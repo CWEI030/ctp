@@ -43,6 +43,16 @@ core.*
 *.log
 logs/
 log/
+/flow/
+/runtime/
+
+# CTP SDK 保持在仓库外
+/sdk/
+/vendor/ctp/
+
+# 本地配置可能包含账号或认证信息
+/config/local.ini
+/config/*.local.ini
 
 # IDE 与编辑器本地文件
 .idea/
