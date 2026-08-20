@@ -1,10 +1,28 @@
-#include "ThostFtdcMdApi.h"
 #include "ThostFtdcTraderApi.h"
 #include "ctp/config.hpp"
+#include "ctp/market_client.hpp"
 
 #include <iostream>
 #include <string_view>
 #include <vector>
+
+namespace {
+
+int run_account_lifecycle_probe()
+{
+    CThostFtdcTraderApi* trader_api =
+        CThostFtdcTraderApi::CreateFtdcTraderApi();
+    if (trader_api == nullptr) {
+        std::cerr << "[error] failed to create trader API\n";
+        return 3;
+    }
+
+    trader_api->Release();
+    std::cout << "[ok] account configuration validated and API lifecycle completed\n";
+    return 0;
+}
+
+}
 
 int main(int argc, char* argv[])
 {
@@ -21,26 +39,8 @@ int main(int argc, char* argv[])
 
     const auto& config = *result.config;
     if (config.mode() == ctp::Mode::Market) {
-        CThostFtdcMdApi* market_api = CThostFtdcMdApi::CreateFtdcMdApi();
-        if (market_api == nullptr) {
-            std::cerr << "[error] failed to create market API\n";
-            return 3;
-        }
-
-        market_api->Release();
-        std::cout << "[ok] market configuration validated and API lifecycle completed\n";
-        return 0;
+        return ctp::run_market(config);
     }
 
-    CThostFtdcTraderApi* trader_api =
-        CThostFtdcTraderApi::CreateFtdcTraderApi();
-    if (trader_api == nullptr) {
-        std::cerr << "[error] failed to create trader API\n";
-        return 3;
-    }
-
-    trader_api->Release();
-    std::cout << "[ok] account configuration validated and API lifecycle completed\n";
-
-    return 0;
+    return run_account_lifecycle_probe();
 }

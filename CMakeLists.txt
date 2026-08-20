@@ -35,6 +35,18 @@ target_compile_options(ctp_config PRIVATE
     -Wextra
     -Wpedantic)
 
+add_library(ctp_market src/market_client.cpp)
+target_include_directories(ctp_market PUBLIC include)
+target_include_directories(ctp_market SYSTEM PUBLIC "${CTP_MD_DIR}")
+target_link_directories(ctp_market PUBLIC "${CTP_MD_DIR}")
+target_link_libraries(ctp_market
+    PUBLIC ctp_config
+    PRIVATE "-l:thostmduserapi_se.so")
+target_compile_options(ctp_market PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic)
+
 add_executable(ctp_client src/main.cpp)
 
 target_include_directories(ctp_client SYSTEM PRIVATE
@@ -46,8 +58,7 @@ target_link_directories(ctp_client PRIVATE
     "${CTP_TRADER_DIR}")
 
 target_link_libraries(ctp_client PRIVATE
-    ctp_config
-    "-l:thostmduserapi_se.so"
+    ctp_market
     "-l:thosttraderapi_se.so")
 
 target_compile_options(ctp_client PRIVATE
@@ -68,4 +79,12 @@ if(BUILD_TESTING)
         -Wextra
         -Wpedantic)
     add_test(NAME config COMMAND ctp_config_tests)
+
+    add_executable(ctp_market_tests tests/market_client_test.cpp)
+    target_link_libraries(ctp_market_tests PRIVATE ctp_market)
+    target_compile_options(ctp_market_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic)
+    add_test(NAME market COMMAND ctp_market_tests)
 endif()
