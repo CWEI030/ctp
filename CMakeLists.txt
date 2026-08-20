@@ -27,6 +27,14 @@ foreach(required_file
     endif()
 endforeach()
 
+add_library(ctp_config src/config.cpp)
+target_include_directories(ctp_config PUBLIC include)
+target_include_directories(ctp_config SYSTEM PRIVATE "${CTP_TRADER_DIR}")
+target_compile_options(ctp_config PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic)
+
 add_executable(ctp_client src/main.cpp)
 
 target_include_directories(ctp_client SYSTEM PRIVATE
@@ -38,6 +46,7 @@ target_link_directories(ctp_client PRIVATE
     "${CTP_TRADER_DIR}")
 
 target_link_libraries(ctp_client PRIVATE
+    ctp_config
     "-l:thostmduserapi_se.so"
     "-l:thosttraderapi_se.so")
 
@@ -48,3 +57,15 @@ target_compile_options(ctp_client PRIVATE
 
 set_target_properties(ctp_client PROPERTIES
     BUILD_RPATH "${CTP_MD_DIR};${CTP_TRADER_DIR}")
+
+include(CTest)
+
+if(BUILD_TESTING)
+    add_executable(ctp_config_tests tests/config_test.cpp)
+    target_link_libraries(ctp_config_tests PRIVATE ctp_config)
+    target_compile_options(ctp_config_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic)
+    add_test(NAME config COMMAND ctp_config_tests)
+endif()
