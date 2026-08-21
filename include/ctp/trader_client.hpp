@@ -8,7 +8,9 @@
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace ctp {
 
@@ -16,17 +18,37 @@ enum class TraderState {
     Connecting,
     AuthenticationPending,
     LoginPending,
-    ReadyForQuery,
+    TradingAccountPending,
+    InvestorPositionPending,
+    Completed,
     AuthenticationFailed,
     LoginFailed,
+    QueryFailed,
     Disconnected,
     TimedOut,
+};
+
+struct TradingAccountSummary {
+    std::string account_id;
+    double balance{0.0};
+    double available{0.0};
+    double current_margin{0.0};
+};
+
+struct PositionSummary {
+    std::string instrument_id;
+    char direction{'\0'};
+    int position{0};
+    int today_position{0};
+    int yesterday_position{0};
 };
 
 struct TraderResult {
     TraderState state{TraderState::Connecting};
     int error_code{0};
     std::string error_message;
+    std::optional<TradingAccountSummary> account;
+    std::vector<PositionSummary> positions;
 };
 
 int report_trader_result(
@@ -48,6 +70,10 @@ public:
         CThostFtdcReqAuthenticateField* request, int request_id) = 0;
     virtual int request_user_login(
         CThostFtdcReqUserLoginField* request, int request_id) = 0;
+    virtual int request_trading_account(
+        CThostFtdcQryTradingAccountField* request, int request_id) = 0;
+    virtual int request_investor_position(
+        CThostFtdcQryInvestorPositionField* request, int request_id) = 0;
     virtual void release() = 0;
 };
 
@@ -69,6 +95,16 @@ public:
         bool is_last) override;
     void OnRspUserLogin(
         CThostFtdcRspUserLoginField* response,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryTradingAccount(
+        CThostFtdcTradingAccountField* response,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryInvestorPosition(
+        CThostFtdcInvestorPositionField* response,
         CThostFtdcRspInfoField* info,
         int request_id,
         bool is_last) override;

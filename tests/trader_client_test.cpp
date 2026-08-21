@@ -38,15 +38,23 @@ struct FakeMetrics {
     std::vector<std::string> calls;
     int authenticate_calls{0};
     int login_calls{0};
+    int account_calls{0};
+    int position_calls{0};
     int release_calls{0};
     int authenticate_request_id{0};
     int login_request_id{0};
+    int account_request_id{0};
+    int position_request_id{0};
     std::string front;
     std::string broker_id;
     std::string user_id;
     std::string app_id;
     std::string auth_code;
     std::string password;
+    std::string account_broker_id;
+    std::string account_investor_id;
+    std::string position_broker_id;
+    std::string position_investor_id;
     THOST_TE_RESUME_TYPE private_mode{THOST_TERT_RESTART};
     THOST_TE_RESUME_TYPE public_mode{THOST_TERT_RESTART};
     int private_sequence{0};
@@ -120,6 +128,32 @@ public:
         return login_return_code;
     }
 
+    int request_trading_account(
+        CThostFtdcQryTradingAccountField* request, int request_id) override
+    {
+        ++metrics_->account_calls;
+        metrics_->account_request_id = request_id;
+        metrics_->account_broker_id = request->BrokerID;
+        metrics_->account_investor_id = request->InvestorID;
+        if (on_account) {
+            on_account(*this);
+        }
+        return account_return_code;
+    }
+
+    int request_investor_position(
+        CThostFtdcQryInvestorPositionField* request, int request_id) override
+    {
+        ++metrics_->position_calls;
+        metrics_->position_request_id = request_id;
+        metrics_->position_broker_id = request->BrokerID;
+        metrics_->position_investor_id = request->InvestorID;
+        if (on_position) {
+            on_position(*this);
+        }
+        return position_return_code;
+    }
+
     void release() override
     {
         ++metrics_->release_calls;
@@ -131,8 +165,12 @@ public:
     std::function<void(FakeTraderApi&)> on_init;
     std::function<void(FakeTraderApi&)> on_authenticate;
     std::function<void(FakeTraderApi&)> on_login;
+    std::function<void(FakeTraderApi&)> on_account;
+    std::function<void(FakeTraderApi&)> on_position;
     int authenticate_return_code{0};
     int login_return_code{0};
+    int account_return_code{0};
+    int position_return_code{0};
 private:
     std::shared_ptr<FakeMetrics> metrics_;
     CThostFtdcTraderSpi* spi_{nullptr};
@@ -168,6 +206,36 @@ void login_success(FakeTraderApi& api, bool is_last = true)
     api.spi()->OnRspUserLogin(&response, &info, 2, is_last);
 }
 
+void account_success(FakeTraderApi& api, bool is_last = true)
+{
+    CThostFtdcTradingAccountField response{};
+    ctp::copy_to_field(response.AccountID, "123456");
+    response.Balance = 100000.5;
+    response.Available = 80000.25;
+    response.CurrMargin = 15000.75;
+    CThostFtdcRspInfoField info{};
+    api.spi()->OnRspQryTradingAccount(&response, &info, 3, is_last);
+}
+
+void position_success(
+    FakeTraderApi& api,
+    std::string_view instrument,
+    char direction,
+    int position,
+    int today,
+    int yesterday,
+    bool is_last)
+{
+    CThostFtdcInvestorPositionField response{};
+    ctp::copy_to_field(response.InstrumentID, instrument);
+    response.PosiDirection = direction;
+    response.Position = position;
+    response.TodayPosition = today;
+    response.YdPosition = yesterday;
+    CThostFtdcRspInfoField info{};
+    api.spi()->OnRspQryInvestorPosition(&response, &info, 4, is_last);
+}
+
 void test_success_advances_once(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -187,6 +255,16 @@ void test_success_advances_once(TestRunner& runner)
         login_success(value);
         value.spi()->OnFrontDisconnected(0x2001);
     };
+    api->on_account = [](FakeTraderApi& value) {
+        account_success(value, false);
+        value.spi()->OnRspQryTradingAccount(nullptr, nullptr, 3, true);
+        account_success(value);
+    };
+    api->on_position = [](FakeTraderApi& value) {
+        position_success(value, "rb2610", THOST_FTDC_PD_Long, 3, 1, 2, false);
+        position_success(value, "ag2612", THOST_FTDC_PD_Short, 2, 2, 0, true);
+        position_success(value, "late", THOST_FTDC_PD_Net, 9, 9, 0, true);
+    };
 
     ctp::TraderResult result;
     {
@@ -195,8 +273,8 @@ void test_success_advances_once(TestRunner& runner)
     }
 
     runner.expect(
-        result.state == ctp::TraderState::ReadyForQuery,
-        "successful authentication and login must become query-ready");
+        result.state == ctp::TraderState::Completed,
+        "successful serial queries must complete");
     runner.expect(
         metrics->calls == std::vector<std::string>{
             "spi", "private", "public", "front", "init"},
@@ -208,14 +286,33 @@ void test_success_advances_once(TestRunner& runner)
         "public and private topics must use quick mode");
     runner.expect(metrics->authenticate_calls == 1, "authentication must run once");
     runner.expect(metrics->login_calls == 1, "login must run once");
+    runner.expect(metrics->account_calls == 1, "account query must run once");
+    runner.expect(metrics->position_calls == 1, "position query must run once");
     runner.expect(metrics->authenticate_request_id == 1, "authentication ID must be 1");
     runner.expect(metrics->login_request_id == 2, "login ID must be 2");
+    runner.expect(metrics->account_request_id == 3, "account query ID must be 3");
+    runner.expect(metrics->position_request_id == 4, "position query ID must be 4");
     runner.expect(metrics->front == "tcp://127.0.0.1:10002", "trader front must be used");
     runner.expect(metrics->broker_id == "9999", "BrokerID must be copied");
     runner.expect(metrics->user_id == "123456", "UserID must be copied");
     runner.expect(metrics->app_id == "test-app", "AppID must be copied");
     runner.expect(metrics->auth_code == "secret-auth-code", "AuthCode must be copied");
     runner.expect(metrics->password == "secret-password", "Password must be copied");
+    runner.expect(metrics->account_broker_id == "9999" &&
+                      metrics->account_investor_id == "123456",
+                  "account query identity must be copied");
+    runner.expect(metrics->position_broker_id == "9999" &&
+                      metrics->position_investor_id == "123456",
+                  "position query identity must be copied");
+    runner.expect(result.account.has_value(), "account summary must be collected");
+    runner.expect(result.account && result.account->available == 80000.25,
+                  "available funds must survive the callback");
+    runner.expect(result.positions.size() == 2,
+                  "all position rows before completion must be collected");
+    runner.expect(result.positions.size() == 2 &&
+                      result.positions[1].instrument_id == "ag2612" &&
+                      result.positions[1].position == 2,
+                  "position row fields must survive the callback");
     runner.expect(metrics->release_calls == 1, "TraderApi must be released once");
 }
 
@@ -361,14 +458,113 @@ void test_wrong_ids_disconnect_and_timeout(TestRunner& runner)
     runner.expect(disconnect_result.error_code == 0x2001, "disconnect reason must survive");
 }
 
+std::unique_ptr<FakeTraderApi> logged_in_api(
+    const std::shared_ptr<FakeMetrics>& metrics)
+{
+    auto api = std::make_unique<FakeTraderApi>(metrics);
+    api->on_init = [](FakeTraderApi& value) { value.spi()->OnFrontConnected(); };
+    api->on_authenticate = [](FakeTraderApi& value) { authenticate_success(value); };
+    api->on_login = [](FakeTraderApi& value) { login_success(value); };
+    return api;
+}
+
+void test_query_failures_and_empty_positions(TestRunner& runner)
+{
+    auto account_rejected_metrics = std::make_shared<FakeMetrics>();
+    auto account_rejected_api = logged_in_api(account_rejected_metrics);
+    account_rejected_api->account_return_code = -5;
+    ctp::TraderClient account_rejected{
+        account_config(), std::move(account_rejected_api)};
+    const auto account_rejected_result =
+        account_rejected.run(std::chrono::milliseconds{20});
+    runner.expect(account_rejected_result.state == ctp::TraderState::QueryFailed &&
+                      account_rejected_result.error_code == -5,
+                  "immediate account query rejection must fail");
+
+    auto account_failed_metrics = std::make_shared<FakeMetrics>();
+    auto account_failed_api = logged_in_api(account_failed_metrics);
+    account_failed_api->on_account = [](FakeTraderApi& value) {
+        CThostFtdcRspInfoField info{};
+        info.ErrorID = 41;
+        ctp::copy_to_field(info.ErrorMsg, "account denied");
+        value.spi()->OnRspQryTradingAccount(nullptr, &info, 3, true);
+    };
+    ctp::TraderClient account_failed{
+        account_config(), std::move(account_failed_api)};
+    const auto account_failed_result =
+        account_failed.run(std::chrono::milliseconds{20});
+    runner.expect(account_failed_result.state == ctp::TraderState::QueryFailed &&
+                      account_failed_result.error_code == 41,
+                  "account business error must fail with its ErrorID");
+
+    auto missing_metrics = std::make_shared<FakeMetrics>();
+    auto missing_api = logged_in_api(missing_metrics);
+    missing_api->on_account = [](FakeTraderApi& value) {
+        value.spi()->OnRspQryTradingAccount(nullptr, nullptr, 3, true);
+    };
+    ctp::TraderClient missing{account_config(), std::move(missing_api)};
+    const auto missing_result = missing.run(std::chrono::milliseconds{20});
+    runner.expect(missing_result.state == ctp::TraderState::QueryFailed,
+                  "missing final account response must fail safely");
+    runner.expect(missing_metrics->position_calls == 0,
+                  "failed account query must not start the position query");
+
+    auto position_failed_metrics = std::make_shared<FakeMetrics>();
+    auto position_failed_api = logged_in_api(position_failed_metrics);
+    position_failed_api->on_account = [](FakeTraderApi& value) {
+        account_success(value);
+    };
+    position_failed_api->on_position = [](FakeTraderApi& value) {
+        CThostFtdcRspInfoField info{};
+        info.ErrorID = 42;
+        ctp::copy_to_field(info.ErrorMsg, "position denied");
+        value.spi()->OnRspQryInvestorPosition(nullptr, &info, 4, true);
+    };
+    ctp::TraderClient position_failed{
+        account_config(), std::move(position_failed_api)};
+    const auto position_failed_result =
+        position_failed.run(std::chrono::milliseconds{20});
+    runner.expect(position_failed_result.state == ctp::TraderState::QueryFailed &&
+                      position_failed_result.error_code == 42,
+                  "position business error must fail with its ErrorID");
+
+    auto position_rejected_metrics = std::make_shared<FakeMetrics>();
+    auto position_rejected_api = logged_in_api(position_rejected_metrics);
+    position_rejected_api->on_account = [](FakeTraderApi& value) {
+        account_success(value);
+    };
+    position_rejected_api->position_return_code = -6;
+    ctp::TraderClient position_rejected{
+        account_config(), std::move(position_rejected_api)};
+    const auto position_rejected_result =
+        position_rejected.run(std::chrono::milliseconds{20});
+    runner.expect(position_rejected_result.state == ctp::TraderState::QueryFailed &&
+                      position_rejected_result.error_code == -6,
+                  "immediate position query rejection must fail");
+
+    auto empty_metrics = std::make_shared<FakeMetrics>();
+    auto empty_api = logged_in_api(empty_metrics);
+    empty_api->on_account = [](FakeTraderApi& value) { account_success(value); };
+    empty_api->on_position = [](FakeTraderApi& value) {
+        value.spi()->OnRspQryInvestorPosition(nullptr, nullptr, 4, true);
+    };
+    ctp::TraderClient empty{account_config(), std::move(empty_api)};
+    const auto empty_result = empty.run(std::chrono::milliseconds{20});
+    runner.expect(empty_result.state == ctp::TraderState::Completed &&
+                      empty_result.positions.empty(),
+                  "null final position response must mean zero positions");
+}
+
 void test_exit_codes_and_safe_output(TestRunner& runner)
 {
-    runner.expect(ctp::trader_exit_code(ctp::TraderState::ReadyForQuery) == 0,
-                  "query-ready must exit 0");
+    runner.expect(ctp::trader_exit_code(ctp::TraderState::Completed) == 0,
+                  "completed queries must exit 0");
     runner.expect(ctp::trader_exit_code(ctp::TraderState::TimedOut) == 4,
                   "timeout must exit 4");
     runner.expect(ctp::trader_exit_code(ctp::TraderState::LoginFailed) == 5,
                   "login failure must exit 5");
+    runner.expect(ctp::trader_exit_code(ctp::TraderState::QueryFailed) == 6,
+                  "query failure must exit 6");
 
     ctp::TraderResult result;
     result.state = ctp::TraderState::LoginFailed;
@@ -383,6 +579,26 @@ void test_exit_codes_and_safe_output(TestRunner& runner)
                   "report must not contain the password");
     runner.expect(text.find("secret-auth-code") == std::string::npos,
                   "report must not contain the AuthCode");
+
+    ctp::TraderResult success;
+    success.state = ctp::TraderState::Completed;
+    success.account = ctp::TradingAccountSummary{
+        "123456", 100000.5, 80000.25, 15000.75};
+    success.positions.push_back(
+        ctp::PositionSummary{"rb2610", THOST_FTDC_PD_Long, 3, 1, 2});
+    std::ostringstream success_output;
+    std::ostringstream success_error;
+    runner.expect(ctp::report_trader_result(
+                      success, success_output, success_error) == 0,
+                  "successful report must exit 0");
+    const std::string success_text = success_output.str();
+    runner.expect(success_text.find("account=****56") != std::string::npos,
+                  "account identifier must be masked");
+    runner.expect(success_text.find("instrument=rb2610") != std::string::npos &&
+                      success_text.find("positions=1") != std::string::npos,
+                  "successful report must include positions and their count");
+    runner.expect(success_text.find("123456") == std::string::npos,
+                  "successful report must not expose the complete account ID");
 }
 
 }
@@ -394,6 +610,7 @@ int main()
     test_immediate_and_business_failures(runner);
     test_login_failure_and_missing_response(runner);
     test_wrong_ids_disconnect_and_timeout(runner);
+    test_query_failures_and_empty_positions(runner);
     test_exit_codes_and_safe_output(runner);
     return runner.finish();
 }

@@ -10,10 +10,15 @@ namespace {
 
 constexpr int kAuthenticationRequestId = 1;
 constexpr int kLoginRequestId = 2;
+constexpr int kTradingAccountRequestId = 3;
+constexpr int kInvestorPositionRequestId = 4;
 constexpr int kMissingAuthenticationResponse = -1;
 constexpr int kMissingLoginResponse = -2;
 constexpr int kInvalidAuthenticationFields = -3;
 constexpr int kInvalidLoginFields = -4;
+constexpr int kMissingTradingAccountResponse = -5;
+constexpr int kInvalidTradingAccountFields = -6;
+constexpr int kInvalidInvestorPositionFields = -7;
 
 class CtpTraderApi final : public TraderApi {
 public:
@@ -63,6 +68,18 @@ public:
         return api_->ReqUserLogin(request, request_id);
     }
 
+    int request_trading_account(
+        CThostFtdcQryTradingAccountField* request, int request_id) override
+    {
+        return api_->ReqQryTradingAccount(request, request_id);
+    }
+
+    int request_investor_position(
+        CThostFtdcQryInvestorPositionField* request, int request_id) override
+    {
+        return api_->ReqQryInvestorPosition(request, request_id);
+    }
+
     void release() override
     {
         if (api_ == nullptr) {
@@ -92,6 +109,28 @@ std::unique_ptr<TraderApi> create_trader_api()
     return std::make_unique<CtpTraderApi>(api);
 }
 
+std::string masked_identifier(const std::string& value)
+{
+    if (value.size() <= 2) {
+        return std::string(value.size(), '*');
+    }
+    return std::string(value.size() - 2, '*') + value.substr(value.size() - 2);
+}
+
+const char* direction_text(char direction)
+{
+    switch (direction) {
+    case THOST_FTDC_PD_Net:
+        return "net";
+    case THOST_FTDC_PD_Long:
+        return "long";
+    case THOST_FTDC_PD_Short:
+        return "short";
+    default:
+        return "unknown";
+    }
+}
+
 }
 
 int report_trader_result(
@@ -99,9 +138,22 @@ int report_trader_result(
     std::ostream& output,
     std::ostream& error)
 {
-    if (result.state == TraderState::ReadyForQuery) {
-        output << "[ok] trader authentication and login completed; "
-                  "ready for queries\n";
+    if (result.state == TraderState::Completed) {
+        if (result.account) {
+            output << "account=" << masked_identifier(result.account->account_id)
+                   << " balance=" << result.account->balance
+                   << " available=" << result.account->available
+                   << " margin=" << result.account->current_margin << '\n';
+        }
+        for (const auto& position : result.positions) {
+            output << "position instrument=" << position.instrument_id
+                   << " direction=" << direction_text(position.direction)
+                   << " total=" << position.position
+                   << " today=" << position.today_position
+                   << " yesterday=" << position.yesterday_position << '\n';
+        }
+        output << "[ok] account queries completed: positions="
+               << result.positions.size() << '\n';
         return 0;
     }
     if (result.state == TraderState::TimedOut) {
@@ -109,6 +161,12 @@ int report_trader_result(
     } else if (result.state == TraderState::Disconnected) {
         error << "[error] trader front disconnected: reason="
               << result.error_code << '\n';
+    } else if (result.state == TraderState::QueryFailed) {
+        error << "[error] trader query failed: code=" << result.error_code;
+        if (!result.error_message.empty()) {
+            error << " message=" << result.error_message;
+        }
+        error << '\n';
     } else {
         error << "[error] trader authentication or login failed: code="
               << result.error_code;
@@ -280,14 +338,149 @@ void TraderClient::OnRspUserLogin(
         return;
     }
 
-    finish(TraderState::ReadyForQuery, 0, {});
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != TraderState::LoginPending) {
+            return;
+        }
+        result_.state = TraderState::TradingAccountPending;
+    }
+
+    CThostFtdcQryTradingAccountField request{};
+    if (!copy_to_field(request.BrokerID, config_.broker_id()) ||
+        !copy_to_field(request.InvestorID, config_.user_id())) {
+        finish(
+            TraderState::QueryFailed,
+            kInvalidTradingAccountFields,
+            "validated trading account fields could not be copied");
+        return;
+    }
+
+    const int code = api_->request_trading_account(
+        &request, kTradingAccountRequestId);
+    if (code != 0) {
+        finish(
+            TraderState::QueryFailed,
+            code,
+            "ReqQryTradingAccount rejected the request");
+    }
+}
+
+void TraderClient::OnRspQryTradingAccount(
+    CThostFtdcTradingAccountField* response,
+    CThostFtdcRspInfoField* info,
+    int request_id,
+    bool is_last)
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != TraderState::TradingAccountPending ||
+            request_id != kTradingAccountRequestId) {
+            return;
+        }
+    }
+
+    if (info != nullptr && info->ErrorID != 0) {
+        finish(TraderState::QueryFailed, info->ErrorID, field_text(info->ErrorMsg));
+        return;
+    }
+
+    bool missing_response = false;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != TraderState::TradingAccountPending) {
+            return;
+        }
+        if (response != nullptr) {
+            result_.account = TradingAccountSummary{
+                field_text(response->AccountID),
+                response->Balance,
+                response->Available,
+                response->CurrMargin};
+        }
+        if (!is_last) {
+            return;
+        }
+        missing_response = !result_.account.has_value();
+        if (!missing_response) {
+            result_.state = TraderState::InvestorPositionPending;
+        }
+    }
+
+    if (missing_response) {
+        finish(
+            TraderState::QueryFailed,
+            kMissingTradingAccountResponse,
+            "trading account response is missing");
+        return;
+    }
+
+    CThostFtdcQryInvestorPositionField request{};
+    if (!copy_to_field(request.BrokerID, config_.broker_id()) ||
+        !copy_to_field(request.InvestorID, config_.user_id())) {
+        finish(
+            TraderState::QueryFailed,
+            kInvalidInvestorPositionFields,
+            "validated investor position fields could not be copied");
+        return;
+    }
+
+    const int code = api_->request_investor_position(
+        &request, kInvestorPositionRequestId);
+    if (code != 0) {
+        finish(
+            TraderState::QueryFailed,
+            code,
+            "ReqQryInvestorPosition rejected the request");
+    }
+}
+
+void TraderClient::OnRspQryInvestorPosition(
+    CThostFtdcInvestorPositionField* response,
+    CThostFtdcRspInfoField* info,
+    int request_id,
+    bool is_last)
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != TraderState::InvestorPositionPending ||
+            request_id != kInvestorPositionRequestId) {
+            return;
+        }
+    }
+
+    if (info != nullptr && info->ErrorID != 0) {
+        finish(TraderState::QueryFailed, info->ErrorID, field_text(info->ErrorMsg));
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != TraderState::InvestorPositionPending) {
+            return;
+        }
+        if (response != nullptr) {
+            result_.positions.push_back(PositionSummary{
+                field_text(response->InstrumentID),
+                response->PosiDirection,
+                response->Position,
+                response->TodayPosition,
+                response->YdPosition});
+        }
+        if (!is_last) {
+            return;
+        }
+        result_.state = TraderState::Completed;
+    }
+    condition_.notify_one();
 }
 
 bool TraderClient::is_terminal() const
 {
-    return result_.state == TraderState::ReadyForQuery ||
+    return result_.state == TraderState::Completed ||
            result_.state == TraderState::AuthenticationFailed ||
            result_.state == TraderState::LoginFailed ||
+           result_.state == TraderState::QueryFailed ||
            result_.state == TraderState::Disconnected ||
            result_.state == TraderState::TimedOut;
 }
@@ -332,11 +525,14 @@ int run_account(const RuntimeConfig& config, std::chrono::milliseconds timeout)
 
 int trader_exit_code(TraderState state)
 {
-    if (state == TraderState::ReadyForQuery) {
+    if (state == TraderState::Completed) {
         return 0;
     }
     if (state == TraderState::Disconnected || state == TraderState::TimedOut) {
         return 4;
+    }
+    if (state == TraderState::QueryFailed) {
+        return 6;
     }
     return 5;
 }
