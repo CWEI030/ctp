@@ -5,26 +5,48 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <iosfwd>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace ctp {
 
 enum class MarketState {
     Connecting,
     LoginPending,
-    LoginSucceeded,
+    SubscriptionPending,
+    TickPending,
+    Completed,
     LoginFailed,
+    SubscriptionFailed,
     Disconnected,
     TimedOut,
+};
+
+struct MarketTick {
+    std::string instrument;
+    std::string update_time;
+    int update_millisec{0};
+    double last_price{0};
+    double bid_price{0};
+    double ask_price{0};
+    int volume{0};
 };
 
 struct MarketResult {
     MarketState state{MarketState::Connecting};
     int error_code{0};
     std::string error_message;
+    std::vector<MarketTick> ticks;
 };
+
+std::string format_market_tick(const MarketTick& tick);
+int report_market_result(
+    const MarketResult& result,
+    std::ostream& output,
+    std::ostream& error);
 
 class MarketApi {
 public:
@@ -36,6 +58,9 @@ public:
     virtual int request_user_login(
         CThostFtdcReqUserLoginField* request,
         int request_id) = 0;
+    virtual int subscribe_market_data(
+        char* instruments[],
+        int count) = 0;
     virtual void release() = 0;
 };
 
@@ -55,6 +80,13 @@ public:
         CThostFtdcRspInfoField* info,
         int request_id,
         bool is_last) override;
+    void OnRspSubMarketData(
+        CThostFtdcSpecificInstrumentField* instrument,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRtnDepthMarketData(
+        CThostFtdcDepthMarketDataField* tick) override;
 
 private:
     bool is_terminal() const;

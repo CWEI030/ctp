@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <system_error>
 #include <utility>
 
@@ -12,6 +14,8 @@ namespace {
 constexpr int kLoginRequestId = 1;
 constexpr int kMissingLoginResponse = -1;
 constexpr int kInvalidLoginFields = -2;
+constexpr int kInvalidInstrument = -3;
+constexpr int kMissingSubscriptionResponse = -4;
 
 template <std::size_t N>
 std::string field_text(const char (&field)[N])
@@ -52,6 +56,11 @@ public:
         return api_->ReqUserLogin(request, request_id);
     }
 
+    int subscribe_market_data(char* instruments[], int count) override
+    {
+        return api_->SubscribeMarketData(instruments, count);
+    }
+
     void release() override
     {
         if (api_ == nullptr) {
@@ -83,6 +92,51 @@ std::unique_ptr<MarketApi> create_market_api()
 
 }
 
+std::string format_market_tick(const MarketTick& tick)
+{
+    std::ostringstream output;
+    output << "time=" << tick.update_time << '.'
+           << std::setfill('0') << std::setw(3) << tick.update_millisec
+           << " instrument=" << tick.instrument
+           << " last=" << tick.last_price
+           << " bid1=" << tick.bid_price
+           << " ask1=" << tick.ask_price
+           << " volume=" << tick.volume;
+    return output.str();
+}
+
+int report_market_result(
+    const MarketResult& result,
+    std::ostream& output,
+    std::ostream& error)
+{
+    if (result.state == MarketState::Completed) {
+        for (const auto& tick : result.ticks) {
+            output << format_market_tick(tick) << '\n';
+        }
+        output << "[ok] market data completed: ticks="
+               << result.ticks.size() << '\n';
+        return market_exit_code(result.state);
+    }
+    if (result.state == MarketState::TimedOut) {
+        error << "[error] market operation timed out: received="
+              << result.ticks.size() << '\n';
+        return market_exit_code(result.state);
+    }
+    if (result.state == MarketState::Disconnected) {
+        error << "[error] market front disconnected: reason="
+              << result.error_code << '\n';
+        return market_exit_code(result.state);
+    }
+
+    error << "[error] market operation failed: code=" << result.error_code;
+    if (!result.error_message.empty()) {
+        error << " message=" << result.error_message;
+    }
+    error << '\n';
+    return market_exit_code(result.state);
+}
+
 MarketClient::MarketClient(
     const RuntimeConfig& config,
     std::unique_ptr<MarketApi> api)
@@ -106,7 +160,7 @@ MarketResult MarketClient::run(std::chrono::milliseconds timeout)
         std::unique_lock<std::mutex> lock{mutex_};
         if (!condition_.wait_for(lock, timeout, [this] { return is_terminal(); })) {
             result_.state = MarketState::TimedOut;
-            result_.error_message = "market login timed out";
+            result_.error_message = "market operation timed out";
         }
         result = result_;
     }
@@ -182,13 +236,120 @@ void MarketClient::OnRspUserLogin(
         return;
     }
 
-    finish(MarketState::LoginSucceeded, 0, {});
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != MarketState::LoginPending) {
+            return;
+        }
+        result_.state = MarketState::SubscriptionPending;
+    }
+
+    std::string instrument = config_.instrument();
+    if (instrument.empty()) {
+        finish(
+            MarketState::SubscriptionFailed,
+            kInvalidInstrument,
+            "validated instrument is empty");
+        return;
+    }
+
+    char* instruments[] = {instrument.data()};
+    const int return_code = api_->subscribe_market_data(instruments, 1);
+    if (return_code != 0) {
+        finish(
+            MarketState::SubscriptionFailed,
+            return_code,
+            "SubscribeMarketData rejected the request");
+        return;
+    }
+}
+
+void MarketClient::OnRspSubMarketData(
+    CThostFtdcSpecificInstrumentField* instrument,
+    CThostFtdcRspInfoField* info,
+    int request_id,
+    bool is_last)
+{
+    static_cast<void>(request_id);
+    static_cast<void>(is_last);
+
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != MarketState::SubscriptionPending) {
+            return;
+        }
+    }
+
+    if (info != nullptr && info->ErrorID != 0) {
+        finish(
+            MarketState::SubscriptionFailed,
+            info->ErrorID,
+            field_text(info->ErrorMsg));
+        return;
+    }
+
+    if (instrument == nullptr) {
+        finish(
+            MarketState::SubscriptionFailed,
+            kMissingSubscriptionResponse,
+            "subscription response is missing");
+        return;
+    }
+
+    if (field_text(instrument->InstrumentID) != config_.instrument()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != MarketState::SubscriptionPending) {
+            return;
+        }
+        result_.state = MarketState::TickPending;
+    }
+}
+
+void MarketClient::OnRtnDepthMarketData(
+    CThostFtdcDepthMarketDataField* tick)
+{
+    if (tick == nullptr) {
+        return;
+    }
+
+    bool completed = false;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (result_.state != MarketState::TickPending ||
+            field_text(tick->InstrumentID) != config_.instrument()) {
+            return;
+        }
+
+        result_.ticks.push_back(MarketTick{
+            field_text(tick->InstrumentID),
+            field_text(tick->UpdateTime),
+            tick->UpdateMillisec,
+            tick->LastPrice,
+            tick->BidPrice1,
+            tick->AskPrice1,
+            tick->Volume});
+
+        if (result_.ticks.size() ==
+            static_cast<std::size_t>(config_.ticks())) {
+            result_.state = MarketState::Completed;
+            completed = true;
+        }
+    }
+
+    if (completed) {
+        condition_.notify_one();
+    }
 }
 
 bool MarketClient::is_terminal() const
 {
-    return result_.state == MarketState::LoginSucceeded ||
+    return result_.state == MarketState::Completed ||
            result_.state == MarketState::LoginFailed ||
+           result_.state == MarketState::SubscriptionFailed ||
            result_.state == MarketState::Disconnected ||
            result_.state == MarketState::TimedOut;
 }
@@ -230,36 +391,20 @@ int run_market(const RuntimeConfig& config, std::chrono::milliseconds timeout)
     MarketClient client{config, std::move(api)};
     const auto result = client.run(timeout);
 
-    if (result.state == MarketState::LoginSucceeded) {
-        std::cout << "[ok] market login succeeded\n";
-        return market_exit_code(result.state);
-    }
-    if (result.state == MarketState::TimedOut) {
-        std::cerr << "[error] market login timed out\n";
-        return market_exit_code(result.state);
-    }
-    if (result.state == MarketState::Disconnected) {
-        std::cerr << "[error] market front disconnected: reason="
-                  << result.error_code << '\n';
-        return market_exit_code(result.state);
-    }
-
-    std::cerr << "[error] market login failed: code=" << result.error_code;
-    if (!result.error_message.empty()) {
-        std::cerr << " message=" << result.error_message;
-    }
-    std::cerr << '\n';
-    return market_exit_code(result.state);
+    return report_market_result(result, std::cout, std::cerr);
 }
 
 int market_exit_code(MarketState state)
 {
-    if (state == MarketState::LoginSucceeded) {
+    if (state == MarketState::Completed) {
         return 0;
     }
     if (state == MarketState::Disconnected ||
         state == MarketState::TimedOut) {
         return 4;
+    }
+    if (state == MarketState::SubscriptionFailed) {
+        return 6;
     }
     return 5;
 }
