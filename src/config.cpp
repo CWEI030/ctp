@@ -27,7 +27,7 @@ struct Profile {
 constexpr Profile kProfiles[]{
     {"simnow-1", "tcp://180.168.146.187:10211", "tcp://180.168.146.187:10201"},
     {"simnow-2", "tcp://180.168.146.187:10212", "tcp://180.168.146.187:10202"},
-    {"simnow-7x24", "tcp://180.168.146.187:10131", "tcp://180.168.146.187:10130"},
+    {"simnow-7x24", "tcp://182.254.243.31:40011", "tcp://182.254.243.31:40001"},
 };
 
 ConfigResult failure(std::string message)

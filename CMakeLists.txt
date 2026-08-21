@@ -47,19 +47,29 @@ target_compile_options(ctp_market PRIVATE
     -Wextra
     -Wpedantic)
 
+add_library(ctp_trader src/trader_client.cpp)
+target_include_directories(ctp_trader PUBLIC include)
+target_include_directories(ctp_trader SYSTEM PUBLIC "${CTP_TRADER_DIR}")
+target_link_directories(ctp_trader PUBLIC "${CTP_TRADER_DIR}")
+target_link_libraries(ctp_trader
+    PUBLIC ctp_config
+    PRIVATE "-l:thosttraderapi_se.so")
+target_compile_options(ctp_trader PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic)
+
 add_executable(ctp_client src/main.cpp)
 
 target_include_directories(ctp_client SYSTEM PRIVATE
-    "${CTP_MD_DIR}"
-    "${CTP_TRADER_DIR}")
+    "${CTP_MD_DIR}")
 
 target_link_directories(ctp_client PRIVATE
-    "${CTP_MD_DIR}"
-    "${CTP_TRADER_DIR}")
+    "${CTP_MD_DIR}")
 
 target_link_libraries(ctp_client PRIVATE
     ctp_market
-    "-l:thosttraderapi_se.so")
+    ctp_trader)
 
 target_compile_options(ctp_client PRIVATE
     -Wall
@@ -87,4 +97,12 @@ if(BUILD_TESTING)
         -Wextra
         -Wpedantic)
     add_test(NAME market COMMAND ctp_market_tests)
+
+    add_executable(ctp_trader_tests tests/trader_client_test.cpp)
+    target_link_libraries(ctp_trader_tests PRIVATE ctp_trader)
+    target_compile_options(ctp_trader_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic)
+    add_test(NAME trader COMMAND ctp_trader_tests)
 endif()

@@ -1,6 +1,5 @@
 #include "ctp/market_client.hpp"
 
-#include <algorithm>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -16,13 +15,6 @@ constexpr int kMissingLoginResponse = -1;
 constexpr int kInvalidLoginFields = -2;
 constexpr int kInvalidInstrument = -3;
 constexpr int kMissingSubscriptionResponse = -4;
-
-template <std::size_t N>
-std::string field_text(const char (&field)[N])
-{
-    const auto end = std::find(std::begin(field), std::end(field), '\0');
-    return std::string{std::begin(field), end};
-}
 
 class CtpMarketApi final : public MarketApi {
 public:

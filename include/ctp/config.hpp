@@ -1,6 +1,7 @@
 #pragma once
 
-#include <algorithm>
+#include "ctp/field.hpp"
+
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -21,18 +22,6 @@ inline constexpr std::size_t kPasswordCapacity = 41;
 inline constexpr std::size_t kInstrumentIdCapacity = 81;
 inline constexpr std::size_t kAuthCodeCapacity = 17;
 inline constexpr std::size_t kAppIdCapacity = 33;
-
-template <std::size_t N>
-bool copy_to_field(char (&destination)[N], std::string_view source)
-{
-    if (source.size() >= N) {
-        return false;
-    }
-
-    std::fill(std::begin(destination), std::end(destination), '\0');
-    std::copy(source.begin(), source.end(), destination);
-    return true;
-}
 
 class RuntimeConfig {
 public:

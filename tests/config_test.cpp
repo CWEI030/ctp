@@ -104,7 +104,10 @@ void test_valid_account(TestRunner& runner)
     runner.expect(result.config->instrument().empty(), "account mode must not have instrument");
     runner.expect(result.config->ticks() == 0, "account mode must not have ticks");
     runner.expect(
-        result.config->trader_front() == "tcp://180.168.146.187:10130",
+        result.config->market_front() == "tcp://182.254.243.31:40011",
+        "7x24 market front must match the profile");
+    runner.expect(
+        result.config->trader_front() == "tcp://182.254.243.31:40001",
         "7x24 trader front must match the profile");
 }
 
