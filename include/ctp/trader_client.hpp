@@ -114,15 +114,36 @@ public:
         bool is_last) override;
 
 private:
+    class CallbackGuard {
+    public:
+        explicit CallbackGuard(TraderClient& client);
+        ~CallbackGuard();
+
+        CallbackGuard(const CallbackGuard&) = delete;
+        CallbackGuard& operator=(const CallbackGuard&) = delete;
+
+        explicit operator bool() const;
+
+    private:
+        TraderClient& client_;
+        bool entered_;
+    };
+
     bool is_terminal() const;
+    bool enter_callback();
+    void leave_callback();
+    bool can_request(TraderState expected_state);
     void finish(TraderState state, int error_code, std::string message);
     void release_api();
 
     RuntimeConfig config_;
     std::unique_ptr<TraderApi> api_;
     std::mutex mutex_;
-    std::condition_variable condition_;
+    std::condition_variable_any condition_;
     TraderResult result_;
+    // Release 前等待完整回调退出，避免 SPI 对象仍被访问时结束其生命周期。
+    std::size_t active_callbacks_{0};
+    bool releasing_{false};
     bool released_{false};
 };
 

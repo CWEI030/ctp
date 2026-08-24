@@ -1,7 +1,9 @@
 #include "ctp/market_client.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -45,6 +47,8 @@ struct FakeMetrics {
     std::string password;
     std::string subscribed_instrument;
     int request_id{0};
+    std::atomic<bool> login_request_active{false};
+    std::atomic<bool> released_during_login_request{false};
 };
 
 class FakeMarketApi final : public ctp::MarketApi {
@@ -77,6 +81,7 @@ public:
         CThostFtdcReqUserLoginField* request,
         int request_id) override
     {
+        metrics_->login_request_active = true;
         ++metrics_->login_calls;
         metrics_->broker_id = request->BrokerID;
         metrics_->user_id = request->UserID;
@@ -85,6 +90,7 @@ public:
         if (on_login_request) {
             on_login_request(*this);
         }
+        metrics_->login_request_active = false;
         return login_return_code;
     }
 
@@ -103,6 +109,9 @@ public:
 
     void release() override
     {
+        if (metrics_->login_request_active) {
+            metrics_->released_during_login_request = true;
+        }
         ++metrics_->release_calls;
         spi_ = nullptr;
     }
@@ -503,6 +512,50 @@ void test_all_market_wait_phases_terminate(TestRunner& runner)
     }
 }
 
+void test_release_waits_for_active_login_request(TestRunner& runner)
+{
+    auto metrics = std::make_shared<FakeMetrics>();
+    auto api = std::make_unique<FakeMarketApi>(metrics);
+    std::promise<void> initialized;
+    std::promise<void> login_entered;
+    std::promise<void> allow_login_return;
+    auto allow_login_future = allow_login_return.get_future().share();
+    api->on_init = [&initialized](FakeMarketApi&) { initialized.set_value(); };
+    api->on_login_request = [&login_entered, allow_login_future](FakeMarketApi&) {
+        login_entered.set_value();
+        allow_login_future.wait();
+    };
+
+    auto client = std::make_unique<ctp::MarketClient>(
+        market_config(), std::move(api));
+    std::atomic<bool> stop_requested{false};
+    auto run = std::async(std::launch::async, [&] {
+        return client->run(std::chrono::seconds{2}, [&] {
+            return stop_requested.load();
+        });
+    });
+    initialized.get_future().wait();
+
+    auto callback = std::async(
+        std::launch::async, [&client] { client->OnFrontConnected(); });
+    login_entered.get_future().wait();
+    stop_requested = true;
+    runner.expect(
+        run.wait_for(std::chrono::milliseconds{250}) ==
+            std::future_status::timeout,
+        "interruption must wait for the active login request to return");
+    allow_login_return.set_value();
+
+    callback.get();
+    const auto result = run.get();
+    runner.expect(result.state == ctp::MarketState::Interrupted,
+                  "active login request must still allow bounded interruption");
+    runner.expect(!metrics->released_during_login_request,
+                  "MarketApi must not be released during an active request");
+    runner.expect(metrics->release_calls == 1,
+                  "concurrent interruption must release MarketApi once");
+}
+
 void test_null_and_late_callbacks(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -599,6 +652,7 @@ int main()
     test_disconnect_and_timeout(runner);
     test_interruption_stops_market_client(runner);
     test_all_market_wait_phases_terminate(runner);
+    test_release_waits_for_active_login_request(runner);
     test_null_and_late_callbacks(runner);
     test_exit_codes(runner);
     test_tick_format(runner);

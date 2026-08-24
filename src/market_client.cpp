@@ -188,6 +188,11 @@ MarketResult MarketClient::run(
 
 void MarketClient::OnFrontConnected()
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != MarketState::Connecting) {
@@ -207,6 +212,9 @@ void MarketClient::OnFrontConnected()
         return;
     }
 
+    if (!can_request(MarketState::LoginPending)) {
+        return;
+    }
     const int return_code = api_->request_user_login(&request, kLoginRequestId);
     if (return_code != 0) {
         finish(
@@ -218,6 +226,11 @@ void MarketClient::OnFrontConnected()
 
 void MarketClient::OnFrontDisconnected(int reason)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     finish(MarketState::Disconnected, reason, "market front disconnected");
 }
 
@@ -227,6 +240,11 @@ void MarketClient::OnRspUserLogin(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     static_cast<void>(is_last);
 
     {
@@ -271,6 +289,9 @@ void MarketClient::OnRspUserLogin(
     }
 
     char* instruments[] = {instrument.data()};
+    if (!can_request(MarketState::SubscriptionPending)) {
+        return;
+    }
     const int return_code = api_->subscribe_market_data(instruments, 1);
     if (return_code != 0) {
         finish(
@@ -287,6 +308,11 @@ void MarketClient::OnRspSubMarketData(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     static_cast<void>(request_id);
     static_cast<void>(is_last);
 
@@ -329,6 +355,11 @@ void MarketClient::OnRspSubMarketData(
 void MarketClient::OnRtnDepthMarketData(
     CThostFtdcDepthMarketDataField* tick)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     if (tick == nullptr) {
         return;
     }
@@ -372,6 +403,48 @@ bool MarketClient::is_terminal() const
            result_.state == MarketState::Interrupted;
 }
 
+MarketClient::CallbackGuard::CallbackGuard(MarketClient& client)
+    : client_(client), entered_(client_.enter_callback())
+{
+}
+
+MarketClient::CallbackGuard::~CallbackGuard()
+{
+    if (entered_) {
+        client_.leave_callback();
+    }
+}
+
+MarketClient::CallbackGuard::operator bool() const
+{
+    return entered_;
+}
+
+bool MarketClient::enter_callback()
+{
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (releasing_ || released_) {
+        return false;
+    }
+    ++active_callbacks_;
+    return true;
+}
+
+void MarketClient::leave_callback()
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        --active_callbacks_;
+    }
+    condition_.notify_all();
+}
+
+bool MarketClient::can_request(MarketState expected_state)
+{
+    std::lock_guard<std::mutex> lock{mutex_};
+    return !releasing_ && !released_ && result_.state == expected_state;
+}
+
 void MarketClient::finish(
     MarketState state,
     int error_code,
@@ -391,11 +464,26 @@ void MarketClient::finish(
 
 void MarketClient::release_api()
 {
-    if (released_) {
-        return;
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        if (released_) {
+            return;
+        }
+        if (releasing_) {
+            condition_.wait(lock, [this] { return released_; });
+            return;
+        }
+        releasing_ = true;
+        condition_.wait(lock, [this] {
+            return active_callbacks_ == 0;
+        });
     }
     api_->release();
-    released_ = true;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        released_ = true;
+    }
+    condition_.notify_all();
 }
 
 int run_market(

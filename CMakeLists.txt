@@ -19,7 +19,11 @@ set(CTP_TRADER_LIBRARY "${CTP_TRADER_DIR}/thosttraderapi_se.so")
 
 foreach(required_file
         "${CTP_MD_DIR}/ThostFtdcMdApi.h"
+        "${CTP_MD_DIR}/ThostFtdcUserApiDataType.h"
+        "${CTP_MD_DIR}/ThostFtdcUserApiStruct.h"
         "${CTP_TRADER_DIR}/ThostFtdcTraderApi.h"
+        "${CTP_TRADER_DIR}/ThostFtdcUserApiDataType.h"
+        "${CTP_TRADER_DIR}/ThostFtdcUserApiStruct.h"
         "${CTP_MD_LIBRARY}"
         "${CTP_TRADER_LIBRARY}")
     if(NOT EXISTS "${required_file}")

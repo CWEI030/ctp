@@ -1,7 +1,9 @@
 #include "ctp/trader_client.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -58,6 +60,8 @@ struct FakeMetrics {
     THOST_TE_RESUME_TYPE private_mode{THOST_TERT_RESTART};
     THOST_TE_RESUME_TYPE public_mode{THOST_TERT_RESTART};
     int private_sequence{0};
+    std::atomic<bool> authenticate_request_active{false};
+    std::atomic<bool> released_during_authenticate_request{false};
 };
 
 class FakeTraderApi final : public ctp::TraderApi {
@@ -104,6 +108,7 @@ public:
     int request_authenticate(
         CThostFtdcReqAuthenticateField* request, int request_id) override
     {
+        metrics_->authenticate_request_active = true;
         ++metrics_->authenticate_calls;
         metrics_->authenticate_request_id = request_id;
         metrics_->broker_id = request->BrokerID;
@@ -113,6 +118,7 @@ public:
         if (on_authenticate) {
             on_authenticate(*this);
         }
+        metrics_->authenticate_request_active = false;
         return authenticate_return_code;
     }
 
@@ -156,6 +162,9 @@ public:
 
     void release() override
     {
+        if (metrics_->authenticate_request_active) {
+            metrics_->released_during_authenticate_request = true;
+        }
         ++metrics_->release_calls;
         spi_ = nullptr;
     }
@@ -595,6 +604,52 @@ void test_all_trader_wait_phases_terminate(TestRunner& runner)
     }
 }
 
+void test_release_waits_for_active_authenticate_request(TestRunner& runner)
+{
+    auto metrics = std::make_shared<FakeMetrics>();
+    auto api = std::make_unique<FakeTraderApi>(metrics);
+    std::promise<void> initialized;
+    std::promise<void> authenticate_entered;
+    std::promise<void> allow_authenticate_return;
+    auto allow_authenticate_future =
+        allow_authenticate_return.get_future().share();
+    api->on_init = [&initialized](FakeTraderApi&) { initialized.set_value(); };
+    api->on_authenticate =
+        [&authenticate_entered, allow_authenticate_future](FakeTraderApi&) {
+            authenticate_entered.set_value();
+            allow_authenticate_future.wait();
+        };
+
+    auto client = std::make_unique<ctp::TraderClient>(
+        account_config(), std::move(api));
+    std::atomic<bool> stop_requested{false};
+    auto run = std::async(std::launch::async, [&] {
+        return client->run(std::chrono::seconds{2}, [&] {
+            return stop_requested.load();
+        });
+    });
+    initialized.get_future().wait();
+
+    auto callback = std::async(
+        std::launch::async, [&client] { client->OnFrontConnected(); });
+    authenticate_entered.get_future().wait();
+    stop_requested = true;
+    runner.expect(
+        run.wait_for(std::chrono::milliseconds{250}) ==
+            std::future_status::timeout,
+        "interruption must wait for the active authentication request to return");
+    allow_authenticate_return.set_value();
+
+    callback.get();
+    const auto result = run.get();
+    runner.expect(result.state == ctp::TraderState::Interrupted,
+                  "active authentication must still allow bounded interruption");
+    runner.expect(!metrics->released_during_authenticate_request,
+                  "TraderApi must not be released during an active request");
+    runner.expect(metrics->release_calls == 1,
+                  "concurrent interruption must release TraderApi once");
+}
+
 std::unique_ptr<FakeTraderApi> logged_in_api(
     const std::shared_ptr<FakeMetrics>& metrics)
 {
@@ -749,6 +804,7 @@ int main()
     test_wrong_ids_disconnect_and_timeout(runner);
     test_interruption_stops_trader_client(runner);
     test_all_trader_wait_phases_terminate(runner);
+    test_release_waits_for_active_authenticate_request(runner);
     test_query_failures_and_empty_positions(runner);
     test_exit_codes_and_safe_output(runner);
     return runner.finish();

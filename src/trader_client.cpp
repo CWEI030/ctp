@@ -237,6 +237,11 @@ TraderResult TraderClient::run(
 
 void TraderClient::OnFrontConnected()
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != TraderState::Connecting) {
@@ -257,6 +262,9 @@ void TraderClient::OnFrontConnected()
         return;
     }
 
+    if (!can_request(TraderState::AuthenticationPending)) {
+        return;
+    }
     const int code = api_->request_authenticate(
         &request, kAuthenticationRequestId);
     if (code != 0) {
@@ -269,6 +277,11 @@ void TraderClient::OnFrontConnected()
 
 void TraderClient::OnFrontDisconnected(int reason)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     finish(TraderState::Disconnected, reason, "trader front disconnected");
 }
 
@@ -278,6 +291,11 @@ void TraderClient::OnRspAuthenticate(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != TraderState::AuthenticationPending ||
@@ -323,6 +341,9 @@ void TraderClient::OnRspAuthenticate(
         return;
     }
 
+    if (!can_request(TraderState::LoginPending)) {
+        return;
+    }
     const int code = api_->request_user_login(&request, kLoginRequestId);
     if (code != 0) {
         finish(
@@ -338,6 +359,11 @@ void TraderClient::OnRspUserLogin(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != TraderState::LoginPending ||
@@ -379,6 +405,9 @@ void TraderClient::OnRspUserLogin(
         return;
     }
 
+    if (!can_request(TraderState::TradingAccountPending)) {
+        return;
+    }
     const int code = api_->request_trading_account(
         &request, kTradingAccountRequestId);
     if (code != 0) {
@@ -395,6 +424,11 @@ void TraderClient::OnRspQryTradingAccount(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != TraderState::TradingAccountPending ||
@@ -448,6 +482,9 @@ void TraderClient::OnRspQryTradingAccount(
         return;
     }
 
+    if (!can_request(TraderState::InvestorPositionPending)) {
+        return;
+    }
     const int code = api_->request_investor_position(
         &request, kInvestorPositionRequestId);
     if (code != 0) {
@@ -464,6 +501,11 @@ void TraderClient::OnRspQryInvestorPosition(
     int request_id,
     bool is_last)
 {
+    CallbackGuard callback{*this};
+    if (!callback) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (result_.state != TraderState::InvestorPositionPending ||
@@ -509,6 +551,48 @@ bool TraderClient::is_terminal() const
            result_.state == TraderState::Interrupted;
 }
 
+TraderClient::CallbackGuard::CallbackGuard(TraderClient& client)
+    : client_(client), entered_(client_.enter_callback())
+{
+}
+
+TraderClient::CallbackGuard::~CallbackGuard()
+{
+    if (entered_) {
+        client_.leave_callback();
+    }
+}
+
+TraderClient::CallbackGuard::operator bool() const
+{
+    return entered_;
+}
+
+bool TraderClient::enter_callback()
+{
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (releasing_ || released_) {
+        return false;
+    }
+    ++active_callbacks_;
+    return true;
+}
+
+void TraderClient::leave_callback()
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        --active_callbacks_;
+    }
+    condition_.notify_all();
+}
+
+bool TraderClient::can_request(TraderState expected_state)
+{
+    std::lock_guard<std::mutex> lock{mutex_};
+    return !releasing_ && !released_ && result_.state == expected_state;
+}
+
 void TraderClient::finish(
     TraderState state,
     int error_code,
@@ -528,11 +612,26 @@ void TraderClient::finish(
 
 void TraderClient::release_api()
 {
-    if (released_) {
-        return;
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        if (released_) {
+            return;
+        }
+        if (releasing_) {
+            condition_.wait(lock, [this] { return released_; });
+            return;
+        }
+        releasing_ = true;
+        condition_.wait(lock, [this] {
+            return active_callbacks_ == 0;
+        });
     }
     api_->release();
-    released_ = true;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        released_ = true;
+    }
+    condition_.notify_all();
 }
 
 int run_account(
