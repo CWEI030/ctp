@@ -15,6 +15,7 @@ constexpr int kMissingLoginResponse = -1;
 constexpr int kInvalidLoginFields = -2;
 constexpr int kInvalidInstrument = -3;
 constexpr int kMissingSubscriptionResponse = -4;
+constexpr auto kStopCheckInterval = std::chrono::milliseconds{50};
 
 class CtpMarketApi final : public MarketApi {
 public:
@@ -120,6 +121,10 @@ int report_market_result(
               << result.error_code << '\n';
         return market_exit_code(result.state);
     }
+    if (result.state == MarketState::Interrupted) {
+        error << "[error] market operation interrupted\n";
+        return market_exit_code(result.state);
+    }
 
     error << "[error] market operation failed: code=" << result.error_code;
     if (!result.error_message.empty()) {
@@ -141,7 +146,9 @@ MarketClient::~MarketClient()
     release_api();
 }
 
-MarketResult MarketClient::run(std::chrono::milliseconds timeout)
+MarketResult MarketClient::run(
+    std::chrono::milliseconds timeout,
+    const StopRequested& stop_requested)
 {
     api_->register_spi(this);
     api_->register_front(config_.market_front());
@@ -150,9 +157,27 @@ MarketResult MarketClient::run(std::chrono::milliseconds timeout)
     MarketResult result;
     {
         std::unique_lock<std::mutex> lock{mutex_};
-        if (!condition_.wait_for(lock, timeout, [this] { return is_terminal(); })) {
-            result_.state = MarketState::TimedOut;
-            result_.error_message = "market operation timed out";
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!is_terminal()) {
+            if (stop_requested && stop_requested()) {
+                result_.state = MarketState::Interrupted;
+                result_.error_message = "market operation interrupted";
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                result_.state = MarketState::TimedOut;
+                result_.error_message = "market operation timed out";
+                break;
+            }
+
+            auto wake_at = now + kStopCheckInterval;
+            if (wake_at > deadline) {
+                wake_at = deadline;
+            }
+            condition_.wait_until(
+                lock, wake_at, [this] { return is_terminal(); });
         }
         result = result_;
     }
@@ -343,7 +368,8 @@ bool MarketClient::is_terminal() const
            result_.state == MarketState::LoginFailed ||
            result_.state == MarketState::SubscriptionFailed ||
            result_.state == MarketState::Disconnected ||
-           result_.state == MarketState::TimedOut;
+           result_.state == MarketState::TimedOut ||
+           result_.state == MarketState::Interrupted;
 }
 
 void MarketClient::finish(
@@ -372,7 +398,10 @@ void MarketClient::release_api()
     released_ = true;
 }
 
-int run_market(const RuntimeConfig& config, std::chrono::milliseconds timeout)
+int run_market(
+    const RuntimeConfig& config,
+    std::chrono::milliseconds timeout,
+    const StopRequested& stop_requested)
 {
     auto api = create_market_api();
     if (!api) {
@@ -381,7 +410,7 @@ int run_market(const RuntimeConfig& config, std::chrono::milliseconds timeout)
     }
 
     MarketClient client{config, std::move(api)};
-    const auto result = client.run(timeout);
+    const auto result = client.run(timeout, stop_requested);
 
     return report_market_result(result, std::cout, std::cerr);
 }
@@ -390,6 +419,9 @@ int market_exit_code(MarketState state)
 {
     if (state == MarketState::Completed) {
         return 0;
+    }
+    if (state == MarketState::Interrupted) {
+        return 130;
     }
     if (state == MarketState::Disconnected ||
         state == MarketState::TimedOut) {

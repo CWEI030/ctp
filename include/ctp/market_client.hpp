@@ -2,6 +2,7 @@
 
 #include "ThostFtdcMdApi.h"
 #include "ctp/config.hpp"
+#include "ctp/interrupt.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -23,6 +24,7 @@ enum class MarketState {
     SubscriptionFailed,
     Disconnected,
     TimedOut,
+    Interrupted,
 };
 
 struct MarketTick {
@@ -71,7 +73,9 @@ public:
         std::unique_ptr<MarketApi> api);
     ~MarketClient();
 
-    MarketResult run(std::chrono::milliseconds timeout);
+    MarketResult run(
+        std::chrono::milliseconds timeout,
+        const StopRequested& stop_requested = {});
 
     void OnFrontConnected() override;
     void OnFrontDisconnected(int reason) override;
@@ -103,7 +107,8 @@ private:
 
 int run_market(
     const RuntimeConfig& config,
-    std::chrono::milliseconds timeout = std::chrono::seconds{15});
+    std::chrono::milliseconds timeout = std::chrono::seconds{15},
+    const StopRequested& stop_requested = {});
 int market_exit_code(MarketState state);
 
 }

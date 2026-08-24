@@ -236,6 +236,76 @@ void position_success(
     api.spi()->OnRspQryInvestorPosition(&response, &info, 4, is_last);
 }
 
+enum class TraderWaitPhase {
+    Connecting,
+    Authentication,
+    Login,
+    TradingAccount,
+    InvestorPosition,
+};
+
+std::unique_ptr<FakeTraderApi> trader_api_waiting_at(
+    const std::shared_ptr<FakeMetrics>& metrics,
+    TraderWaitPhase phase,
+    bool disconnect)
+{
+    auto api = std::make_unique<FakeTraderApi>(metrics);
+    if (phase == TraderWaitPhase::Connecting) {
+        if (disconnect) {
+            api->on_init = [](FakeTraderApi& value) {
+                value.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_init = [](FakeTraderApi& value) {
+        value.spi()->OnFrontConnected();
+    };
+    if (phase == TraderWaitPhase::Authentication) {
+        if (disconnect) {
+            api->on_authenticate = [](FakeTraderApi& value) {
+                value.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_authenticate = [](FakeTraderApi& value) {
+        authenticate_success(value);
+    };
+    if (phase == TraderWaitPhase::Login) {
+        if (disconnect) {
+            api->on_login = [](FakeTraderApi& value) {
+                value.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_login = [](FakeTraderApi& value) {
+        login_success(value);
+    };
+    if (phase == TraderWaitPhase::TradingAccount) {
+        if (disconnect) {
+            api->on_account = [](FakeTraderApi& value) {
+                value.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_account = [](FakeTraderApi& value) {
+        account_success(value);
+    };
+    if (disconnect) {
+        api->on_position = [](FakeTraderApi& value) {
+            value.spi()->OnFrontDisconnected(0x2001);
+        };
+    }
+    return api;
+}
+
 void test_success_advances_once(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -458,6 +528,73 @@ void test_wrong_ids_disconnect_and_timeout(TestRunner& runner)
     runner.expect(disconnect_result.error_code == 0x2001, "disconnect reason must survive");
 }
 
+void test_interruption_stops_trader_client(TestRunner& runner)
+{
+    auto metrics = std::make_shared<FakeMetrics>();
+    auto api = std::make_unique<FakeTraderApi>(metrics);
+    ctp::TraderClient client{account_config(), std::move(api)};
+
+    const auto result = client.run(
+        std::chrono::milliseconds{100}, [] { return true; });
+    client.OnFrontConnected();
+
+    runner.expect(
+        result.state == ctp::TraderState::Interrupted,
+        "stop request must interrupt the trader client");
+    runner.expect(
+        ctp::trader_exit_code(result.state) == 130,
+        "trader interruption must map to exit code 130");
+    runner.expect(metrics->authenticate_calls == 0,
+                  "late callbacks must not advance after interruption");
+    runner.expect(metrics->release_calls == 1,
+                  "interruption must release TraderApi once");
+}
+
+void test_all_trader_wait_phases_terminate(TestRunner& runner)
+{
+    const TraderWaitPhase phases[]{
+        TraderWaitPhase::Connecting,
+        TraderWaitPhase::Authentication,
+        TraderWaitPhase::Login,
+        TraderWaitPhase::TradingAccount,
+        TraderWaitPhase::InvestorPosition};
+
+    for (const auto phase : phases) {
+        auto timeout_metrics = std::make_shared<FakeMetrics>();
+        ctp::TraderClient timed_out{
+            account_config(),
+            trader_api_waiting_at(timeout_metrics, phase, false)};
+        const auto timeout_result =
+            timed_out.run(std::chrono::milliseconds{2});
+        runner.expect(timeout_result.state == ctp::TraderState::TimedOut,
+                      "every trader wait phase must time out");
+        runner.expect(timeout_metrics->release_calls == 1,
+                      "every trader timeout must release once");
+
+        auto interrupt_metrics = std::make_shared<FakeMetrics>();
+        ctp::TraderClient interrupted{
+            account_config(),
+            trader_api_waiting_at(interrupt_metrics, phase, false)};
+        const auto interrupt_result = interrupted.run(
+            std::chrono::milliseconds{100}, [] { return true; });
+        runner.expect(interrupt_result.state == ctp::TraderState::Interrupted,
+                      "every trader wait phase must be interruptible");
+        runner.expect(interrupt_metrics->release_calls == 1,
+                      "every trader interruption must release once");
+
+        auto disconnect_metrics = std::make_shared<FakeMetrics>();
+        ctp::TraderClient disconnected{
+            account_config(),
+            trader_api_waiting_at(disconnect_metrics, phase, true)};
+        const auto disconnect_result =
+            disconnected.run(std::chrono::milliseconds{100});
+        runner.expect(disconnect_result.state == ctp::TraderState::Disconnected,
+                      "every trader wait phase must handle disconnection");
+        runner.expect(disconnect_metrics->release_calls == 1,
+                      "every trader disconnection must release once");
+    }
+}
+
 std::unique_ptr<FakeTraderApi> logged_in_api(
     const std::shared_ptr<FakeMetrics>& metrics)
 {
@@ -610,6 +747,8 @@ int main()
     test_immediate_and_business_failures(runner);
     test_login_failure_and_missing_response(runner);
     test_wrong_ids_disconnect_and_timeout(runner);
+    test_interruption_stops_trader_client(runner);
+    test_all_trader_wait_phases_terminate(runner);
     test_query_failures_and_empty_positions(runner);
     test_exit_codes_and_safe_output(runner);
     return runner.finish();

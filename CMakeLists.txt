@@ -35,6 +35,13 @@ target_compile_options(ctp_config PRIVATE
     -Wextra
     -Wpedantic)
 
+add_library(ctp_interrupt src/interrupt.cpp)
+target_include_directories(ctp_interrupt PUBLIC include)
+target_compile_options(ctp_interrupt PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic)
+
 add_library(ctp_market src/market_client.cpp)
 target_include_directories(ctp_market PUBLIC include)
 target_include_directories(ctp_market SYSTEM PUBLIC "${CTP_MD_DIR}")
@@ -68,6 +75,7 @@ target_link_directories(ctp_client PRIVATE
     "${CTP_MD_DIR}")
 
 target_link_libraries(ctp_client PRIVATE
+    ctp_interrupt
     ctp_market
     ctp_trader)
 
@@ -82,6 +90,14 @@ set_target_properties(ctp_client PROPERTIES
 include(CTest)
 
 if(BUILD_TESTING)
+    add_executable(ctp_interrupt_tests tests/interrupt_test.cpp)
+    target_link_libraries(ctp_interrupt_tests PRIVATE ctp_interrupt)
+    target_compile_options(ctp_interrupt_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic)
+    add_test(NAME interrupt COMMAND ctp_interrupt_tests)
+
     add_executable(ctp_config_tests tests/config_test.cpp)
     target_link_libraries(ctp_config_tests PRIVATE ctp_config)
     target_compile_options(ctp_config_tests PRIVATE

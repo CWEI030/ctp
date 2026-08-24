@@ -19,6 +19,7 @@ constexpr int kInvalidLoginFields = -4;
 constexpr int kMissingTradingAccountResponse = -5;
 constexpr int kInvalidTradingAccountFields = -6;
 constexpr int kInvalidInvestorPositionFields = -7;
+constexpr auto kStopCheckInterval = std::chrono::milliseconds{50};
 
 class CtpTraderApi final : public TraderApi {
 public:
@@ -158,6 +159,8 @@ int report_trader_result(
     }
     if (result.state == TraderState::TimedOut) {
         error << "[error] trader operation timed out\n";
+    } else if (result.state == TraderState::Interrupted) {
+        error << "[error] trader operation interrupted\n";
     } else if (result.state == TraderState::Disconnected) {
         error << "[error] trader front disconnected: reason="
               << result.error_code << '\n';
@@ -190,7 +193,9 @@ TraderClient::~TraderClient()
     release_api();
 }
 
-TraderResult TraderClient::run(std::chrono::milliseconds timeout)
+TraderResult TraderClient::run(
+    std::chrono::milliseconds timeout,
+    const StopRequested& stop_requested)
 {
     api_->register_spi(this);
     api_->subscribe_private_topic(THOST_TERT_QUICK, 1);
@@ -201,9 +206,27 @@ TraderResult TraderClient::run(std::chrono::milliseconds timeout)
     TraderResult result;
     {
         std::unique_lock<std::mutex> lock{mutex_};
-        if (!condition_.wait_for(lock, timeout, [this] { return is_terminal(); })) {
-            result_.state = TraderState::TimedOut;
-            result_.error_message = "trader operation timed out";
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!is_terminal()) {
+            if (stop_requested && stop_requested()) {
+                result_.state = TraderState::Interrupted;
+                result_.error_message = "trader operation interrupted";
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                result_.state = TraderState::TimedOut;
+                result_.error_message = "trader operation timed out";
+                break;
+            }
+
+            auto wake_at = now + kStopCheckInterval;
+            if (wake_at > deadline) {
+                wake_at = deadline;
+            }
+            condition_.wait_until(
+                lock, wake_at, [this] { return is_terminal(); });
         }
         result = result_;
     }
@@ -482,7 +505,8 @@ bool TraderClient::is_terminal() const
            result_.state == TraderState::LoginFailed ||
            result_.state == TraderState::QueryFailed ||
            result_.state == TraderState::Disconnected ||
-           result_.state == TraderState::TimedOut;
+           result_.state == TraderState::TimedOut ||
+           result_.state == TraderState::Interrupted;
 }
 
 void TraderClient::finish(
@@ -511,7 +535,10 @@ void TraderClient::release_api()
     released_ = true;
 }
 
-int run_account(const RuntimeConfig& config, std::chrono::milliseconds timeout)
+int run_account(
+    const RuntimeConfig& config,
+    std::chrono::milliseconds timeout,
+    const StopRequested& stop_requested)
 {
     auto api = create_trader_api();
     if (!api) {
@@ -520,13 +547,17 @@ int run_account(const RuntimeConfig& config, std::chrono::milliseconds timeout)
     }
 
     TraderClient client{config, std::move(api)};
-    return report_trader_result(client.run(timeout), std::cout, std::cerr);
+    return report_trader_result(
+        client.run(timeout, stop_requested), std::cout, std::cerr);
 }
 
 int trader_exit_code(TraderState state)
 {
     if (state == TraderState::Completed) {
         return 0;
+    }
+    if (state == TraderState::Interrupted) {
+        return 130;
     }
     if (state == TraderState::Disconnected || state == TraderState::TimedOut) {
         return 4;

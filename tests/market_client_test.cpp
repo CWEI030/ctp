@@ -169,6 +169,59 @@ void emit_ticks(FakeMarketApi& api, int count)
     }
 }
 
+enum class MarketWaitPhase {
+    Connecting,
+    Login,
+    Subscription,
+    Tick,
+};
+
+std::unique_ptr<FakeMarketApi> market_api_waiting_at(
+    const std::shared_ptr<FakeMetrics>& metrics,
+    MarketWaitPhase phase,
+    bool disconnect)
+{
+    auto api = std::make_unique<FakeMarketApi>(metrics);
+    if (phase == MarketWaitPhase::Connecting) {
+        if (disconnect) {
+            api->on_init = [](FakeMarketApi& fake) {
+                fake.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_init = [](FakeMarketApi& fake) {
+        fake.spi()->OnFrontConnected();
+    };
+    if (phase == MarketWaitPhase::Login) {
+        if (disconnect) {
+            api->on_login_request = [](FakeMarketApi& fake) {
+                fake.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_login_request = respond_with_success;
+    if (phase == MarketWaitPhase::Subscription) {
+        if (disconnect) {
+            api->on_subscribe = [](FakeMarketApi& fake) {
+                fake.spi()->OnFrontDisconnected(0x2001);
+            };
+        }
+        return api;
+    }
+
+    api->on_subscribe = [disconnect](FakeMarketApi& fake) {
+        respond_to_subscription(fake, 0, {});
+        if (disconnect) {
+            fake.spi()->OnFrontDisconnected(0x2001);
+        }
+    };
+    return api;
+}
+
 void test_subscription_response_is_required(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -384,6 +437,72 @@ void test_disconnect_and_timeout(TestRunner& runner)
     runner.expect(timeout_metrics->release_calls == 1, "timeout must release once");
 }
 
+void test_interruption_stops_market_client(TestRunner& runner)
+{
+    auto metrics = std::make_shared<FakeMetrics>();
+    auto api = std::make_unique<FakeMarketApi>(metrics);
+    ctp::MarketClient client{market_config(), std::move(api)};
+
+    const auto result = client.run(
+        std::chrono::milliseconds{100}, [] { return true; });
+    client.OnFrontConnected();
+
+    runner.expect(
+        result.state == ctp::MarketState::Interrupted,
+        "stop request must interrupt the market client");
+    runner.expect(
+        ctp::market_exit_code(result.state) == 130,
+        "market interruption must map to exit code 130");
+    runner.expect(metrics->login_calls == 0,
+                  "late callbacks must not advance after interruption");
+    runner.expect(metrics->release_calls == 1,
+                  "interruption must release MarketApi once");
+}
+
+void test_all_market_wait_phases_terminate(TestRunner& runner)
+{
+    const MarketWaitPhase phases[]{
+        MarketWaitPhase::Connecting,
+        MarketWaitPhase::Login,
+        MarketWaitPhase::Subscription,
+        MarketWaitPhase::Tick};
+
+    for (const auto phase : phases) {
+        auto timeout_metrics = std::make_shared<FakeMetrics>();
+        ctp::MarketClient timed_out{
+            market_config(),
+            market_api_waiting_at(timeout_metrics, phase, false)};
+        const auto timeout_result =
+            timed_out.run(std::chrono::milliseconds{2});
+        runner.expect(timeout_result.state == ctp::MarketState::TimedOut,
+                      "every market wait phase must time out");
+        runner.expect(timeout_metrics->release_calls == 1,
+                      "every market timeout must release once");
+
+        auto interrupt_metrics = std::make_shared<FakeMetrics>();
+        ctp::MarketClient interrupted{
+            market_config(),
+            market_api_waiting_at(interrupt_metrics, phase, false)};
+        const auto interrupt_result = interrupted.run(
+            std::chrono::milliseconds{100}, [] { return true; });
+        runner.expect(interrupt_result.state == ctp::MarketState::Interrupted,
+                      "every market wait phase must be interruptible");
+        runner.expect(interrupt_metrics->release_calls == 1,
+                      "every market interruption must release once");
+
+        auto disconnect_metrics = std::make_shared<FakeMetrics>();
+        ctp::MarketClient disconnected{
+            market_config(),
+            market_api_waiting_at(disconnect_metrics, phase, true)};
+        const auto disconnect_result =
+            disconnected.run(std::chrono::milliseconds{100});
+        runner.expect(disconnect_result.state == ctp::MarketState::Disconnected,
+                      "every market wait phase must handle disconnection");
+        runner.expect(disconnect_metrics->release_calls == 1,
+                      "every market disconnection must release once");
+    }
+}
+
 void test_null_and_late_callbacks(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -478,6 +597,8 @@ int main()
     test_immediate_request_failure(runner);
     test_business_login_failure(runner);
     test_disconnect_and_timeout(runner);
+    test_interruption_stops_market_client(runner);
+    test_all_market_wait_phases_terminate(runner);
     test_null_and_late_callbacks(runner);
     test_exit_codes(runner);
     test_tick_format(runner);

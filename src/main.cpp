@@ -1,7 +1,9 @@
 #include "ctp/config.hpp"
+#include "ctp/interrupt.hpp"
 #include "ctp/market_client.hpp"
 #include "ctp/trader_client.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <string_view>
 #include <vector>
@@ -20,9 +22,20 @@ int main(int argc, char* argv[])
     }
 
     const auto& config = *result.config;
-    if (config.mode() == ctp::Mode::Market) {
-        return ctp::run_market(config);
+    ctp::SigintHandler sigint;
+    if (!sigint.installed()) {
+        std::cerr << "[error] failed to install SIGINT handler\n";
+        return 3;
     }
 
-    return ctp::run_account(config);
+    const ctp::StopRequested stop_requested = [&sigint] {
+        return sigint.stop_requested();
+    };
+    if (config.mode() == ctp::Mode::Market) {
+        return ctp::run_market(
+            config, std::chrono::seconds{15}, stop_requested);
+    }
+
+    return ctp::run_account(
+        config, std::chrono::seconds{15}, stop_requested);
 }

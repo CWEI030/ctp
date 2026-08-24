@@ -2,6 +2,7 @@
 
 #include "ThostFtdcTraderApi.h"
 #include "ctp/config.hpp"
+#include "ctp/interrupt.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -26,6 +27,7 @@ enum class TraderState {
     QueryFailed,
     Disconnected,
     TimedOut,
+    Interrupted,
 };
 
 struct TradingAccountSummary {
@@ -84,7 +86,9 @@ public:
         std::unique_ptr<TraderApi> api);
     ~TraderClient();
 
-    TraderResult run(std::chrono::milliseconds timeout);
+    TraderResult run(
+        std::chrono::milliseconds timeout,
+        const StopRequested& stop_requested = {});
 
     void OnFrontConnected() override;
     void OnFrontDisconnected(int reason) override;
@@ -124,7 +128,8 @@ private:
 
 int run_account(
     const RuntimeConfig& config,
-    std::chrono::milliseconds timeout = std::chrono::seconds{15});
+    std::chrono::milliseconds timeout = std::chrono::seconds{15},
+    const StopRequested& stop_requested = {});
 int trader_exit_code(TraderState state);
 
 }
