@@ -329,6 +329,27 @@ void test_login_starts_single_subscription(TestRunner& runner)
         "configured instrument must be subscribed");
 }
 
+void test_zero_login_request_id_starts_subscription(TestRunner& runner)
+{
+    auto metrics = std::make_shared<FakeMetrics>();
+    auto api = std::make_unique<FakeMarketApi>(metrics);
+    api->on_init = [](FakeMarketApi& fake) {
+        fake.spi()->OnFrontConnected();
+    };
+    api->on_login_request = [](FakeMarketApi& fake) {
+        CThostFtdcRspUserLoginField response{};
+        CThostFtdcRspInfoField info{};
+        fake.spi()->OnRspUserLogin(&response, &info, 0, true);
+    };
+
+    ctp::MarketClient client{market_config(), std::move(api)};
+    client.run(std::chrono::milliseconds{2});
+
+    runner.expect(
+        metrics->subscribe_calls == 1,
+        "SimNow login response ID 0 must start subscription");
+}
+
 void test_success_and_lifecycle(TestRunner& runner)
 {
     auto metrics = std::make_shared<FakeMetrics>();
@@ -642,6 +663,7 @@ int main()
 {
     TestRunner runner;
     test_login_starts_single_subscription(runner);
+    test_zero_login_request_id_starts_subscription(runner);
     test_subscription_response_is_required(runner);
     test_subscription_business_failure(runner);
     test_immediate_subscription_failure(runner);

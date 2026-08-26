@@ -249,8 +249,11 @@ void MarketClient::OnRspUserLogin(
 
     {
         std::lock_guard<std::mutex> lock{mutex_};
+        // SimNow 行情登录回调可能返回 0，即使请求使用了非零编号。
+        const bool matches_login_request =
+            request_id == 0 || request_id == kLoginRequestId;
         if (result_.state != MarketState::LoginPending ||
-            request_id != kLoginRequestId) {
+            !matches_login_request) {
             return;
         }
     }
