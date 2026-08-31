@@ -54,6 +54,17 @@ std::string trim(std::string_view text)
     return std::string{text.substr(first, last - first + 1)};
 }
 
+bool fits_field(std::string_view value, std::size_t capacity)
+{
+    return !value.empty() && value.size() < capacity;
+}
+
+bool is_tcp_front(std::string_view value)
+{
+    constexpr std::string_view prefix{"tcp://"};
+    return value.size() > prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
 ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
 {
     std::string engine_mode;
@@ -190,6 +201,29 @@ ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
             }
         }
 
+        struct FixedField {
+            std::string_view name;
+            std::size_t capacity;
+        };
+        constexpr FixedField fixed_fields[]{
+            {"broker_id", kBrokerIdCapacity},
+            {"user_id", kUserIdCapacity},
+            {"password", kPasswordCapacity},
+            {"app_id", kAppIdCapacity},
+            {"auth_code", kAuthCodeCapacity},
+        };
+        for (const auto& field : fixed_fields) {
+            if (!fits_field(section.fields.at(std::string{field.name}), field.capacity)) {
+                return failure(
+                    "account '" + section.alias + "' " + std::string{field.name}
+                    + " exceeds CTP field capacity");
+            }
+        }
+
+        if (!is_tcp_front(section.fields.at("trader_front"))) {
+            return failure("account '" + section.alias + "' trader_front must use tcp://");
+        }
+
         accounts.emplace_back(
             section.alias,
             section.fields.at("broker_id"),
@@ -239,17 +273,6 @@ std::optional<std::string> read_required(
         return std::nullopt;
     }
     return value;
-}
-
-bool fits_field(std::string_view value, std::size_t capacity)
-{
-    return !value.empty() && value.size() < capacity;
-}
-
-bool is_tcp_front(std::string_view value)
-{
-    constexpr std::string_view prefix{"tcp://"};
-    return value.size() > prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
 std::optional<int> parse_positive_int(std::string_view text)

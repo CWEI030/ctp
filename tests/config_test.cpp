@@ -94,6 +94,23 @@ std::string make_accounts_ini(std::size_t enabled_accounts, bool add_disabled = 
     return output.str();
 }
 
+std::string replace_account_field(
+    std::string ini,
+    std::string_view field,
+    std::string_view replacement)
+{
+    const std::string prefix = std::string{field} + "=";
+    const auto field_begin = ini.find(prefix);
+    if (field_begin == std::string::npos) {
+        return ini;
+    }
+
+    const auto value_begin = field_begin + prefix.size();
+    const auto value_end = ini.find('\n', value_begin);
+    ini.replace(value_begin, value_end - value_begin, replacement);
+    return ini;
+}
+
 ctp::EnvironmentReader environment_reader(Environment values)
 {
     return [values = std::move(values)](std::string_view name)
@@ -264,6 +281,75 @@ void test_engine_requires_private_regular_config_file(TestRunner& runner)
         "regular file");
 }
 
+void test_engine_rejects_invalid_account_schema(TestRunner& runner)
+{
+    {
+        TemporaryAccountFile file{make_accounts_ini(1) + make_accounts_ini(1)};
+        expect_error_contains(
+            runner,
+            parse({"engine", "--mode", "live", "--config", file.path()}, {}),
+            "duplicate alias");
+    }
+
+    {
+        const std::string without_password =
+            replace_account_field(make_accounts_ini(1), "password", "");
+        TemporaryAccountFile file{without_password};
+        expect_error_contains(
+            runner,
+            parse({"engine", "--mode", "live", "--config", file.path()}, {}),
+            "password");
+    }
+
+    {
+        const std::string invalid_front = replace_account_field(
+            make_accounts_ini(1),
+            "trader_front",
+            "http://127.0.0.1:41001");
+        TemporaryAccountFile file{invalid_front};
+        expect_error_contains(
+            runner,
+            parse({"engine", "--mode", "live", "--config", file.path()}, {}),
+            "trader_front");
+    }
+}
+
+void test_engine_rejects_oversized_fields_without_leaking_values(TestRunner& runner)
+{
+    struct FieldBoundary {
+        std::string_view name;
+        std::size_t capacity;
+        char secret_character;
+    };
+
+    constexpr FieldBoundary boundaries[]{
+        {"broker_id", ctp::kBrokerIdCapacity, 'b'},
+        {"user_id", ctp::kUserIdCapacity, 'u'},
+        {"password", ctp::kPasswordCapacity, 'p'},
+        {"app_id", ctp::kAppIdCapacity, 'a'},
+        {"auth_code", ctp::kAuthCodeCapacity, 'c'},
+    };
+
+    for (const auto& boundary : boundaries) {
+        const std::string secret_value(
+            boundary.capacity,
+            boundary.secret_character);
+        const std::string invalid_ini = replace_account_field(
+            make_accounts_ini(1),
+            boundary.name,
+            secret_value);
+        TemporaryAccountFile file{invalid_ini};
+        const auto result = parse(
+            {"engine", "--mode", "live", "--config", file.path()},
+            {});
+
+        expect_error_contains(runner, result, boundary.name);
+        runner.expect(
+            result.error.find(secret_value) == std::string::npos,
+            "account config error must not contain the rejected field value");
+    }
+}
+
 void test_invalid_inputs(TestRunner& runner)
 {
     const Environment market_env{
@@ -362,6 +448,8 @@ int main()
     test_engine_accepts_variable_account_count(runner);
     test_engine_rejects_zero_enabled_accounts(runner);
     test_engine_requires_private_regular_config_file(runner);
+    test_engine_rejects_invalid_account_schema(runner);
+    test_engine_rejects_oversized_fields_without_leaking_values(runner);
     test_invalid_inputs(runner);
     test_field_boundaries(runner);
     return runner.finish();
