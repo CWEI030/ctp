@@ -4,7 +4,10 @@
 
 #include <charconv>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -24,6 +27,11 @@ struct Profile {
     std::string_view trader_front;
 };
 
+struct AccountSection {
+    std::string alias;
+    std::unordered_map<std::string, std::string> fields;
+};
+
 constexpr Profile kProfiles[]{
     {"simnow-1", "tcp://180.168.146.187:10211", "tcp://180.168.146.187:10201"},
     {"simnow-2", "tcp://180.168.146.187:10212", "tcp://180.168.146.187:10202"},
@@ -33,6 +41,183 @@ constexpr Profile kProfiles[]{
 ConfigResult failure(std::string message)
 {
     return {std::nullopt, std::move(message)};
+}
+
+std::string trim(std::string_view text)
+{
+    constexpr std::string_view whitespace{" \t\r"};
+    const auto first = text.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) {
+        return {};
+    }
+    const auto last = text.find_last_not_of(whitespace);
+    return std::string{text.substr(first, last - first + 1)};
+}
+
+ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
+{
+    std::string engine_mode;
+    std::string config_path;
+    std::unordered_set<std::string_view> seen_options;
+
+    for (std::size_t index = 1; index < arguments.size(); index += 2) {
+        const auto option = arguments[index];
+        if (option != "--mode" && option != "--config") {
+            return failure("unknown engine command-line option");
+        }
+        if (!seen_options.insert(option).second) {
+            return failure("duplicate engine command-line option");
+        }
+        if (index + 1 >= arguments.size()) {
+            return failure("engine command-line option is missing a value");
+        }
+
+        if (option == "--mode") {
+            engine_mode = std::string{arguments[index + 1]};
+        } else {
+            config_path = std::string{arguments[index + 1]};
+        }
+    }
+
+    if (engine_mode != "live") {
+        return failure("engine --mode must be live");
+    }
+    if (config_path.empty()) {
+        return failure("engine --config is required");
+    }
+
+    std::error_code status_error;
+    const auto file_status =
+        std::filesystem::symlink_status(config_path, status_error);
+    if (status_error) {
+        return failure("account config file status cannot be read");
+    }
+    if (!std::filesystem::is_regular_file(file_status)) {
+        return failure("account config path must be a regular file");
+    }
+
+    constexpr auto required_permissions =
+        std::filesystem::perms::owner_read
+        | std::filesystem::perms::owner_write;
+    const auto actual_permissions =
+        file_status.permissions() & std::filesystem::perms::mask;
+    if (actual_permissions != required_permissions) {
+        return failure("account config file permissions must be 0600");
+    }
+
+    std::ifstream input{config_path};
+    if (!input) {
+        return failure("account config file cannot be opened");
+    }
+
+    std::vector<AccountSection> sections;
+    std::unordered_set<std::string> aliases;
+    AccountSection* current_section = nullptr;
+    std::string line;
+    std::size_t line_number = 0;
+
+    while (std::getline(input, line)) {
+        ++line_number;
+        const std::string cleaned = trim(line);
+        if (cleaned.empty() || cleaned.front() == '#' || cleaned.front() == ';') {
+            continue;
+        }
+
+        if (cleaned.front() == '[') {
+            if (cleaned.back() != ']') {
+                return failure("account config has an invalid section header");
+            }
+
+            constexpr std::string_view prefix{"account."};
+            const std::string section_name =
+                cleaned.substr(1, cleaned.size() - 2);
+            if (section_name.size() <= prefix.size()
+                || section_name.compare(0, prefix.size(), prefix) != 0) {
+                return failure("account config section must use [account.alias]");
+            }
+
+            std::string alias = section_name.substr(prefix.size());
+            if (!aliases.insert(alias).second) {
+                return failure("account config contains a duplicate alias");
+            }
+            sections.push_back({std::move(alias), {}});
+            current_section = &sections.back();
+            continue;
+        }
+
+        if (current_section == nullptr) {
+            return failure("account config field appears before a section");
+        }
+
+        const auto separator = cleaned.find('=');
+        if (separator == std::string::npos) {
+            return failure(
+                "account config line " + std::to_string(line_number)
+                + " must use key=value");
+        }
+
+        std::string key = trim(std::string_view{cleaned}.substr(0, separator));
+        std::string value = trim(std::string_view{cleaned}.substr(separator + 1));
+        if (key.empty()) {
+            return failure("account config contains an empty field name");
+        }
+        if (!current_section->fields.emplace(std::move(key), std::move(value)).second) {
+            return failure("account config contains a duplicate field");
+        }
+    }
+
+    std::vector<AccountConfig> accounts;
+    accounts.reserve(sections.size());
+    for (const auto& section : sections) {
+        const auto enabled = section.fields.find("enabled");
+        if (enabled == section.fields.end()) {
+            return failure("account '" + section.alias + "' is missing enabled");
+        }
+        if (enabled->second == "false") {
+            continue;
+        }
+        if (enabled->second != "true") {
+            return failure("account '" + section.alias + "' enabled must be true or false");
+        }
+
+        constexpr std::string_view required_fields[]{
+            "broker_id", "user_id", "password", "app_id", "auth_code", "trader_front"};
+        for (const auto field : required_fields) {
+            const auto found = section.fields.find(std::string{field});
+            if (found == section.fields.end() || found->second.empty()) {
+                return failure(
+                    "account '" + section.alias + "' is missing " + std::string{field});
+            }
+        }
+
+        accounts.emplace_back(
+            section.alias,
+            section.fields.at("broker_id"),
+            section.fields.at("user_id"),
+            section.fields.at("password"),
+            section.fields.at("app_id"),
+            section.fields.at("auth_code"),
+            section.fields.at("trader_front"));
+    }
+
+    if (accounts.empty()) {
+        return failure("at least one enabled account is required");
+    }
+
+    RuntimeConfig config{
+        Mode::Engine,
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        0,
+        std::move(accounts)};
+    return {std::move(config), {}};
 }
 
 const Profile* find_profile(std::string_view name)
@@ -81,6 +266,24 @@ std::optional<int> parse_positive_int(std::string_view text)
 
 }
 
+AccountConfig::AccountConfig(
+    std::string alias,
+    std::string broker_id,
+    std::string user_id,
+    std::string password,
+    std::string app_id,
+    std::string auth_code,
+    std::string trader_front)
+    : alias_(std::move(alias)),
+      broker_id_(std::move(broker_id)),
+      user_id_(std::move(user_id)),
+      password_(std::move(password)),
+      app_id_(std::move(app_id)),
+      auth_code_(std::move(auth_code)),
+      trader_front_(std::move(trader_front))
+{
+}
+
 RuntimeConfig::RuntimeConfig(
     Mode mode,
     std::string profile,
@@ -92,7 +295,8 @@ RuntimeConfig::RuntimeConfig(
     std::string market_front,
     std::string trader_front,
     std::string instrument,
-    int ticks)
+    int ticks,
+    std::vector<AccountConfig> accounts)
     : mode_(mode),
       profile_(std::move(profile)),
       broker_id_(std::move(broker_id)),
@@ -103,7 +307,8 @@ RuntimeConfig::RuntimeConfig(
       market_front_(std::move(market_front)),
       trader_front_(std::move(trader_front)),
       instrument_(std::move(instrument)),
-      ticks_(ticks)
+      ticks_(ticks),
+      accounts_(std::move(accounts))
 {
 }
 
@@ -113,6 +318,10 @@ ConfigResult parse_config(
 {
     if (arguments.empty()) {
         return failure("mode must be market or account");
+    }
+
+    if (arguments.front() == "engine") {
+        return parse_engine_config(arguments);
     }
 
     Mode mode;

@@ -1,8 +1,12 @@
 #include "ctp/config.hpp"
 
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -34,6 +38,61 @@ private:
 };
 
 using Environment = std::unordered_map<std::string, std::string>;
+
+class TemporaryAccountFile {
+public:
+    explicit TemporaryAccountFile(std::string_view contents)
+    {
+        static std::size_t sequence = 0;
+        const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        path_ = std::filesystem::temp_directory_path()
+            / ("ctp-accounts-" + std::to_string(timestamp) + "-"
+               + std::to_string(sequence++) + ".ini");
+
+        std::ofstream output{path_};
+        output << contents;
+        output.close();
+        std::filesystem::permissions(
+            path_,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace);
+    }
+
+    ~TemporaryAccountFile()
+    {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    TemporaryAccountFile(const TemporaryAccountFile&) = delete;
+    TemporaryAccountFile& operator=(const TemporaryAccountFile&) = delete;
+
+    std::string path() const { return path_.string(); }
+
+private:
+    std::filesystem::path path_;
+};
+
+std::string make_accounts_ini(std::size_t enabled_accounts, bool add_disabled = false)
+{
+    std::ostringstream output;
+    for (std::size_t index = 0; index < enabled_accounts; ++index) {
+        const auto number = index + 1;
+        output << "[account.account" << number << "]\n"
+               << "enabled=true\n"
+               << "broker_id=9999\n"
+               << "user_id=user" << number << "\n"
+               << "password=test-password-" << number << "\n"
+               << "app_id=test-app-" << number << "\n"
+               << "auth_code=test-auth-" << number << "\n"
+               << "trader_front=tcp://127.0.0.1:" << (41000 + number) << "\n\n";
+    }
+    if (add_disabled) {
+        output << "[account.disabled]\n"
+               << "enabled=false\n";
+    }
+    return output.str();
+}
 
 ctp::EnvironmentReader environment_reader(Environment values)
 {
@@ -109,6 +168,100 @@ void test_valid_account(TestRunner& runner)
     runner.expect(
         result.config->trader_front() == "tcp://182.254.243.31:40001",
         "7x24 trader front must match the profile");
+}
+
+void test_engine_accepts_variable_account_count(TestRunner& runner)
+{
+    for (std::size_t count = 1; count <= 5; ++count) {
+        TemporaryAccountFile file{make_accounts_ini(count, true)};
+        const std::string path = file.path();
+        const auto result = parse(
+            {"engine", "--mode", "live", "--config", path},
+            {});
+
+        runner.expect(
+            result.config.has_value(),
+            "engine must accept every enabled account count from one through five");
+        if (!result.config) {
+            continue;
+        }
+
+        runner.expect(result.config->mode() == ctp::Mode::Engine, "mode must be engine");
+        runner.expect(
+            result.config->accounts().size() == count,
+            "disabled sections must not count as enabled accounts");
+
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto number = index + 1;
+            const auto& account = result.config->accounts()[index];
+
+            runner.expect(
+                account.alias() == "account" + std::to_string(number),
+                "each account alias must come from its INI section name");
+            runner.expect(
+                account.broker_id() == "9999",
+                "each account broker id must be retained");
+            runner.expect(
+                account.user_id() == "user" + std::to_string(number),
+                "each account user id must be retained");
+            runner.expect(
+                account.password() == "test-password-" + std::to_string(number),
+                "each account password must be retained");
+            runner.expect(
+                account.app_id() == "test-app-" + std::to_string(number),
+                "each account app id must be retained");
+            runner.expect(
+                account.auth_code() == "test-auth-" + std::to_string(number),
+                "each account auth code must be retained");
+            runner.expect(
+                account.trader_front()
+                    == "tcp://127.0.0.1:" + std::to_string(41000 + number),
+                "each account trader front must be retained");
+        }
+    }
+}
+
+void test_engine_rejects_zero_enabled_accounts(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_accounts_ini(0, true)};
+    const std::string path = file.path();
+    const auto result = parse(
+        {"engine", "--mode", "live", "--config", path},
+        {});
+
+    expect_error_contains(runner, result, "enabled account");
+}
+
+void test_engine_requires_private_regular_config_file(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_accounts_ini(1)};
+    const std::string path = file.path();
+    constexpr std::filesystem::perms invalid_permissions[]{
+        std::filesystem::perms::owner_read,
+        std::filesystem::perms::owner_read
+            | std::filesystem::perms::owner_write
+            | std::filesystem::perms::group_read,
+        std::filesystem::perms::owner_read
+            | std::filesystem::perms::owner_write
+            | std::filesystem::perms::others_read,
+    };
+
+    for (const auto permissions : invalid_permissions) {
+        std::filesystem::permissions(
+            path,
+            permissions,
+            std::filesystem::perm_options::replace);
+        expect_error_contains(
+            runner,
+            parse({"engine", "--mode", "live", "--config", path}, {}),
+            "0600");
+    }
+
+    const std::string directory = std::filesystem::temp_directory_path().string();
+    expect_error_contains(
+        runner,
+        parse({"engine", "--mode", "live", "--config", directory}, {}),
+        "regular file");
 }
 
 void test_invalid_inputs(TestRunner& runner)
@@ -206,6 +359,9 @@ int main()
     TestRunner runner;
     test_valid_market(runner);
     test_valid_account(runner);
+    test_engine_accepts_variable_account_count(runner);
+    test_engine_rejects_zero_enabled_accounts(runner);
+    test_engine_requires_private_regular_config_file(runner);
     test_invalid_inputs(runner);
     test_field_boundaries(runner);
     return runner.finish();
