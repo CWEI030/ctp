@@ -66,6 +66,9 @@ public:
     virtual void release() = 0;
 };
 
+// 新引擎复用现有真实行情适配器；目录创建和 SDK 对象分配只发生在控制面。
+std::unique_ptr<MarketApi> create_market_api();
+
 class MarketClient final : public CThostFtdcMdSpi {
 public:
     MarketClient(

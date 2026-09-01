@@ -68,6 +68,8 @@ private:
     std::string front_;
 };
 
+}
+
 std::unique_ptr<MarketApi> create_market_api()
 {
     std::error_code error;
@@ -81,8 +83,6 @@ std::unique_ptr<MarketApi> create_market_api()
         return nullptr;
     }
     return std::make_unique<CtpMarketApi>(api);
-}
-
 }
 
 std::string format_market_tick(const MarketTick& tick)

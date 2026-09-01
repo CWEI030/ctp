@@ -24,7 +24,8 @@ int main(int argc, char* argv[])
     const auto& config = *result.config;
     if (config.mode() == ctp::Mode::Engine) {
         std::cerr
-            << "[error] engine runtime is not available until BATCH-002\n";
+            << "[error] engine live runtime is not connected yet; "
+               "offline market distribution is available\n";
         return 3;
     }
 
@@ -42,7 +43,7 @@ int main(int argc, char* argv[])
             config, std::chrono::seconds{15}, stop_requested);
     }
 
-    // Engine 模式已经在上方返回；这里只有兼容保留的单账户查询模式。
+    // Engine 模式已在上方返回；这里只有兼容保留的单账户查询模式。
     return ctp::run_account(
         config, std::chrono::seconds{15}, stop_requested);
 }

@@ -1,38 +1,23 @@
 #include "ctp/market_client.hpp"
+#include "test_support.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
-#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace {
 
-class TestRunner {
-public:
-    void expect(bool condition, std::string_view message)
-    {
-        if (!condition) {
-            ++failures_;
-            std::cerr << "[fail] " << message << '\n';
-        }
-    }
+using TestRunner = test_support::TestRunner;
 
-    int finish() const
-    {
-        if (failures_ == 0) {
-            std::cout << "[ok] all market client tests passed\n";
-        }
-        return failures_ == 0 ? 0 : 1;
-    }
-
-private:
-    int failures_{0};
-};
+static_assert(std::is_same_v<
+              decltype(&ctp::create_market_api),
+              std::unique_ptr<ctp::MarketApi> (*)()>);
 
 struct FakeMetrics {
     int register_spi_calls{0};
@@ -661,7 +646,7 @@ void test_completed_result_output(TestRunner& runner)
 
 int main()
 {
-    TestRunner runner;
+    TestRunner runner{"market client"};
     test_login_starts_single_subscription(runner);
     test_zero_login_request_id_starts_subscription(runner);
     test_subscription_response_is_required(runner);
