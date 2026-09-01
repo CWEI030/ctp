@@ -58,6 +58,15 @@ target_compile_options(ctp_market PRIVATE
     -Wextra
     -Wpedantic)
 
+add_library(ctp_engine src/engine.cpp)
+target_include_directories(ctp_engine PUBLIC include)
+target_include_directories(ctp_engine SYSTEM PUBLIC "${CTP_MD_DIR}")
+target_link_libraries(ctp_engine PUBLIC ctp_config ctp_market)
+target_compile_options(ctp_engine PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic)
+
 add_library(ctp_trader src/trader_client.cpp)
 target_include_directories(ctp_trader PUBLIC include)
 target_include_directories(ctp_trader SYSTEM PUBLIC "${CTP_TRADER_DIR}")
@@ -80,6 +89,7 @@ target_link_directories(ctp_client PRIVATE
 
 target_link_libraries(ctp_client PRIVATE
     ctp_interrupt
+    ctp_engine
     ctp_market
     ctp_trader)
 
@@ -117,6 +127,15 @@ if(BUILD_TESTING)
         -Wextra
         -Wpedantic)
     add_test(NAME market COMMAND ctp_market_tests)
+
+    add_executable(ctp_engine_tests tests/engine_test.cpp)
+    target_include_directories(ctp_engine_tests PRIVATE tests)
+    target_link_libraries(ctp_engine_tests PRIVATE ctp_engine)
+    target_compile_options(ctp_engine_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic)
+    add_test(NAME engine COMMAND ctp_engine_tests)
 
     add_executable(ctp_trader_tests tests/trader_client_test.cpp)
     target_link_libraries(ctp_trader_tests PRIVATE ctp_trader)
