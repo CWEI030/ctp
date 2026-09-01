@@ -65,7 +65,9 @@ bool is_tcp_front(std::string_view value)
     return value.size() > prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
-ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
+ConfigResult parse_engine_config(
+    const std::vector<std::string_view>& arguments,
+    const EnvironmentReader& read_environment)
 {
     std::string engine_mode;
     std::string config_path;
@@ -179,7 +181,7 @@ ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
 
     std::vector<AccountConfig> accounts;
     accounts.reserve(sections.size());
-    for (const auto& section : sections) {
+    for (auto& section : sections) {
         const auto enabled = section.fields.find("enabled");
         if (enabled == section.fields.end()) {
             return failure("account '" + section.alias + "' is missing enabled");
@@ -203,21 +205,43 @@ ConfigResult parse_engine_config(const std::vector<std::string_view>& arguments)
 
         struct FixedField {
             std::string_view name;
+            std::string_view environment_suffix;
             std::size_t capacity;
         };
         constexpr FixedField fixed_fields[]{
-            {"broker_id", kBrokerIdCapacity},
-            {"user_id", kUserIdCapacity},
-            {"password", kPasswordCapacity},
-            {"app_id", kAppIdCapacity},
-            {"auth_code", kAuthCodeCapacity},
+            {"broker_id", "BROKER_ID", kBrokerIdCapacity},
+            {"user_id", "USER_ID", kUserIdCapacity},
+            {"password", "PASSWORD", kPasswordCapacity},
+            {"app_id", "APP_ID", kAppIdCapacity},
+            {"auth_code", "AUTH_CODE", kAuthCodeCapacity},
         };
         for (const auto& field : fixed_fields) {
+            const std::string environment_name =
+                "CTP_ACCOUNT_" + section.alias + "_"
+                + std::string{field.environment_suffix};
+            if (auto override_value = read_environment(environment_name)) {
+                if (!fits_field(*override_value, field.capacity)) {
+                    return failure(
+                        "environment override '" + environment_name + "' is invalid");
+                }
+                section.fields.at(std::string{field.name}) = std::move(*override_value);
+            }
+
             if (!fits_field(section.fields.at(std::string{field.name}), field.capacity)) {
                 return failure(
                     "account '" + section.alias + "' " + std::string{field.name}
                     + " exceeds CTP field capacity");
             }
+        }
+
+        const std::string trader_front_environment =
+            "CTP_ACCOUNT_" + section.alias + "_TRADER_FRONT";
+        if (auto override_value = read_environment(trader_front_environment)) {
+            if (!is_tcp_front(*override_value)) {
+                return failure(
+                    "environment override '" + trader_front_environment + "' is invalid");
+            }
+            section.fields.at("trader_front") = std::move(*override_value);
         }
 
         if (!is_tcp_front(section.fields.at("trader_front"))) {
@@ -344,7 +368,7 @@ ConfigResult parse_config(
     }
 
     if (arguments.front() == "engine") {
-        return parse_engine_config(arguments);
+        return parse_engine_config(arguments, read_environment);
     }
 
     Mode mode;

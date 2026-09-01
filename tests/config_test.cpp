@@ -350,6 +350,71 @@ void test_engine_rejects_oversized_fields_without_leaking_values(TestRunner& run
     }
 }
 
+void test_engine_environment_overrides_only_the_selected_account(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_accounts_ini(2)};
+    const auto result = parse(
+        {"engine", "--mode", "live", "--config", file.path()},
+        {
+            {"CTP_ACCOUNT_account1_BROKER_ID", "8888"},
+            {"CTP_ACCOUNT_account1_USER_ID", "override-user-1"},
+            {"CTP_ACCOUNT_account1_PASSWORD", "override-password-1"},
+            {"CTP_ACCOUNT_account1_APP_ID", "override-app-1"},
+            {"CTP_ACCOUNT_account1_AUTH_CODE", "override-auth-1"},
+            {"CTP_ACCOUNT_account2_TRADER_FRONT", "tcp://127.0.0.1:42002"},
+        });
+
+    runner.expect(result.config.has_value(), "valid account overrides must be accepted");
+    if (!result.config) {
+        return;
+    }
+
+    const auto& accounts = result.config->accounts();
+    runner.expect(accounts.size() == 2, "overrides must not change the account count");
+    runner.expect(
+        accounts[0].broker_id() == "8888",
+        "account1 broker id override must be applied to account1");
+    runner.expect(
+        accounts[0].user_id() == "override-user-1",
+        "account1 user id override must be applied to account1");
+    runner.expect(
+        accounts[0].password() == "override-password-1",
+        "account1 password override must be applied to account1");
+    runner.expect(
+        accounts[0].app_id() == "override-app-1",
+        "account1 app id override must be applied to account1");
+    runner.expect(
+        accounts[0].auth_code() == "override-auth-1",
+        "account1 auth code override must be applied to account1");
+    runner.expect(
+        accounts[0].trader_front() == "tcp://127.0.0.1:41001",
+        "account2 front override must not modify account1");
+    runner.expect(
+        accounts[1].password() == "test-password-2",
+        "account1 password override must not modify account2");
+    runner.expect(
+        accounts[1].auth_code() == "test-auth-2",
+        "account1 auth code override must not modify account2");
+    runner.expect(
+        accounts[1].trader_front() == "tcp://127.0.0.1:42002",
+        "account2 front override must be applied to account2");
+}
+
+void test_engine_rejects_invalid_environment_override_without_leaking_it(
+    TestRunner& runner)
+{
+    const std::string secret_value(ctp::kPasswordCapacity, 's');
+    TemporaryAccountFile file{make_accounts_ini(1)};
+    const auto result = parse(
+        {"engine", "--mode", "live", "--config", file.path()},
+        {{"CTP_ACCOUNT_account1_PASSWORD", secret_value}});
+
+    expect_error_contains(runner, result, "CTP_ACCOUNT_account1_PASSWORD");
+    runner.expect(
+        result.error.find(secret_value) == std::string::npos,
+        "environment override error must not contain the rejected value");
+}
+
 void test_invalid_inputs(TestRunner& runner)
 {
     const Environment market_env{
@@ -450,6 +515,8 @@ int main()
     test_engine_requires_private_regular_config_file(runner);
     test_engine_rejects_invalid_account_schema(runner);
     test_engine_rejects_oversized_fields_without_leaking_values(runner);
+    test_engine_environment_overrides_only_the_selected_account(runner);
+    test_engine_rejects_invalid_environment_override_without_leaking_it(runner);
     test_invalid_inputs(runner);
     test_field_boundaries(runner);
     return runner.finish();
