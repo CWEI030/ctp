@@ -42,6 +42,7 @@ struct MarketEvent {
 
 static_assert(std::is_trivially_copyable<MarketEvent>::value);
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic<bool>::is_always_lock_free);
 
 template <typename Event, std::size_t Capacity>
 class SpscQueue {

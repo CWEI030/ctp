@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <new>
 #include <string>
 #include <type_traits>
@@ -112,41 +113,79 @@ void test_normalization_and_four_account_distribution(
         runner.expect(event.bid_price_ticks == 499, "bid price must use integer ticks");
         runner.expect(event.ask_price_ticks == 501, "ask price must use integer ticks");
         runner.expect(
+            std::string_view{event.instrument.data()} == "IF2609",
+            "the fixed event must retain the instrument identifier");
+        runner.expect(
             event.status == ctp::MarketDataStatus::Valid,
             "valid book data must retain an explicit valid status");
+
+        event.instrument[0] = 'X';
+        if (account + 1 < 4) {
+            runner.expect(
+                ingress.snapshot(account + 1).depth == 1,
+                "changing one popped copy must not alter another account queue");
+        }
     }
 }
 
 void test_slow_account_does_not_block_other_accounts(
     test_support::TestRunner& runner)
 {
-    ctp::MarketIngress ingress{make_accounts(4), 0.2};
-    ingress.start();
+    for (std::size_t slow_account = 0; slow_account < 4; ++slow_account) {
+        ctp::MarketIngress ingress{make_accounts(4), 0.2};
+        ingress.start();
 
-    for (std::size_t sequence = 0;
-         sequence < ctp::kMarketQueueCapacity + 2;
-         ++sequence) {
-        auto tick = make_tick(static_cast<int>(sequence % 100));
-        ingress.ingest(&tick, static_cast<std::int64_t>(sequence));
+        for (std::size_t sequence = 0;
+             sequence < ctp::kMarketQueueCapacity + 2;
+             ++sequence) {
+            auto tick = make_tick(static_cast<int>(sequence % 100));
+            const auto result =
+                ingress.ingest(&tick, static_cast<std::int64_t>(sequence));
 
-        for (std::size_t account = 1; account < 4; ++account) {
-            ctp::MarketEvent event{};
-            runner.expect(
-                ingress.try_pop(account, event),
-                "active accounts must continue while account zero is paused");
-            runner.expect(
-                event.market_seq == sequence + 1,
-                "active account sequence must remain continuous");
+            for (std::size_t account = 0; account < 4; ++account) {
+                if (account == slow_account) {
+                    continue;
+                }
+                ctp::MarketEvent event{};
+                runner.expect(
+                    ingress.try_pop(account, event),
+                    "active accounts must continue while one account is paused");
+                runner.expect(
+                    event.market_seq == sequence + 1,
+                    "active account sequence must remain continuous");
+            }
+
+            if (sequence >= ctp::kMarketQueueCapacity) {
+                runner.expect(
+                    result.published == 3 && result.overflowed == 1,
+                    "overflow result must identify only the paused account");
+            }
+        }
+
+        const auto slow = ingress.snapshot(slow_account);
+        runner.expect(slow.overflowed, "only the paused account must be marked overflowed");
+        runner.expect(slow.dropped == 2, "paused account must count every omitted event");
+        for (std::size_t account = 0; account < 4; ++account) {
+            if (account == slow_account) {
+                continue;
+            }
+            const auto active = ingress.snapshot(account);
+            runner.expect(!active.overflowed, "other accounts must remain healthy");
+            runner.expect(active.dropped == 0, "other accounts must not inherit drops");
         }
     }
+}
 
-    const auto slow = ingress.snapshot(0);
-    runner.expect(slow.overflowed, "only the paused account must be marked overflowed");
-    runner.expect(slow.dropped == 2, "paused account must count every omitted event");
-    for (std::size_t account = 1; account < 4; ++account) {
-        const auto active = ingress.snapshot(account);
-        runner.expect(!active.overflowed, "other accounts must remain healthy");
-        runner.expect(active.dropped == 0, "other accounts must not inherit drops");
+void expect_status_for_all_accounts(
+    test_support::TestRunner& runner,
+    ctp::MarketIngress& ingress,
+    ctp::MarketDataStatus expected,
+    std::string_view message)
+{
+    for (std::size_t account = 0; account < ingress.account_count(); ++account) {
+        ctp::MarketEvent event{};
+        runner.expect(ingress.try_pop(account, event), message);
+        runner.expect(event.status == expected, message);
     }
 }
 
@@ -160,20 +199,44 @@ void test_lifecycle_invalid_data_and_hot_path_allocation(
         "ingress must ignore callbacks before start");
 
     ingress.start();
-    tick.BidPrice1 = tick.AskPrice1 + 1.0;
     runner.expect(
-        ingress.ingest(&tick, 2).published == 2,
+        ingress.ingest(nullptr, 2).published == 2,
+        "null callbacks must become explicit events");
+    expect_status_for_all_accounts(
+        runner, ingress, ctp::MarketDataStatus::NullData,
+        "null callbacks must have NullData status");
+
+    tick.InstrumentID[0] = '\0';
+    runner.expect(
+        ingress.ingest(&tick, 3).published == 2,
         "invalid market data must remain visible to every account");
-    for (std::size_t account = 0; account < 2; ++account) {
-        ctp::MarketEvent event{};
-        ingress.try_pop(account, event);
-        runner.expect(
-            event.status == ctp::MarketDataStatus::InvalidBook,
-            "crossed book must be marked invalid instead of silently discarded");
-    }
+    expect_status_for_all_accounts(
+        runner, ingress, ctp::MarketDataStatus::InvalidInstrument,
+        "empty instrument must be marked invalid");
 
     tick = make_tick(0);
-    ingress.ingest(&tick, 3);
+    ctp::copy_to_field(tick.UpdateTime, "25:00:00");
+    ingress.ingest(&tick, 4);
+    expect_status_for_all_accounts(
+        runner, ingress, ctp::MarketDataStatus::InvalidTime,
+        "invalid exchange time must be classified");
+
+    tick = make_tick(0);
+    tick.LastPrice = std::numeric_limits<double>::quiet_NaN();
+    ingress.ingest(&tick, 5);
+    expect_status_for_all_accounts(
+        runner, ingress, ctp::MarketDataStatus::InvalidPrice,
+        "non-finite price must be classified");
+
+    tick = make_tick(0);
+    tick.BidPrice1 = tick.AskPrice1 + 1.0;
+    ingress.ingest(&tick, 6);
+    expect_status_for_all_accounts(
+        runner, ingress, ctp::MarketDataStatus::InvalidBook,
+        "crossed book must be marked invalid instead of silently discarded");
+
+    tick = make_tick(0);
+    ingress.ingest(&tick, 7);
     for (std::size_t account = 0; account < 2; ++account) {
         ctp::MarketEvent event{};
         ingress.try_pop(account, event);
@@ -181,14 +244,16 @@ void test_lifecycle_invalid_data_and_hot_path_allocation(
 
     allocation_count = 0;
     count_allocations = true;
-    const auto result = ingress.ingest(&tick, 4);
+    ingress.OnRtnDepthMarketData(&tick);
     count_allocations = false;
-    runner.expect(result.published == 2, "preheated callback must still publish normally");
+    runner.expect(
+        ingress.snapshot(0).depth == 1 && ingress.snapshot(1).depth == 1,
+        "preheated callback must still publish normally");
     runner.expect(allocation_count == 0, "preheated callback must not allocate memory");
 
     ingress.stop();
     runner.expect(
-        ingress.ingest(&tick, 5).published == 0,
+        ingress.ingest(&tick, 8).published == 0,
         "ingress must ignore callbacks after stop");
 }
 
