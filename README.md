@@ -3,9 +3,12 @@
 这是一个用于学习 CTP API 的 Linux C++17 命令行项目。它可以：
 
 - `market`：登录行情前置，订阅一个合约，收到指定条数后退出；
-- `account`：认证并登录交易前置，查询资金和全部持仓后退出。
+- `account`：认证并登录交易前置，查询资金和全部持仓后退出；
+- `engine --mode live`：校验并加载一个或多个账户的本地配置。
 
-项目不会报单、撤单或转账。CTP 官方 SDK 和账号凭据都不应提交到 Git。
+第一批只完成多账户配置层，尚未启动多账户交易引擎。执行 `engine` 会在配置校验成功后
+明确返回“运行时尚未实现”，不会连接 SimNow，也不会误进入旧单账户查询。项目目前不会报单、
+撤单或转账。CTP 官方 SDK 和账号凭据都不应提交到 Git。
 
 ## 1. 准备环境
 
@@ -47,12 +50,42 @@ ctest --test-dir build --output-on-failure
 ```text
 ctp_client market  [--profile PROFILE] --instrument INSTRUMENT --ticks COUNT
 ctp_client account [--profile PROFILE]
+ctp_client engine --mode live [--config CONFIG]
 ```
 
 - `PROFILE` 默认是 `simnow-7x24`；
 - `INSTRUMENT` 是有效合约代码，例如运行当天仍有效的期货合约；
 - `COUNT` 必须是正整数；
 - 禁止使用 `--password`，密码只能通过环境变量传入。
+
+### 多账户本地配置
+
+先从可提交的占位模板创建本机配置，再将权限限制为只有文件所有者可以读写：
+
+```bash
+cp config/accounts.example.ini config/accounts.local.ini
+chmod 600 config/accounts.local.ini
+```
+
+把 `config/accounts.local.ini` 中的 `<...>` 替换为本机测试账户信息。该文件已被 Git
+忽略，不得提交。每个 `[account.别名]` 表示一个账户；可以配置 1 个、2 个、3 个、4 个
+或更多账户。四账户只是本阶段必须通过的验收门槛，不是程序上限。`enabled=false` 的账户
+不会进入启动时生成的只读账户集合；如果没有任何启用账户，程序拒绝启动。
+
+省略 `--config` 时默认读取 `config/accounts.local.ini`。临时覆盖某个账户字段时，环境变量
+名称为 `CTP_ACCOUNT_账户别名_字段名`，例如：
+
+```bash
+export CTP_ACCOUNT_account1_PASSWORD='<temporary-password>'
+export CTP_ACCOUNT_account2_TRADER_FRONT='tcp://127.0.0.1:40001'
+```
+
+可覆盖字段为 `BROKER_ID`、`USER_ID`、`PASSWORD`、`APP_ID`、`AUTH_CODE` 和
+`TRADER_FRONT`。覆盖只影响别名对应的账户。运行秘密审计：
+
+```bash
+scripts/audit.sh secrets
+```
 
 程序内置的 profile 如下。它们是公共接入参数，不是账号信息：
 
@@ -221,3 +254,6 @@ ldd "$CTP_SDK_ROOT"/trader/thosttraderapi_se.so
 - 不自动重连，不持续运行，不保存行情；
 - 账户模式只查询资金和全部持仓；
 - 不处理结算单确认，不支持报单、撤单或转账。
+- 多账户 `engine` 当前只完成配置校验和启动时不可变账户集合；真正的运行时、行情分发和
+  独立账户执行单元从 BATCH-002 开始实现；
+- `replay` 和 `benchmark` 命令尚未实现，分别属于后续策略回放和性能验收批次。

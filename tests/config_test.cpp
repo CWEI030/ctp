@@ -73,6 +73,46 @@ private:
     std::filesystem::path path_;
 };
 
+class TemporaryDefaultConfigDirectory {
+public:
+    explicit TemporaryDefaultConfigDirectory(std::string_view contents)
+        : original_path_(std::filesystem::current_path())
+    {
+        static std::size_t sequence = 0;
+        const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        root_ = std::filesystem::temp_directory_path()
+            / ("ctp-default-config-" + std::to_string(timestamp) + "-"
+               + std::to_string(sequence++));
+        const auto config_directory = root_ / "config";
+        std::filesystem::create_directories(config_directory);
+
+        const auto config_path = config_directory / "accounts.local.ini";
+        std::ofstream output{config_path};
+        output << contents;
+        output.close();
+        std::filesystem::permissions(
+            config_path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace);
+        std::filesystem::current_path(root_);
+    }
+
+    ~TemporaryDefaultConfigDirectory()
+    {
+        std::error_code ignored;
+        std::filesystem::current_path(original_path_, ignored);
+        std::filesystem::remove_all(root_, ignored);
+    }
+
+    TemporaryDefaultConfigDirectory(const TemporaryDefaultConfigDirectory&) = delete;
+    TemporaryDefaultConfigDirectory& operator=(
+        const TemporaryDefaultConfigDirectory&) = delete;
+
+private:
+    std::filesystem::path original_path_;
+    std::filesystem::path root_;
+};
+
 std::string make_accounts_ini(std::size_t enabled_accounts, bool add_disabled = false)
 {
     std::ostringstream output;
@@ -236,6 +276,22 @@ void test_engine_accepts_variable_account_count(TestRunner& runner)
                 "each account trader front must be retained");
         }
     }
+}
+
+void test_engine_uses_default_account_config_path(TestRunner& runner)
+{
+    TemporaryDefaultConfigDirectory directory{make_accounts_ini(2)};
+    const auto result = parse({"engine", "--mode", "live"}, {});
+
+    runner.expect(
+        result.config.has_value(),
+        "engine without --config must read config/accounts.local.ini");
+    if (!result.config) {
+        return;
+    }
+    runner.expect(
+        result.config->accounts().size() == 2,
+        "default account config must retain every enabled account");
 }
 
 void test_engine_rejects_zero_enabled_accounts(TestRunner& runner)
@@ -511,6 +567,7 @@ int main()
     test_valid_market(runner);
     test_valid_account(runner);
     test_engine_accepts_variable_account_count(runner);
+    test_engine_uses_default_account_config_path(runner);
     test_engine_rejects_zero_enabled_accounts(runner);
     test_engine_requires_private_regular_config_file(runner);
     test_engine_rejects_invalid_account_schema(runner);

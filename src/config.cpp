@@ -96,7 +96,7 @@ ConfigResult parse_engine_config(
         return failure("engine --mode must be live");
     }
     if (config_path.empty()) {
-        return failure("engine --config is required");
+        config_path = "config/accounts.local.ini";
     }
 
     std::error_code status_error;
