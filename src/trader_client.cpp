@@ -81,6 +81,30 @@ public:
         return api_->ReqQryInvestorPosition(request, request_id);
     }
 
+    int request_order_insert(
+        CThostFtdcInputOrderField* request, int request_id) override
+    {
+        return api_->ReqOrderInsert(request, request_id);
+    }
+
+    int request_order_action(
+        CThostFtdcInputOrderActionField* request, int request_id) override
+    {
+        return api_->ReqOrderAction(request, request_id);
+    }
+
+    int request_order_query(
+        CThostFtdcQryOrderField* request, int request_id) override
+    {
+        return api_->ReqQryOrder(request, request_id);
+    }
+
+    int request_trade_query(
+        CThostFtdcQryTradeField* request, int request_id) override
+    {
+        return api_->ReqQryTrade(request, request_id);
+    }
+
     void release() override
     {
         if (api_ == nullptr) {
@@ -95,27 +119,32 @@ private:
     std::string front_;
 };
 
-std::unique_ptr<TraderApi> create_trader_api()
-{
-    std::error_code error;
-    std::filesystem::create_directories("flow/trader", error);
-    if (error) {
-        return nullptr;
-    }
-
-    auto* api = CThostFtdcTraderApi::CreateFtdcTraderApi("flow/trader/");
-    if (api == nullptr) {
-        return nullptr;
-    }
-    return std::make_unique<CtpTraderApi>(api);
-}
-
 std::string masked_identifier(const std::string& value)
 {
     if (value.size() <= 2) {
         return std::string(value.size(), '*');
     }
     return std::string(value.size() - 2, '*') + value.substr(value.size() - 2);
+}
+
+std::unique_ptr<TraderApi> create_ctp_trader_api(
+    const std::string& flow_directory)
+{
+    std::error_code error;
+    std::filesystem::create_directories(flow_directory, error);
+    if (error) {
+        return nullptr;
+    }
+
+    std::string ctp_path = flow_directory;
+    if (ctp_path.empty() || ctp_path.back() != '/') {
+        ctp_path.push_back('/');
+    }
+    auto* api = CThostFtdcTraderApi::CreateFtdcTraderApi(ctp_path.c_str());
+    if (api == nullptr) {
+        return nullptr;
+    }
+    return std::make_unique<CtpTraderApi>(api);
 }
 
 const char* direction_text(char direction)
@@ -132,6 +161,12 @@ const char* direction_text(char direction)
     }
 }
 
+}
+
+std::unique_ptr<TraderApi> create_trader_api(
+    const std::string& flow_directory)
+{
+    return create_ctp_trader_api(flow_directory);
 }
 
 int report_trader_result(
@@ -639,7 +674,7 @@ int run_account(
     std::chrono::milliseconds timeout,
     const StopRequested& stop_requested)
 {
-    auto api = create_trader_api();
+    auto api = create_trader_api("flow/trader");
     if (!api) {
         std::cerr << "[error] failed to create trader API or flow directory\n";
         return 3;

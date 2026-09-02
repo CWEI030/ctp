@@ -79,6 +79,9 @@ target_compile_options(ctp_trader PRIVATE
     -Wextra
     -Wpedantic)
 
+# 交易状态与下单会话共用 TraderApi；同时让共用测试替身只保留一份实现。
+target_link_libraries(ctp_engine PUBLIC ctp_trader)
+
 add_executable(ctp_client src/main.cpp)
 
 target_include_directories(ctp_client SYSTEM PRIVATE
@@ -147,6 +150,9 @@ if(BUILD_TESTING)
     add_test(NAME trading COMMAND ctp_trading_tests)
 
     add_executable(ctp_trader_tests tests/trader_client_test.cpp)
+    target_include_directories(ctp_trader_tests PRIVATE tests)
+    target_compile_definitions(ctp_trader_tests PRIVATE
+        CTP_TEST_WITH_TRADER_FAKE)
     target_link_libraries(ctp_trader_tests PRIVATE ctp_trader)
     target_compile_options(ctp_trader_tests PRIVATE
         -Wall

@@ -76,8 +76,20 @@ public:
         CThostFtdcQryTradingAccountField* request, int request_id) = 0;
     virtual int request_investor_position(
         CThostFtdcQryInvestorPositionField* request, int request_id) = 0;
+    virtual int request_order_insert(
+        CThostFtdcInputOrderField* request, int request_id) = 0;
+    virtual int request_order_action(
+        CThostFtdcInputOrderActionField* request, int request_id) = 0;
+    virtual int request_order_query(
+        CThostFtdcQryOrderField* request, int request_id) = 0;
+    virtual int request_trade_query(
+        CThostFtdcQryTradeField* request, int request_id) = 0;
     virtual void release() = 0;
 };
+
+// 每个账户使用独立流目录，避免 CTP 私有流文件在账户之间互相覆盖。
+std::unique_ptr<TraderApi> create_trader_api(
+    const std::string& flow_directory);
 
 class TraderClient final : public CThostFtdcTraderSpi {
 public:

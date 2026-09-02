@@ -1,10 +1,20 @@
 #pragma once
 
+#ifdef CTP_TEST_WITH_TRADER_FAKE
+#include "ctp/trader_client.hpp"
+#endif
+
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <new>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace test_support {
 
@@ -71,6 +81,195 @@ private:
     std::string_view suite_name_;
     int failures_{0};
 };
+
+#ifdef CTP_TEST_WITH_TRADER_FAKE
+// 各交易测试共用同一个可观察替身，避免每个批次重复实现 CTP 接口。
+struct FakeTraderMetrics {
+    std::vector<std::string> calls;
+    int authenticate_calls{0};
+    int login_calls{0};
+    int account_calls{0};
+    int position_calls{0};
+    int order_insert_calls{0};
+    int order_action_calls{0};
+    int order_query_calls{0};
+    int trade_query_calls{0};
+    int release_calls{0};
+    int authenticate_request_id{0};
+    int login_request_id{0};
+    int account_request_id{0};
+    int position_request_id{0};
+    int order_insert_request_id{0};
+    int order_action_request_id{0};
+    std::string front;
+    std::string broker_id;
+    std::string user_id;
+    std::string app_id;
+    std::string auth_code;
+    std::string password;
+    std::string account_broker_id;
+    std::string account_investor_id;
+    std::string position_broker_id;
+    std::string position_investor_id;
+    CThostFtdcInputOrderField last_order{};
+    CThostFtdcInputOrderActionField last_action{};
+    THOST_TE_RESUME_TYPE private_mode{THOST_TERT_RESTART};
+    THOST_TE_RESUME_TYPE public_mode{THOST_TERT_RESTART};
+    int private_sequence{0};
+    std::atomic<bool> authenticate_request_active{false};
+    std::atomic<bool> released_during_authenticate_request{false};
+};
+
+class FakeTraderApi final : public ctp::TraderApi {
+public:
+    explicit FakeTraderApi(std::shared_ptr<FakeTraderMetrics> metrics)
+        : metrics_(std::move(metrics))
+    {
+    }
+
+    void register_spi(CThostFtdcTraderSpi* spi) override
+    {
+        metrics_->calls.push_back("spi");
+        spi_ = spi;
+    }
+
+    void subscribe_private_topic(
+        THOST_TE_RESUME_TYPE resume_type, int sequence) override
+    {
+        metrics_->calls.push_back("private");
+        metrics_->private_mode = resume_type;
+        metrics_->private_sequence = sequence;
+    }
+
+    void subscribe_public_topic(THOST_TE_RESUME_TYPE resume_type) override
+    {
+        metrics_->calls.push_back("public");
+        metrics_->public_mode = resume_type;
+    }
+
+    void register_front(const std::string& front) override
+    {
+        metrics_->calls.push_back("front");
+        metrics_->front = front;
+    }
+
+    void init() override
+    {
+        metrics_->calls.push_back("init");
+        if (on_init) on_init(*this);
+    }
+
+    int request_authenticate(
+        CThostFtdcReqAuthenticateField* request, int request_id) override
+    {
+        metrics_->authenticate_request_active = true;
+        ++metrics_->authenticate_calls;
+        metrics_->authenticate_request_id = request_id;
+        metrics_->broker_id = request->BrokerID;
+        metrics_->user_id = request->UserID;
+        metrics_->app_id = request->AppID;
+        metrics_->auth_code = request->AuthCode;
+        if (on_authenticate) on_authenticate(*this);
+        metrics_->authenticate_request_active = false;
+        return authenticate_return_code;
+    }
+
+    int request_user_login(
+        CThostFtdcReqUserLoginField* request, int request_id) override
+    {
+        ++metrics_->login_calls;
+        metrics_->login_request_id = request_id;
+        metrics_->password = request->Password;
+        if (on_login) on_login(*this);
+        return login_return_code;
+    }
+
+    int request_trading_account(
+        CThostFtdcQryTradingAccountField* request, int request_id) override
+    {
+        ++metrics_->account_calls;
+        metrics_->account_request_id = request_id;
+        metrics_->account_broker_id = request->BrokerID;
+        metrics_->account_investor_id = request->InvestorID;
+        if (on_account) on_account(*this);
+        return account_return_code;
+    }
+
+    int request_investor_position(
+        CThostFtdcQryInvestorPositionField* request, int request_id) override
+    {
+        ++metrics_->position_calls;
+        metrics_->position_request_id = request_id;
+        metrics_->position_broker_id = request->BrokerID;
+        metrics_->position_investor_id = request->InvestorID;
+        if (on_position) on_position(*this);
+        return position_return_code;
+    }
+
+    int request_order_insert(
+        CThostFtdcInputOrderField* request, int request_id) override
+    {
+        ++metrics_->order_insert_calls;
+        metrics_->order_insert_request_id = request_id;
+        metrics_->last_order = *request;
+        if (on_order_insert) on_order_insert(*this);
+        return order_insert_return_code;
+    }
+
+    int request_order_action(
+        CThostFtdcInputOrderActionField* request, int request_id) override
+    {
+        ++metrics_->order_action_calls;
+        metrics_->order_action_request_id = request_id;
+        metrics_->last_action = *request;
+        if (on_order_action) on_order_action(*this);
+        return order_action_return_code;
+    }
+
+    int request_order_query(CThostFtdcQryOrderField*, int) override
+    {
+        ++metrics_->order_query_calls;
+        return order_query_return_code;
+    }
+
+    int request_trade_query(CThostFtdcQryTradeField*, int) override
+    {
+        ++metrics_->trade_query_calls;
+        return trade_query_return_code;
+    }
+
+    void release() override
+    {
+        if (metrics_->authenticate_request_active) {
+            metrics_->released_during_authenticate_request = true;
+        }
+        ++metrics_->release_calls;
+        spi_ = nullptr;
+    }
+
+    CThostFtdcTraderSpi* spi() const noexcept { return spi_; }
+
+    std::function<void(FakeTraderApi&)> on_init;
+    std::function<void(FakeTraderApi&)> on_authenticate;
+    std::function<void(FakeTraderApi&)> on_login;
+    std::function<void(FakeTraderApi&)> on_account;
+    std::function<void(FakeTraderApi&)> on_position;
+    std::function<void(FakeTraderApi&)> on_order_insert;
+    std::function<void(FakeTraderApi&)> on_order_action;
+    int authenticate_return_code{0};
+    int login_return_code{0};
+    int account_return_code{0};
+    int position_return_code{0};
+    int order_insert_return_code{0};
+    int order_action_return_code{0};
+    int order_query_return_code{0};
+    int trade_query_return_code{0};
+
+private:
+    std::shared_ptr<FakeTraderMetrics> metrics_;
+    CThostFtdcTraderSpi* spi_{nullptr};
+};
+#endif
 
 }
 
