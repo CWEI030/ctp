@@ -1,29 +1,13 @@
 #include "ctp/engine.hpp"
+#define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
 
-#include <atomic>
-#include <cstdlib>
 #include <limits>
-#include <new>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 namespace {
-
-std::atomic<bool> count_allocations{false};
-std::atomic<std::size_t> allocation_count{0};
-
-void* allocate(std::size_t size)
-{
-    if (count_allocations.load(std::memory_order_relaxed)) {
-        allocation_count.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (void* memory = std::malloc(size)) {
-        return memory;
-    }
-    throw std::bad_alloc{};
-}
 
 std::vector<ctp::AccountConfig> make_accounts(std::size_t count)
 {
@@ -242,14 +226,15 @@ void test_lifecycle_invalid_data_and_hot_path_allocation(
         ingress.try_pop(account, event);
     }
 
-    allocation_count = 0;
-    count_allocations = true;
+    test_support::AllocationProbe allocation_probe;
     ingress.OnRtnDepthMarketData(&tick);
-    count_allocations = false;
+    allocation_probe.stop();
     runner.expect(
         ingress.snapshot(0).depth == 1 && ingress.snapshot(1).depth == 1,
         "preheated callback must still publish normally");
-    runner.expect(allocation_count == 0, "preheated callback must not allocate memory");
+    runner.expect(
+        allocation_probe.count() == 0,
+        "preheated callback must not allocate memory");
 
     ingress.stop();
     runner.expect(
@@ -257,36 +242,6 @@ void test_lifecycle_invalid_data_and_hot_path_allocation(
         "ingress must ignore callbacks after stop");
 }
 
-}
-
-void* operator new(std::size_t size)
-{
-    return allocate(size);
-}
-
-void* operator new[](std::size_t size)
-{
-    return allocate(size);
-}
-
-void operator delete(void* memory) noexcept
-{
-    std::free(memory);
-}
-
-void operator delete[](void* memory) noexcept
-{
-    std::free(memory);
-}
-
-void operator delete(void* memory, std::size_t) noexcept
-{
-    std::free(memory);
-}
-
-void operator delete[](void* memory, std::size_t) noexcept
-{
-    std::free(memory);
 }
 
 int main()

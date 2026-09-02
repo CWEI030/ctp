@@ -1,6 +1,10 @@
 #include "ctp/field.hpp"
 #include "ctp/trading.hpp"
+#define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
+
+#include <algorithm>
+#include <array>
 
 namespace {
 
@@ -120,6 +124,10 @@ void test_order_capacity_and_duplicates(test_support::TestRunner& runner)
     runner.expect(
         state.create_order(order_seed(1)).code == ctp::ApplyCode::Duplicate,
         "the same client order id must not create a second order");
+    auto conflicting_order = order_seed(1, 9);
+    runner.expect(
+        state.create_order(conflicting_order).code == ctp::ApplyCode::Conflict,
+        "the same client order id with different contents must be diagnosed");
     runner.expect(
         state.create_order(order_seed(2)).code == ctp::ApplyCode::Applied,
         "second order must fit the declared capacity");
@@ -233,6 +241,170 @@ void test_open_and_close_positions(test_support::TestRunner& runner)
         "opening and closing both position directions must be deterministic");
 }
 
+void test_all_report_permutations_converge(test_support::TestRunner& runner)
+{
+    std::array<int, 6> facts{0, 1, 2, 3, 4, 5};
+    std::size_t permutation_count = 0;
+    bool all_converged = true;
+    do {
+        ctp::AccountTradingState state{"account1", 4, 8};
+        state.create_order(order_seed(1, 5));
+        state.apply_local_event(1, ctp::LocalOrderEvent::RiskAccepted);
+        state.apply_local_event(1, ctp::LocalOrderEvent::Submitted);
+
+        const auto apply_fact = [&state](int fact) {
+            switch (fact) {
+            case 0:
+                state.apply_order_report(
+                    {1, ctp::OrderReportType::Accepted, 0});
+                break;
+            case 1:
+                state.apply_order_report(
+                    {1, ctp::OrderReportType::PartiallyFilled, 2});
+                break;
+            case 2:
+                state.apply_order_report(
+                    {1, ctp::OrderReportType::Filled, 5});
+                break;
+            case 3:
+                state.apply_trade(trade_report(1, "trade-1", 2));
+                break;
+            case 4:
+                state.apply_trade(trade_report(1, "trade-2", 1));
+                break;
+            case 5:
+                state.apply_trade(trade_report(1, "trade-3", 2));
+                break;
+            }
+        };
+
+        for (const int fact : facts) {
+            apply_fact(fact);
+            apply_fact(fact);
+        }
+        const auto order = snapshot(state, 1);
+        const auto final_position = position(state);
+        all_converged = all_converged
+            && order.state == ctp::OrderState::Filled
+            && order.reported_filled == 5
+            && order.accounted_filled == 5
+            && final_position.long_quantity == 5
+            && !state.reconciliation_required();
+        ++permutation_count;
+    } while (std::next_permutation(facts.begin(), facts.end()));
+
+    runner.expect(
+        permutation_count == 720,
+        "all six-factor arrival permutations must be exercised");
+    runner.expect(
+        all_converged,
+        "every duplicate and out-of-order report sequence must converge");
+}
+
+void test_cancel_fill_race_converges(test_support::TestRunner& runner)
+{
+    ctp::AccountTradingState state{"account1", 4, 8};
+    state.create_order(order_seed(1, 5));
+    state.apply_local_event(1, ctp::LocalOrderEvent::RiskAccepted);
+    state.apply_local_event(1, ctp::LocalOrderEvent::Submitted);
+    state.apply_order_report({1, ctp::OrderReportType::Accepted, 0});
+    state.apply_trade(trade_report(1, "before-cancel", 2));
+    state.apply_local_event(1, ctp::LocalOrderEvent::CancelRequested);
+    state.apply_order_report({1, ctp::OrderReportType::Canceled, 2});
+
+    runner.expect(
+        snapshot(state, 1).state == ctp::OrderState::Canceled,
+        "cancel acknowledgement must cancel only the unfilled remainder");
+    runner.expect(
+        state.apply_trade(trade_report(1, "late-fill", 3)).code
+            == ctp::ApplyCode::Applied,
+        "a valid late fill must still be recorded after cancellation");
+    const auto order = snapshot(state, 1);
+    runner.expect(
+        order.state == ctp::OrderState::Filled
+            && order.accounted_filled == 5
+            && order.cancel_acknowledged,
+        "late fills must refine canceled to filled without erasing cancel history");
+    runner.expect(
+        position(state).long_quantity == 5
+            && !state.reconciliation_required(),
+        "the cancel-fill race must converge without duplicate position effects");
+}
+
+void test_conflicts_and_fixed_capacity(test_support::TestRunner& runner)
+{
+    ctp::AccountTradingState conflict{"account1", 4, 4};
+    conflict.create_order(order_seed(1, 5));
+    const auto original = trade_report(1, "same-key", 2);
+    conflict.apply_trade(original);
+    auto changed = original;
+    changed.quantity = 3;
+    runner.expect(
+        conflict.apply_trade(changed).code == ctp::ApplyCode::Conflict,
+        "one trade key with different contents must be diagnosed");
+    runner.expect(
+        snapshot(conflict, 1).accounted_filled == 2
+            && position(conflict).long_quantity == 2,
+        "a conflicting duplicate must have no second-order effects");
+
+    ctp::AccountTradingState full{"account2", 4, 1};
+    full.create_order(order_seed(1, 2));
+    full.apply_trade(trade_report(1, "only-slot", 1));
+    runner.expect(
+        full.apply_trade(trade_report(1, "no-slot", 1)).code
+            == ctp::ApplyCode::CapacityExceeded,
+        "a full trade table must fail explicitly without allocating");
+    runner.expect(
+        snapshot(full, 1).accounted_filled == 1
+            && position(full).long_quantity == 1,
+        "capacity failure must not partly update order or position");
+
+    ctp::AccountTradingState missing_position{"account3", 4, 4};
+    auto close = order_seed(1, 1);
+    close.direction = ctp::Direction::Sell;
+    close.offset = ctp::Offset::Close;
+    missing_position.create_order(close);
+    runner.expect(
+        missing_position.apply_trade(trade_report(
+            1, "bad-close", 1,
+            ctp::Direction::Sell, ctp::Offset::Close)).code
+            == ctp::ApplyCode::Conflict,
+        "closing a position absent from local state must require reconciliation");
+    runner.expect(
+        !position(missing_position).known
+            && missing_position.reconciliation_required(),
+        "an inconsistent position must be marked unknown instead of going negative");
+}
+
+void test_trading_hot_path_does_not_allocate(
+    test_support::TestRunner& runner)
+{
+    ctp::AccountTradingState state{"account1", 4, 8};
+    const auto seed = order_seed(1, 5);
+    const auto first = trade_report(1, "trade-1", 2);
+    const auto second = trade_report(1, "trade-2", 3);
+    ctp::OrderSnapshot order{};
+    ctp::PositionSnapshot held{};
+
+    test_support::AllocationProbe allocation_probe;
+    state.create_order(seed);
+    state.apply_local_event(1, ctp::LocalOrderEvent::RiskAccepted);
+    state.apply_local_event(1, ctp::LocalOrderEvent::Submitted);
+    state.apply_order_report({1, ctp::OrderReportType::Accepted, 0});
+    state.apply_trade(first);
+    state.apply_trade(second);
+    state.order_snapshot(1, order);
+    state.position_snapshot("IF2609", held);
+    allocation_probe.stop();
+
+    runner.expect(
+        allocation_probe.count() == 0,
+        "preallocated order, report, trade, and snapshot hot paths must not allocate");
+    runner.expect(
+        order.accounted_filled == 5 && held.long_quantity == 5,
+        "the allocation probe must still execute the complete trading path");
+}
+
 }
 
 int main()
@@ -244,5 +416,9 @@ int main()
     test_multiple_fills_are_deduplicated(runner);
     test_trade_identity_scope_and_account_isolation(runner);
     test_open_and_close_positions(runner);
+    test_all_report_permutations_converge(runner);
+    test_cancel_fill_race_converges(runner);
+    test_conflicts_and_fixed_capacity(runner);
+    test_trading_hot_path_does_not_allocate(runner);
     return runner.finish();
 }

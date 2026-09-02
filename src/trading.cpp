@@ -103,6 +103,15 @@ bool valid_seed(const OrderSeed& seed) noexcept
         && seed.instrument.front() != '\0';
 }
 
+bool same_seed(const OrderSeed& left, const OrderSeed& right) noexcept
+{
+    return left.client_order_id == right.client_order_id
+        && left.instrument == right.instrument
+        && left.direction == right.direction
+        && left.offset == right.offset
+        && left.quantity == right.quantity;
+}
+
 }
 
 struct AccountTradingState::Impl {
@@ -260,8 +269,10 @@ ApplyResult AccountTradingState::create_order(const OrderSeed& seed) noexcept
     if (!valid_seed(seed)) {
         return impl_->conflict();
     }
-    if (impl_->find_order(seed.client_order_id) != nullptr) {
-        return {ApplyCode::Duplicate};
+    if (OrderRecord* existing = impl_->find_order(seed.client_order_id)) {
+        return same_seed(existing->seed, seed)
+            ? ApplyResult{ApplyCode::Duplicate}
+            : impl_->conflict(existing);
     }
     OrderRecord* record = impl_->empty_order(seed.client_order_id);
     if (record == nullptr) {
@@ -287,6 +298,21 @@ ApplyResult AccountTradingState::apply_local_event(
     }
 
     const OrderState before = record->snapshot.state;
+    const bool duplicate =
+        (event == LocalOrderEvent::RiskAccepted
+         && before == OrderState::RiskAccepted)
+        || (event == LocalOrderEvent::RiskRejected
+            && before == OrderState::RiskRejected)
+        || (event == LocalOrderEvent::SubmitRejected
+            && before == OrderState::SubmitRejectedLocally)
+        || (event == LocalOrderEvent::SubmitResultUnknown
+            && before == OrderState::SubmitResultUnknown)
+        || (event == LocalOrderEvent::Submitted
+            && before == OrderState::Submitted)
+        || (event == LocalOrderEvent::CancelRequested
+            && before == OrderState::CancelRequested);
+    if (duplicate) return {ApplyCode::Duplicate};
+
     OrderState after = before;
     switch (event) {
     case LocalOrderEvent::RiskAccepted:
@@ -344,36 +370,73 @@ ApplyResult AccountTradingState::apply_order_report(
     }
 
     const std::int32_t previous_fill = record->snapshot.reported_filled;
+    const OrderState before = record->snapshot.state;
+    const bool locally_impossible = before == OrderState::RiskRejected
+        || before == OrderState::SubmitRejectedLocally;
+
+    const bool invalid_report =
+        (report.type == OrderReportType::Rejected
+         && report.cumulative_filled != 0)
+        || (report.type == OrderReportType::PartiallyFilled
+            && (report.cumulative_filled == 0
+                || report.cumulative_filled == record->seed.quantity))
+        || (report.type == OrderReportType::Filled
+            && report.cumulative_filled != record->seed.quantity)
+        || (report.type == OrderReportType::Canceled
+            && report.cumulative_filled == record->seed.quantity);
+    if (invalid_report || locally_impossible) {
+        return impl_->conflict(record);
+    }
     if (report.cumulative_filled < previous_fill) {
         return {ApplyCode::Stale};
     }
-    record->snapshot.reported_filled = report.cumulative_filled;
 
-    const OrderState before = record->snapshot.state;
     OrderState after = before;
     switch (report.type) {
     case OrderReportType::Accepted:
-        if (before == OrderState::Submitted) after = OrderState::Accepted;
+        if (before == OrderState::Created
+            || before == OrderState::RiskAccepted
+            || before == OrderState::Submitted) {
+            after = OrderState::Accepted;
+        }
         break;
     case OrderReportType::Rejected:
-        if (before == OrderState::Submitted) after = OrderState::Rejected;
+        if (before == OrderState::Created
+            || before == OrderState::RiskAccepted
+            || before == OrderState::Submitted
+            || before == OrderState::Accepted) {
+            after = OrderState::Rejected;
+        } else if (before != OrderState::Rejected) {
+            return impl_->conflict(record);
+        }
         break;
     case OrderReportType::PartiallyFilled:
-        if (!is_terminal(before) || before == OrderState::Canceled) {
+        if (before == OrderState::Rejected) {
+            return impl_->conflict(record);
+        }
+        if (before != OrderState::Filled
+            && before != OrderState::Canceled
+            && before != OrderState::CancelRequested) {
             after = OrderState::PartiallyFilled;
         }
         break;
     case OrderReportType::Filled:
-        if (report.cumulative_filled == record->seed.quantity
-            && before != OrderState::RiskRejected
-            && before != OrderState::SubmitRejectedLocally) {
-            after = OrderState::Filled;
+        if (before == OrderState::Rejected) {
+            record->snapshot.reported_filled = report.cumulative_filled;
+            record->snapshot.state = OrderState::Filled;
+            impl_->reconciliation = true;
+            record->snapshot.reconciliation_required = true;
+            return {ApplyCode::Conflict, true,
+                    previous_fill != report.cumulative_filled,
+                    false, true};
         }
+        after = OrderState::Filled;
         break;
     case OrderReportType::Canceled:
-        if (before != OrderState::Filled && before != OrderState::Rejected
-            && before != OrderState::RiskRejected
-            && before != OrderState::SubmitRejectedLocally) {
+        if (before == OrderState::Rejected) {
+            return impl_->conflict(record);
+        }
+        if (before != OrderState::Filled) {
             after = OrderState::Canceled;
             record->snapshot.cancel_acknowledged = true;
         }
@@ -387,13 +450,14 @@ ApplyResult AccountTradingState::apply_order_report(
         break;
     }
 
+    record->snapshot.reported_filled = report.cumulative_filled;
     const bool fill_changed = previous_fill != report.cumulative_filled;
     const bool state_changed = before != after;
     if (!state_changed && !fill_changed) {
-        return {ApplyCode::Duplicate};
-    }
-    if (!state_changed && report.type != OrderReportType::Accepted) {
-        return impl_->conflict(record);
+        return is_terminal(before) || before == OrderState::PartiallyFilled
+            || before == OrderState::CancelRequested
+            ? ApplyResult{ApplyCode::Stale}
+            : ApplyResult{ApplyCode::Duplicate};
     }
     record->snapshot.state = after;
     return {ApplyCode::Applied, state_changed, fill_changed};
@@ -451,6 +515,7 @@ ApplyResult AccountTradingState::apply_trade(const TradeReport& report) noexcept
         position->snapshot.instrument = report.instrument;
     }
 
+    // 成交去重记录必须先于订单和持仓副作用落下；此后重复回报只能命中它。
     trade->occupied = true;
     trade->report = report;
     order->snapshot.accounted_filled += report.quantity;
@@ -478,6 +543,7 @@ ApplyResult AccountTradingState::apply_trade(const TradeReport& report) noexcept
         before == OrderState::RiskRejected
         || before == OrderState::SubmitRejectedLocally
         || before == OrderState::Rejected;
+    // 撤单只取消未成交余量；迟到但有效的成交仍可把 Canceled 推进为 Filled。
     order->snapshot.state =
         order->snapshot.accounted_filled == order->seed.quantity
         ? OrderState::Filled
