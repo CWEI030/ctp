@@ -221,6 +221,21 @@ struct SubmitResult {
     int api_return_code{0};
 };
 
+enum class CancelCode : std::uint8_t {
+    Requested,
+    RejectedLocally,
+    Duplicate,
+    UnknownOrder,
+    NotCancelable,
+    DailyLimit,
+};
+
+struct CancelResult {
+    CancelCode code{CancelCode::RejectedLocally};
+    std::uint64_t client_order_id{0};
+    int api_return_code{0};
+};
+
 // 一个实例只属于一个账户，并由该账户执行线程串行修改。
 class AccountTradingState {
 public:
@@ -279,6 +294,34 @@ public:
     SubmitResult submit(
         const OrderIntent& intent,
         const RiskSnapshot& snapshot) noexcept;
+    CancelResult cancel(std::uint64_t client_order_id) noexcept;
+    std::size_t drain_callbacks() noexcept;
+    bool order_snapshot(
+        std::uint64_t client_order_id,
+        OrderSnapshot& snapshot) const noexcept;
+    bool position_snapshot(
+        std::string_view instrument,
+        PositionSnapshot& snapshot) const noexcept;
+    bool reconciliation_required() const noexcept;
+
+    void OnRspOrderInsert(
+        CThostFtdcInputOrderField* order,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspOrderAction(
+        CThostFtdcInputOrderActionField* action,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRtnOrder(CThostFtdcOrderField* order) override;
+    void OnRtnTrade(CThostFtdcTradeField* trade) override;
+    void OnErrRtnOrderInsert(
+        CThostFtdcInputOrderField* order,
+        CThostFtdcRspInfoField* info) override;
+    void OnErrRtnOrderAction(
+        CThostFtdcOrderActionField* action,
+        CThostFtdcRspInfoField* info) override;
 
 private:
     struct Impl;

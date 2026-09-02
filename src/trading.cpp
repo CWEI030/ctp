@@ -1,6 +1,7 @@
 #include "ctp/trading.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <limits>
 #include <utility>
@@ -641,6 +642,9 @@ RiskRejectReason evaluate_risk(
             > limits.max_market_age_ns) {
         return RiskRejectReason::StaleMarket;
     }
+    if (limits.max_slippage_ticks < 0) {
+        return RiskRejectReason::PriceProtection;
+    }
     const bool outside_price_limit = intent.direction == Direction::Buy
         ? intent.limit_price_ticks
             > snapshot.ask_price_ticks + limits.max_slippage_ticks
@@ -652,9 +656,17 @@ RiskRejectReason evaluate_risk(
         if (!snapshot.funds_known) return RiskRejectReason::FundsUnknown;
         const auto quantity = static_cast<std::int64_t>(intent.quantity);
         if (limits.margin_per_lot < 0
-            || quantity > (std::numeric_limits<std::int64_t>::max()
-                            - limits.minimum_available_after_order)
-                    / std::max<std::int64_t>(limits.margin_per_lot, 1)
+            || limits.minimum_available_after_order < 0
+            || limits.minimum_available_after_order
+                > std::numeric_limits<std::int64_t>::max()
+                    - quantity * std::min(
+                        limits.margin_per_lot,
+                        std::numeric_limits<std::int64_t>::max() / quantity)
+            || (limits.margin_per_lot > 0
+                && quantity
+                    > (std::numeric_limits<std::int64_t>::max()
+                       - limits.minimum_available_after_order)
+                        / limits.margin_per_lot)
             || snapshot.available_funds
                 < quantity * limits.margin_per_lot
                     + limits.minimum_available_after_order) {
@@ -687,8 +699,26 @@ namespace {
 
 struct SignalRecord {
     bool occupied{false};
+    bool active_open{false};
+    bool cancel_requested{false};
     OrderIntent intent{};
     SubmitResult result{};
+};
+
+enum class CallbackType : std::uint8_t {
+    Order,
+    Trade,
+    InsertRejected,
+    CancelRejected,
+    Unknown,
+};
+
+struct CallbackEvent {
+    CallbackType type{CallbackType::Order};
+    std::array<char, 13> order_ref{};
+    OrderReportType order_type{OrderReportType::Accepted};
+    std::int32_t cumulative_filled{0};
+    TradeReport trade{};
 };
 
 bool same_intent(const OrderIntent& left, const OrderIntent& right) noexcept
@@ -718,6 +748,7 @@ struct AccountTradingSession::Impl {
         std::size_t order_capacity,
         std::size_t trade_capacity,
         std::size_t signal_capacity,
+        std::size_t callback_capacity,
         std::uint64_t first_client_order_id,
         std::uint64_t first_order_ref)
         : account_id(source.alias()),
@@ -727,6 +758,7 @@ struct AccountTradingSession::Impl {
           api(std::move(trader_api)),
           state(source.alias(), order_capacity, trade_capacity),
           signals(signal_capacity),
+          callbacks(callback_capacity + 1),
           next_client_order_id(first_client_order_id),
           next_order_ref(first_order_ref)
     {
@@ -739,6 +771,10 @@ struct AccountTradingSession::Impl {
     std::unique_ptr<TraderApi> api;
     AccountTradingState state;
     std::vector<SignalRecord> signals;
+    std::vector<CallbackEvent> callbacks;
+    std::atomic<std::size_t> callback_write{0};
+    std::atomic<std::size_t> callback_read{0};
+    std::atomic<bool> callback_overflow{false};
     std::uint64_t next_client_order_id{1};
     std::uint64_t next_order_ref{1};
     std::uint32_t daily_signals{0};
@@ -747,6 +783,53 @@ struct AccountTradingSession::Impl {
     int front_id{0};
     int session_id{0};
     int next_request_id{1};
+    int next_action_ref{1};
+    std::uint32_t daily_cancels{0};
+    bool reconciliation{false};
+
+    bool push_callback(const CallbackEvent& event) noexcept
+    {
+        const auto write = callback_write.load(std::memory_order_relaxed);
+        const auto next = (write + 1) % callbacks.size();
+        if (next == callback_read.load(std::memory_order_acquire)) {
+            callback_overflow.store(true, std::memory_order_release);
+            return false;
+        }
+        callbacks[write] = event;
+        callback_write.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool pop_callback(CallbackEvent& event) noexcept
+    {
+        const auto read = callback_read.load(std::memory_order_relaxed);
+        if (read == callback_write.load(std::memory_order_acquire)) return false;
+        event = callbacks[read];
+        callback_read.store(
+            (read + 1) % callbacks.size(), std::memory_order_release);
+        return true;
+    }
+
+    SignalRecord* find_order(std::uint64_t client_order_id) noexcept
+    {
+        for (auto& record : signals) {
+            if (record.occupied
+                && record.result.client_order_id == client_order_id) {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
+    SignalRecord* find_order_ref(std::uint64_t order_ref) noexcept
+    {
+        for (auto& record : signals) {
+            if (record.occupied && record.result.order_ref == order_ref) {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
 };
 
 AccountTradingSession::AccountTradingSession(
@@ -756,7 +839,7 @@ AccountTradingSession::AccountTradingSession(
     std::size_t order_capacity,
     std::size_t trade_capacity,
     std::size_t signal_capacity,
-    std::size_t,
+    std::size_t callback_capacity,
     std::uint64_t next_client_order_id,
     std::uint64_t persisted_next_order_ref)
     : impl_(std::make_unique<Impl>(
@@ -766,6 +849,7 @@ AccountTradingSession::AccountTradingSession(
           order_capacity,
           trade_capacity,
           signal_capacity,
+          callback_capacity,
           next_client_order_id,
           persisted_next_order_ref))
 {
@@ -837,6 +921,10 @@ SubmitResult AccountTradingSession::submit(
     effective.daily_orders = std::max(snapshot.daily_orders, impl_->daily_orders);
     effective.active_open_orders = std::max(
         snapshot.active_open_orders, impl_->active_open_orders);
+    effective.reconciled = snapshot.reconciled
+        && !impl_->reconciliation
+        && !impl_->state.reconciliation_required()
+        && !impl_->callback_overflow.load(std::memory_order_acquire);
     const auto reason = evaluate_risk(intent, effective, impl_->limits);
     if (reason != RiskRejectReason::None) {
         impl_->state.apply_local_event(
@@ -854,6 +942,14 @@ SubmitResult AccountTradingSession::submit(
     copy_to_field(request.InvestorID, impl_->user_id);
     copy_to_field(request.UserID, impl_->user_id);
     copy_to_field(request.InstrumentID, field_view(intent.instrument));
+    constexpr std::uint64_t kLargestCtpOrderRef = 999'999'999'999ULL;
+    if (impl_->next_order_ref > kLargestCtpOrderRef) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::SubmitRejected);
+        free_record->result.code = SubmitCode::RejectedLocally;
+        return free_record->result;
+    }
     const auto order_ref = impl_->next_order_ref++;
     const auto converted = std::to_chars(
         std::begin(request.OrderRef), std::end(request.OrderRef) - 1, order_ref);
@@ -897,9 +993,270 @@ SubmitResult AccountTradingSession::submit(
     }
     impl_->state.apply_local_event(
         free_record->result.client_order_id, LocalOrderEvent::Submitted);
-    if (intent.offset == Offset::Open) ++impl_->active_open_orders;
+    if (intent.offset == Offset::Open) {
+        ++impl_->active_open_orders;
+        free_record->active_open = true;
+    }
     free_record->result.code = SubmitCode::Submitted;
     return free_record->result;
+}
+
+CancelResult AccountTradingSession::cancel(
+    std::uint64_t client_order_id) noexcept
+{
+    auto* record = impl_->find_order(client_order_id);
+    if (record == nullptr) {
+        return {CancelCode::UnknownOrder, client_order_id};
+    }
+    if (record->cancel_requested) {
+        return {CancelCode::Duplicate, client_order_id};
+    }
+    OrderSnapshot snapshot{};
+    if (!impl_->state.order_snapshot(client_order_id, snapshot)
+        || is_terminal(snapshot.state)) {
+        return {CancelCode::NotCancelable, client_order_id};
+    }
+    if (impl_->daily_cancels >= impl_->limits.max_daily_cancels) {
+        return {CancelCode::DailyLimit, client_order_id};
+    }
+    const auto applied = impl_->state.apply_local_event(
+        client_order_id, LocalOrderEvent::CancelRequested);
+    if (applied.code != ApplyCode::Applied) {
+        return {CancelCode::NotCancelable, client_order_id};
+    }
+
+    CThostFtdcInputOrderActionField action{};
+    copy_to_field(action.BrokerID, impl_->broker_id);
+    copy_to_field(action.InvestorID, impl_->user_id);
+    copy_to_field(action.UserID, impl_->user_id);
+    copy_to_field(action.InstrumentID, field_view(record->intent.instrument));
+    const auto converted = std::to_chars(
+        std::begin(action.OrderRef),
+        std::end(action.OrderRef) - 1,
+        record->result.order_ref);
+    if (converted.ec != std::errc{}) {
+        impl_->state.apply_order_report(
+            {client_order_id, OrderReportType::CancelRejected, 0});
+        return {CancelCode::RejectedLocally, client_order_id, -1};
+    }
+    *converted.ptr = '\0';
+    action.FrontID = impl_->front_id;
+    action.SessionID = impl_->session_id;
+    action.OrderActionRef = impl_->next_action_ref++;
+    action.ActionFlag = THOST_FTDC_AF_Delete;
+    record->cancel_requested = true;
+    ++impl_->daily_cancels;
+    const int api_code = impl_->api == nullptr
+        ? -1
+        : impl_->api->request_order_action(
+              &action, impl_->next_request_id++);
+    if (api_code != 0) {
+        impl_->state.apply_order_report(
+            {client_order_id, OrderReportType::CancelRejected, 0});
+        return {CancelCode::RejectedLocally, client_order_id, api_code};
+    }
+    return {CancelCode::Requested, client_order_id, 0};
+}
+
+namespace {
+
+bool parse_order_ref(
+    const std::array<char, 13>& field,
+    std::uint64_t& value) noexcept
+{
+    const auto text = field_view(field);
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), value);
+    return !text.empty() && parsed.ec == std::errc{}
+        && parsed.ptr == text.data() + text.size();
+}
+
+template <std::size_t N>
+void copy_from_ctp(std::array<char, N>& destination, const char* source) noexcept
+{
+    destination.fill('\0');
+    std::size_t index = 0;
+    while (index + 1 < N && source[index] != '\0') {
+        destination[index] = source[index];
+        ++index;
+    }
+}
+
+}
+
+std::size_t AccountTradingSession::drain_callbacks() noexcept
+{
+    if (impl_->callback_overflow.exchange(false, std::memory_order_acq_rel)) {
+        impl_->reconciliation = true;
+    }
+    std::size_t applied_count = 0;
+    CallbackEvent event{};
+    while (impl_->pop_callback(event)) {
+        ++applied_count;
+        std::uint64_t order_ref = 0;
+        if (!parse_order_ref(event.order_ref, order_ref)) {
+            impl_->reconciliation = true;
+            continue;
+        }
+        auto* record = impl_->find_order_ref(order_ref);
+        if (record == nullptr) {
+            impl_->reconciliation = true;
+            continue;
+        }
+        if (event.type == CallbackType::Unknown) {
+            impl_->reconciliation = true;
+            continue;
+        }
+        ApplyResult result{};
+        if (event.type == CallbackType::Trade) {
+            event.trade.client_order_id = record->result.client_order_id;
+            result = impl_->state.apply_trade(event.trade);
+        } else {
+            const auto type = event.type == CallbackType::InsertRejected
+                ? OrderReportType::Rejected
+                : event.type == CallbackType::CancelRejected
+                    ? OrderReportType::CancelRejected : event.order_type;
+            result = impl_->state.apply_order_report(
+                {record->result.client_order_id,
+                 type,
+                 event.cumulative_filled});
+        }
+        if (result.reconciliation_required
+            || result.code == ApplyCode::Conflict
+            || result.code == ApplyCode::UnknownOrder
+            || result.code == ApplyCode::CapacityExceeded) {
+            impl_->reconciliation = true;
+        }
+        OrderSnapshot snapshot{};
+        if (record->active_open
+            && impl_->state.order_snapshot(
+                record->result.client_order_id, snapshot)
+            && is_terminal(snapshot.state)) {
+            record->active_open = false;
+            --impl_->active_open_orders;
+        }
+    }
+    return applied_count;
+}
+
+bool AccountTradingSession::order_snapshot(
+    std::uint64_t client_order_id,
+    OrderSnapshot& snapshot) const noexcept
+{
+    return impl_->state.order_snapshot(client_order_id, snapshot);
+}
+
+bool AccountTradingSession::position_snapshot(
+    std::string_view instrument,
+    PositionSnapshot& snapshot) const noexcept
+{
+    return impl_->state.position_snapshot(instrument, snapshot);
+}
+
+bool AccountTradingSession::reconciliation_required() const noexcept
+{
+    return impl_->reconciliation || impl_->state.reconciliation_required()
+        || impl_->callback_overflow.load(std::memory_order_acquire);
+}
+
+void AccountTradingSession::OnRtnOrder(CThostFtdcOrderField* order)
+{
+    if (order == nullptr) return;
+    CallbackEvent event{};
+    event.type = CallbackType::Order;
+    copy_from_ctp(event.order_ref, order->OrderRef);
+    event.cumulative_filled = order->VolumeTraded;
+    if (order->OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
+        event.order_type = OrderReportType::Rejected;
+    } else if (order->OrderSubmitStatus == THOST_FTDC_OSS_CancelRejected) {
+        event.order_type = OrderReportType::CancelRejected;
+    } else if (order->OrderStatus == THOST_FTDC_OST_AllTraded) {
+        event.order_type = OrderReportType::Filled;
+    } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedQueueing
+               || order->OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing) {
+        event.order_type = OrderReportType::PartiallyFilled;
+    } else if (order->OrderStatus == THOST_FTDC_OST_Canceled) {
+        event.order_type = OrderReportType::Canceled;
+    } else if (order->OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
+        event.order_type = OrderReportType::Accepted;
+    } else {
+        event.type = CallbackType::Unknown;
+    }
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnRtnTrade(CThostFtdcTradeField* trade)
+{
+    if (trade == nullptr) return;
+    CallbackEvent event{};
+    event.type = CallbackType::Trade;
+    copy_from_ctp(event.order_ref, trade->OrderRef);
+    copy_from_ctp(event.trade.trading_day, trade->TradingDay);
+    copy_from_ctp(event.trade.exchange_id, trade->ExchangeID);
+    copy_from_ctp(event.trade.trade_id, trade->TradeID);
+    copy_from_ctp(event.trade.instrument, trade->InstrumentID);
+    if (trade->Direction == THOST_FTDC_D_Buy) {
+        event.trade.direction = Direction::Buy;
+    } else if (trade->Direction == THOST_FTDC_D_Sell) {
+        event.trade.direction = Direction::Sell;
+    } else {
+        event.type = CallbackType::Unknown;
+    }
+    if (trade->OffsetFlag == THOST_FTDC_OF_Open) {
+        event.trade.offset = Offset::Open;
+    } else if (trade->OffsetFlag == THOST_FTDC_OF_Close
+               || trade->OffsetFlag == THOST_FTDC_OF_CloseToday
+               || trade->OffsetFlag == THOST_FTDC_OF_CloseYesterday) {
+        event.trade.offset = Offset::Close;
+    } else {
+        event.type = CallbackType::Unknown;
+    }
+    event.trade.quantity = trade->Volume;
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnRspOrderInsert(
+    CThostFtdcInputOrderField* order,
+    CThostFtdcRspInfoField* info,
+    int,
+    bool)
+{
+    if (order == nullptr || info == nullptr || info->ErrorID == 0) return;
+    CallbackEvent event{};
+    event.type = CallbackType::InsertRejected;
+    copy_from_ctp(event.order_ref, order->OrderRef);
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnErrRtnOrderInsert(
+    CThostFtdcInputOrderField* order,
+    CThostFtdcRspInfoField* info)
+{
+    OnRspOrderInsert(order, info, 0, true);
+}
+
+void AccountTradingSession::OnRspOrderAction(
+    CThostFtdcInputOrderActionField* action,
+    CThostFtdcRspInfoField* info,
+    int,
+    bool)
+{
+    if (action == nullptr || info == nullptr || info->ErrorID == 0) return;
+    CallbackEvent event{};
+    event.type = CallbackType::CancelRejected;
+    copy_from_ctp(event.order_ref, action->OrderRef);
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnErrRtnOrderAction(
+    CThostFtdcOrderActionField* action,
+    CThostFtdcRspInfoField* info)
+{
+    if (action == nullptr || info == nullptr || info->ErrorID == 0) return;
+    CallbackEvent event{};
+    event.type = CallbackType::CancelRejected;
+    copy_from_ctp(event.order_ref, action->OrderRef);
+    impl_->push_callback(event);
 }
 
 }

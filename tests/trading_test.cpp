@@ -62,6 +62,7 @@ ctp::RiskLimits risk_limits()
     limits.minimum_available_after_order = 100;
     limits.max_daily_signals = 10;
     limits.max_daily_orders = 10;
+    limits.max_daily_cancels = 10;
     limits.max_active_open_orders = 1;
     limits.max_net_open_position = 1;
     return limits;
@@ -497,6 +498,132 @@ void test_risk_boundaries_have_stable_reasons(
         ctp::evaluate_risk(intent, active, limits)
                 == ctp::RiskRejectReason::TooManyActiveOpenOrders,
         "the next opening order beyond the active-order limit must be rejected");
+
+    auto unauthenticated = healthy;
+    unauthenticated.authenticated = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, unauthenticated, limits)
+                == ctp::RiskRejectReason::NotAuthenticated,
+        "an unauthenticated account must be rejected");
+    auto logged_out = healthy;
+    logged_out.logged_in = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, logged_out, limits)
+                == ctp::RiskRejectReason::NotLoggedIn,
+        "a logged-out account must be rejected");
+    auto unreconciled = healthy;
+    unreconciled.reconciled = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, unreconciled, limits)
+                == ctp::RiskRejectReason::NotReconciled,
+        "an unreconciled account must be rejected");
+    auto frozen = healthy;
+    frozen.frozen = true;
+    runner.expect(
+        ctp::evaluate_risk(intent, frozen, limits)
+                == ctp::RiskRejectReason::AccountFrozen,
+        "a frozen account must be rejected");
+    auto stopped = healthy;
+    stopped.exiting = true;
+    runner.expect(
+        ctp::evaluate_risk(intent, stopped, limits)
+                == ctp::RiskRejectReason::Exiting,
+        "an exiting account must reject new orders");
+    auto outside_window = healthy;
+    outside_window.trading_window_open = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, outside_window, limits)
+                == ctp::RiskRejectReason::OutsideTradingWindow,
+        "orders outside the trading window must be rejected");
+    auto killed = healthy;
+    killed.account_kill_switch = true;
+    runner.expect(
+        ctp::evaluate_risk(intent, killed, limits)
+                == ctp::RiskRejectReason::KillSwitch,
+        "the account kill switch must reject new orders");
+    auto unknown_result = healthy;
+    unknown_result.result_unknown = true;
+    runner.expect(
+        ctp::evaluate_risk(intent, unknown_result, limits)
+                == ctp::RiskRejectReason::ResultUnknown,
+        "an unknown prior submit result must stop another order");
+    auto wrong_instrument = intent;
+    ctp::copy_to_field(wrong_instrument.instrument, "IC2609");
+    runner.expect(
+        ctp::evaluate_risk(wrong_instrument, healthy, limits)
+                == ctp::RiskRejectReason::InstrumentNotAllowed,
+        "an instrument outside the whitelist must be rejected");
+    auto forbidden_limits = limits;
+    forbidden_limits.allow_buy = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, healthy, forbidden_limits)
+                == ctp::RiskRejectReason::DirectionNotAllowed,
+        "a disabled direction must be rejected");
+    forbidden_limits = limits;
+    forbidden_limits.allow_open = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, healthy, forbidden_limits)
+                == ctp::RiskRejectReason::OffsetNotAllowed,
+        "a disabled open offset must be rejected");
+    auto bad_quantity = intent;
+    bad_quantity.quantity = 0;
+    runner.expect(
+        ctp::evaluate_risk(bad_quantity, healthy, limits)
+                == ctp::RiskRejectReason::InvalidQuantity,
+        "a zero quantity must be rejected");
+    auto signal_limited = healthy;
+    signal_limited.daily_signals = limits.max_daily_signals;
+    runner.expect(
+        ctp::evaluate_risk(intent, signal_limited, limits)
+                == ctp::RiskRejectReason::DailySignalLimit,
+        "the next signal beyond the daily limit must be rejected");
+    auto order_limited = healthy;
+    order_limited.daily_orders = limits.max_daily_orders;
+    runner.expect(
+        ctp::evaluate_risk(intent, order_limited, limits)
+                == ctp::RiskRejectReason::DailyOrderLimit,
+        "the next order beyond the daily limit must be rejected");
+    auto invalid_book = healthy;
+    invalid_book.bid_price_ticks = invalid_book.ask_price_ticks + 1;
+    runner.expect(
+        ctp::evaluate_risk(intent, invalid_book, limits)
+                == ctp::RiskRejectReason::InvalidMarket,
+        "a crossed market must be rejected");
+    auto unknown_funds = healthy;
+    unknown_funds.funds_known = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, unknown_funds, limits)
+                == ctp::RiskRejectReason::FundsUnknown,
+        "an opening order with unknown funds must be rejected");
+    auto position_limited = healthy;
+    position_limited.long_position = limits.max_net_open_position;
+    runner.expect(
+        ctp::evaluate_risk(intent, position_limited, limits)
+                == ctp::RiskRejectReason::NetPositionLimit,
+        "the next lot beyond the net position limit must be rejected");
+
+    auto close = intent;
+    close.direction = ctp::Direction::Sell;
+    close.offset = ctp::Offset::Close;
+    close.limit_price_ticks = healthy.bid_price_ticks
+        - limits.max_slippage_ticks;
+    auto close_snapshot = healthy;
+    close_snapshot.closable_long = 1;
+    runner.expect(
+        ctp::evaluate_risk(close, close_snapshot, limits)
+                == ctp::RiskRejectReason::None,
+        "an exactly covered closing order must pass");
+    close_snapshot.positions_known = false;
+    runner.expect(
+        ctp::evaluate_risk(close, close_snapshot, limits)
+                == ctp::RiskRejectReason::PositionsUnknown,
+        "a closing order with unknown positions must be rejected");
+    close_snapshot.positions_known = true;
+    close_snapshot.closable_long = 0;
+    runner.expect(
+        ctp::evaluate_risk(close, close_snapshot, limits)
+                == ctp::RiskRejectReason::InsufficientPosition,
+        "a closing order beyond the available position must be rejected");
 }
 
 void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
@@ -533,6 +660,295 @@ void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
         "the accepted intent must be translated into the CTP order request");
 }
 
+void test_ctp_callbacks_are_drained_on_account_thread(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto limits = risk_limits();
+    limits.max_net_open_position = 5;
+    auto risk = healthy_risk_snapshot();
+    risk.available_funds = 600;
+    auto intent = opening_intent(88);
+    intent.quantity = 5;
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* fake_view = fake.get();
+    ctp::AccountTradingSession session{
+        account, limits, std::move(fake), 8, 16, 8, 16, 200, 20};
+    session.activate(3, 9, "20");
+    const auto submitted = session.submit(intent, risk);
+
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "21");
+    ctp::copy_to_field(accepted.ExchangeID, "CFFEX");
+    ctp::copy_to_field(accepted.OrderSysID, "sys-21");
+    accepted.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    fake_view->spi()->OnRtnOrder(&accepted);
+
+    ctp::OrderSnapshot before{};
+    session.order_snapshot(submitted.client_order_id, before);
+    runner.expect(
+        before.state == ctp::OrderState::Submitted,
+        "the CTP callback thread must enqueue instead of mutating account state");
+    session.drain_callbacks();
+    ctp::OrderSnapshot after{};
+    session.order_snapshot(submitted.client_order_id, after);
+    runner.expect(
+        after.state == ctp::OrderState::Accepted,
+        "the account thread must apply the queued acceptance");
+
+    const auto send_trade = [fake_view](std::string_view trade_id, int volume) {
+        CThostFtdcTradeField trade{};
+        ctp::copy_to_field(trade.OrderRef, "21");
+        ctp::copy_to_field(trade.TradingDay, "20260902");
+        ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+        ctp::copy_to_field(trade.TradeID, trade_id);
+        ctp::copy_to_field(trade.InstrumentID, "IF2609");
+        trade.Direction = THOST_FTDC_D_Buy;
+        trade.OffsetFlag = THOST_FTDC_OF_Open;
+        trade.Volume = volume;
+        fake_view->spi()->OnRtnTrade(&trade);
+    };
+    send_trade("trade-1", 2);
+    send_trade("trade-1", 2);
+    send_trade("trade-2", 1);
+    send_trade("trade-3", 2);
+    session.drain_callbacks();
+    ctp::PositionSnapshot held{};
+    session.position_snapshot("IF2609", held);
+    session.order_snapshot(submitted.client_order_id, after);
+    runner.expect(
+        after.state == ctp::OrderState::Filled
+            && after.accounted_filled == 5 && held.long_quantity == 5,
+        "three distinct fills and one duplicate must produce exactly five lots");
+}
+
+void test_cancel_fill_race_calls_ctp_once(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto limits = risk_limits();
+    limits.max_net_open_position = 5;
+    limits.max_daily_cancels = 3;
+    auto risk = healthy_risk_snapshot();
+    risk.available_funds = 600;
+    auto intent = opening_intent(99);
+    intent.quantity = 5;
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* fake_view = fake.get();
+    ctp::AccountTradingSession session{
+        account, limits, std::move(fake), 8, 16, 8, 16, 300, 30};
+    session.activate(4, 10, "30");
+    const auto submitted = session.submit(intent, risk);
+
+    const auto first_cancel = session.cancel(submitted.client_order_id);
+    const auto duplicate_cancel = session.cancel(submitted.client_order_id);
+    runner.expect(
+        first_cancel.code == ctp::CancelCode::Requested
+            && duplicate_cancel.code == ctp::CancelCode::Duplicate
+            && metrics->order_action_calls == 1,
+        "repeated cancellation must call the CTP interface exactly once");
+    runner.expect(
+        std::string_view{metrics->last_action.OrderRef} == "31"
+            && metrics->last_action.FrontID == 4
+            && metrics->last_action.SessionID == 10,
+        "cancel must use the original order reference and login identity");
+
+    CThostFtdcOrderField canceled{};
+    ctp::copy_to_field(canceled.OrderRef, "31");
+    canceled.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    canceled.OrderStatus = THOST_FTDC_OST_Canceled;
+    canceled.VolumeTraded = 2;
+    fake_view->spi()->OnRtnOrder(&canceled);
+    CThostFtdcTradeField late{};
+    ctp::copy_to_field(late.OrderRef, "31");
+    ctp::copy_to_field(late.TradingDay, "20260902");
+    ctp::copy_to_field(late.ExchangeID, "CFFEX");
+    ctp::copy_to_field(late.TradeID, "late-fill");
+    ctp::copy_to_field(late.InstrumentID, "IF2609");
+    late.Direction = THOST_FTDC_D_Buy;
+    late.OffsetFlag = THOST_FTDC_OF_Open;
+    late.Volume = 5;
+    fake_view->spi()->OnRtnTrade(&late);
+    session.drain_callbacks();
+
+    ctp::OrderSnapshot final_order{};
+    ctp::PositionSnapshot final_position{};
+    session.order_snapshot(submitted.client_order_id, final_order);
+    session.position_snapshot("IF2609", final_position);
+    runner.expect(
+        final_order.state == ctp::OrderState::Filled
+            && final_order.cancel_acknowledged
+            && final_position.long_quantity == 5,
+        "a late fill must refine canceled to filled without losing cancel history");
+}
+
+void test_unknown_callback_freezes_only_its_account(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig first_account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    const ctp::AccountConfig second_account{
+        "account2", "9999", "user2", "password", "app", "auth", "front"};
+    auto first_metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto second_metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto first_api = std::make_unique<test_support::FakeTraderApi>(first_metrics);
+    auto second_api = std::make_unique<test_support::FakeTraderApi>(second_metrics);
+    auto* first_view = first_api.get();
+    ctp::AccountTradingSession first{
+        first_account, risk_limits(), std::move(first_api), 4, 4, 4, 4};
+    ctp::AccountTradingSession second{
+        second_account, risk_limits(), std::move(second_api), 4, 4, 4, 4};
+
+    CThostFtdcOrderField unknown{};
+    ctp::copy_to_field(unknown.OrderRef, "999");
+    unknown.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    first_view->spi()->OnRtnOrder(&unknown);
+    first.drain_callbacks();
+    const auto blocked = first.submit(
+        opening_intent(401), healthy_risk_snapshot());
+    runner.expect(
+        first.reconciliation_required()
+            && !second.reconciliation_required()
+            && blocked.code == ctp::SubmitCode::RiskRejected
+            && blocked.risk_reason == ctp::RiskRejectReason::NotReconciled
+            && first_metrics->order_insert_calls == 0,
+        "an unknown callback must freeze only the owning account session");
+}
+
+void test_local_and_exchange_rejections_are_distinct(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    fake->order_insert_return_code = -3;
+    ctp::AccountTradingSession local_reject{
+        account, risk_limits(), std::move(fake), 4, 4, 4, 4};
+    const auto local = local_reject.submit(
+        opening_intent(501), healthy_risk_snapshot());
+    ctp::OrderSnapshot local_order{};
+    local_reject.order_snapshot(local.client_order_id, local_order);
+    runner.expect(
+        local.code == ctp::SubmitCode::RejectedLocally
+            && local.api_return_code == -3
+            && local_order.state == ctp::OrderState::SubmitRejectedLocally,
+        "a nonzero CTP return code must be a local rejection");
+
+    metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto exchange_fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* exchange_view = exchange_fake.get();
+    ctp::AccountTradingSession exchange_reject{
+        account, risk_limits(), std::move(exchange_fake), 4, 4, 4, 4};
+    const auto submitted = exchange_reject.submit(
+        opening_intent(502), healthy_risk_snapshot());
+    CThostFtdcInputOrderField rejected{};
+    ctp::copy_to_field(rejected.OrderRef, "1");
+    CThostFtdcRspInfoField error{};
+    error.ErrorID = 31;
+    exchange_view->spi()->OnRspOrderInsert(&rejected, &error, 1, true);
+    exchange_reject.drain_callbacks();
+    ctp::OrderSnapshot exchange_order{};
+    exchange_reject.order_snapshot(submitted.client_order_id, exchange_order);
+    runner.expect(
+        submitted.code == ctp::SubmitCode::Submitted
+            && exchange_order.state == ctp::OrderState::Rejected,
+        "a zero API return followed by an error callback is an exchange rejection");
+}
+
+void test_callback_queue_overflow_is_explicit(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 4, 4, 4, 1};
+    session.submit(opening_intent(601), healthy_risk_snapshot());
+    CThostFtdcOrderField report{};
+    ctp::copy_to_field(report.OrderRef, "1");
+    report.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRtnOrder(&report);
+    view->spi()->OnRtnOrder(&report);
+    runner.expect(
+        session.reconciliation_required(),
+        "a full callback queue must be observable before another order is allowed");
+}
+
+void test_cancel_rejection_and_daily_limit(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 4, 4, 4, 4};
+    const auto submitted = session.submit(
+        opening_intent(651), healthy_risk_snapshot());
+    session.cancel(submitted.client_order_id);
+    CThostFtdcInputOrderActionField action{};
+    ctp::copy_to_field(action.OrderRef, "1");
+    CThostFtdcRspInfoField error{};
+    error.ErrorID = 32;
+    view->spi()->OnRspOrderAction(&action, &error, 2, true);
+    session.drain_callbacks();
+    ctp::OrderSnapshot order{};
+    session.order_snapshot(submitted.client_order_id, order);
+    runner.expect(
+        order.state == ctp::OrderState::Accepted,
+        "a rejected cancellation must restore the last known live order state");
+
+    auto no_cancel_limits = risk_limits();
+    no_cancel_limits.max_daily_cancels = 0;
+    auto limited_metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto limited_api =
+        std::make_unique<test_support::FakeTraderApi>(limited_metrics);
+    ctp::AccountTradingSession limited{
+        account, no_cancel_limits, std::move(limited_api), 4, 4, 4, 4};
+    const auto limited_order = limited.submit(
+        opening_intent(652), healthy_risk_snapshot());
+    runner.expect(
+        limited.cancel(limited_order.client_order_id).code
+                == ctp::CancelCode::DailyLimit
+            && limited_metrics->order_action_calls == 0,
+        "the cancel frequency boundary must reject before calling CTP");
+}
+
+void test_session_hot_path_does_not_allocate(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 4, 4, 4, 4};
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "1");
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    ctp::OrderSnapshot snapshot{};
+
+    test_support::AllocationProbe allocation_probe;
+    const auto submitted = session.submit(
+        opening_intent(701), healthy_risk_snapshot());
+    view->spi()->OnRtnOrder(&accepted);
+    session.drain_callbacks();
+    session.cancel(submitted.client_order_id);
+    session.order_snapshot(submitted.client_order_id, snapshot);
+    allocation_probe.stop();
+    runner.expect(
+        allocation_probe.count() == 0,
+        "submit, callback enqueue/drain, cancel, and snapshot must not allocate");
+}
+
 }
 
 int main()
@@ -550,5 +966,12 @@ int main()
     test_trading_hot_path_does_not_allocate(runner);
     test_risk_boundaries_have_stable_reasons(runner);
     test_one_signal_submits_at_most_once(runner);
+    test_ctp_callbacks_are_drained_on_account_thread(runner);
+    test_cancel_fill_race_calls_ctp_once(runner);
+    test_unknown_callback_freezes_only_its_account(runner);
+    test_local_and_exchange_rejections_are_distinct(runner);
+    test_callback_queue_overflow_is_explicit(runner);
+    test_cancel_rejection_and_daily_limit(runner);
+    test_session_hot_path_does_not_allocate(runner);
     return runner.finish();
 }
