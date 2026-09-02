@@ -52,6 +52,52 @@ ctp::PositionSnapshot position(ctp::AccountTradingState& state)
     return value;
 }
 
+ctp::RiskLimits risk_limits()
+{
+    ctp::RiskLimits limits{};
+    ctp::copy_to_field(limits.allowed_instrument, "IF2609");
+    limits.max_market_age_ns = 1'000'000;
+    limits.max_slippage_ticks = 2;
+    limits.margin_per_lot = 100;
+    limits.minimum_available_after_order = 100;
+    limits.max_daily_signals = 10;
+    limits.max_daily_orders = 10;
+    limits.max_active_open_orders = 1;
+    limits.max_net_open_position = 1;
+    return limits;
+}
+
+ctp::RiskSnapshot healthy_risk_snapshot()
+{
+    ctp::RiskSnapshot snapshot{};
+    snapshot.enabled = true;
+    snapshot.authenticated = true;
+    snapshot.logged_in = true;
+    snapshot.reconciled = true;
+    snapshot.trading_window_open = true;
+    snapshot.market_valid = true;
+    snapshot.funds_known = true;
+    snapshot.positions_known = true;
+    snapshot.now_ns = 2'000'000;
+    snapshot.market_receive_ns = 1'500'000;
+    snapshot.bid_price_ticks = 3'999;
+    snapshot.ask_price_ticks = 4'000;
+    snapshot.available_funds = 200;
+    return snapshot;
+}
+
+ctp::OrderIntent opening_intent(std::uint64_t signal_id = 41)
+{
+    ctp::OrderIntent intent{};
+    intent.signal_id = signal_id;
+    ctp::copy_to_field(intent.instrument, "IF2609");
+    intent.direction = ctp::Direction::Buy;
+    intent.offset = ctp::Offset::Open;
+    intent.quantity = 1;
+    intent.limit_price_ticks = 4'002;
+    return intent;
+}
+
 void test_local_order_states(test_support::TestRunner& runner)
 {
     ctp::AccountTradingState state{"account1", 8, 16};
@@ -405,6 +451,88 @@ void test_trading_hot_path_does_not_allocate(
         "the allocation probe must still execute the complete trading path");
 }
 
+void test_risk_boundaries_have_stable_reasons(
+    test_support::TestRunner& runner)
+{
+    const auto limits = risk_limits();
+    const auto intent = opening_intent();
+    const auto healthy = healthy_risk_snapshot();
+    runner.expect(
+        ctp::evaluate_risk(intent, healthy, limits)
+                == ctp::RiskRejectReason::None,
+        "exact price, funds, active-order, and position boundaries must pass");
+
+    auto disabled = healthy;
+    disabled.enabled = false;
+    runner.expect(
+        ctp::evaluate_risk(intent, disabled, limits)
+                == ctp::RiskRejectReason::AccountDisabled,
+        "a disabled account must have a stable rejection reason");
+
+    auto stale = healthy;
+    stale.market_receive_ns = stale.now_ns - limits.max_market_age_ns - 1;
+    runner.expect(
+        ctp::evaluate_risk(intent, stale, limits)
+                == ctp::RiskRejectReason::StaleMarket,
+        "market data one nanosecond beyond the boundary must be stale");
+
+    auto bad_price = intent;
+    bad_price.limit_price_ticks = healthy.ask_price_ticks
+        + limits.max_slippage_ticks + 1;
+    runner.expect(
+        ctp::evaluate_risk(bad_price, healthy, limits)
+                == ctp::RiskRejectReason::PriceProtection,
+        "a buy one tick beyond the protection boundary must be rejected");
+
+    auto insufficient = healthy;
+    --insufficient.available_funds;
+    runner.expect(
+        ctp::evaluate_risk(intent, insufficient, limits)
+                == ctp::RiskRejectReason::InsufficientFunds,
+        "funds one unit below margin plus reserve must be rejected");
+
+    auto active = healthy;
+    active.active_open_orders = limits.max_active_open_orders;
+    runner.expect(
+        ctp::evaluate_risk(intent, active, limits)
+                == ctp::RiskRejectReason::TooManyActiveOpenOrders,
+        "the next opening order beyond the active-order limit must be rejected");
+}
+
+void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth",
+        "tcp://127.0.0.1:41001"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto api = std::make_unique<test_support::FakeTraderApi>(metrics);
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(api), 8, 16, 8, 8, 100, 7};
+    session.activate(3, 9, "12");
+
+    const auto first = session.submit(
+        opening_intent(77), healthy_risk_snapshot());
+    const auto duplicate = session.submit(
+        opening_intent(77), healthy_risk_snapshot());
+    runner.expect(
+        first.code == ctp::SubmitCode::Submitted
+            && duplicate.code == ctp::SubmitCode::Duplicate,
+        "the repeated signal must return the original order without resubmitting");
+    runner.expect(
+        first.client_order_id == 100
+            && duplicate.client_order_id == first.client_order_id,
+        "one signal must keep one stable client order id");
+    runner.expect(
+        metrics->order_insert_calls == 1
+            && std::string_view{metrics->last_order.OrderRef} == "13",
+        "login MaxOrderRef plus one must be used exactly once");
+    runner.expect(
+        std::string_view{metrics->last_order.InstrumentID} == "IF2609"
+            && metrics->last_order.VolumeTotalOriginal == 1
+            && metrics->last_order.LimitPrice == 4'002,
+        "the accepted intent must be translated into the CTP order request");
+}
+
 }
 
 int main()
@@ -420,5 +548,7 @@ int main()
     test_cancel_fill_race_converges(runner);
     test_conflicts_and_fixed_capacity(runner);
     test_trading_hot_path_does_not_allocate(runner);
+    test_risk_boundaries_have_stable_reasons(runner);
+    test_one_signal_submits_at_most_once(runner);
     return runner.finish();
 }

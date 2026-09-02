@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ctp/config.hpp"
+#include "ctp/trader_client.hpp"
 
 #include <array>
 #include <cstddef>
@@ -117,6 +118,109 @@ struct PositionSnapshot {
     bool known{true};
 };
 
+struct OrderIntent {
+    std::uint64_t signal_id{0};
+    std::array<char, kInstrumentIdCapacity> instrument{};
+    Direction direction{Direction::Buy};
+    Offset offset{Offset::Open};
+    std::int32_t quantity{0};
+    std::int64_t limit_price_ticks{0};
+};
+
+struct RiskLimits {
+    std::array<char, kInstrumentIdCapacity> allowed_instrument{};
+    std::int64_t max_market_age_ns{0};
+    std::int64_t max_slippage_ticks{0};
+    std::int64_t margin_per_lot{0};
+    std::int64_t minimum_available_after_order{0};
+    std::uint32_t max_daily_signals{0};
+    std::uint32_t max_daily_orders{0};
+    std::uint32_t max_daily_cancels{0};
+    std::int32_t max_active_open_orders{0};
+    std::int32_t max_net_open_position{0};
+    bool allow_buy{true};
+    bool allow_sell{true};
+    bool allow_open{true};
+    bool allow_close{true};
+};
+
+struct RiskSnapshot {
+    bool enabled{false};
+    bool authenticated{false};
+    bool logged_in{false};
+    bool reconciled{false};
+    bool frozen{false};
+    bool exiting{false};
+    bool trading_window_open{false};
+    bool global_kill_switch{false};
+    bool account_kill_switch{false};
+    bool market_valid{false};
+    bool funds_known{false};
+    bool positions_known{false};
+    bool result_unknown{false};
+    std::int64_t now_ns{0};
+    std::int64_t market_receive_ns{0};
+    std::int64_t bid_price_ticks{0};
+    std::int64_t ask_price_ticks{0};
+    std::int64_t available_funds{0};
+    std::int32_t long_position{0};
+    std::int32_t short_position{0};
+    std::int32_t closable_long{0};
+    std::int32_t closable_short{0};
+    std::uint32_t daily_signals{0};
+    std::uint32_t daily_orders{0};
+    std::int32_t active_open_orders{0};
+};
+
+enum class RiskRejectReason : std::uint8_t {
+    None,
+    AccountDisabled,
+    NotAuthenticated,
+    NotLoggedIn,
+    NotReconciled,
+    AccountFrozen,
+    Exiting,
+    OutsideTradingWindow,
+    KillSwitch,
+    InstrumentNotAllowed,
+    DirectionNotAllowed,
+    OffsetNotAllowed,
+    InvalidQuantity,
+    DailySignalLimit,
+    DailyOrderLimit,
+    InvalidMarket,
+    StaleMarket,
+    PriceProtection,
+    FundsUnknown,
+    InsufficientFunds,
+    PositionsUnknown,
+    InsufficientPosition,
+    TooManyActiveOpenOrders,
+    NetPositionLimit,
+    ResultUnknown,
+};
+
+RiskRejectReason evaluate_risk(
+    const OrderIntent& intent,
+    const RiskSnapshot& snapshot,
+    const RiskLimits& limits) noexcept;
+
+enum class SubmitCode : std::uint8_t {
+    Submitted,
+    RiskRejected,
+    RejectedLocally,
+    Duplicate,
+    CapacityExceeded,
+};
+
+struct SubmitResult {
+    SubmitCode code{SubmitCode::RejectedLocally};
+    std::uint64_t client_order_id{0};
+    std::uint64_t order_ref{0};
+    RiskRejectReason risk_reason{RiskRejectReason::None};
+    int api_return_code{0};
+};
+
 // 一个实例只属于一个账户，并由该账户执行线程串行修改。
 class AccountTradingState {
 public:
@@ -144,6 +248,37 @@ public:
         std::string_view instrument,
         PositionSnapshot& snapshot) const noexcept;
     bool reconciliation_required() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// 一个会话只绑定一个账户；提交热路径只扫描构造时预留的定长表。
+class AccountTradingSession final : public CThostFtdcTraderSpi {
+public:
+    AccountTradingSession(
+        const AccountConfig& account,
+        RiskLimits limits,
+        std::unique_ptr<TraderApi> api,
+        std::size_t order_capacity,
+        std::size_t trade_capacity,
+        std::size_t signal_capacity,
+        std::size_t callback_capacity,
+        std::uint64_t next_client_order_id = 1,
+        std::uint64_t persisted_next_order_ref = 1);
+    ~AccountTradingSession();
+
+    AccountTradingSession(const AccountTradingSession&) = delete;
+    AccountTradingSession& operator=(const AccountTradingSession&) = delete;
+
+    void activate(
+        int front_id,
+        int session_id,
+        std::string_view max_order_ref) noexcept;
+    SubmitResult submit(
+        const OrderIntent& intent,
+        const RiskSnapshot& snapshot) noexcept;
 
 private:
     struct Impl;

@@ -1,7 +1,10 @@
 #include "ctp/trading.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <limits>
 #include <utility>
+#include <vector>
 
 namespace ctp {
 namespace {
@@ -588,6 +591,315 @@ bool AccountTradingState::position_snapshot(
 bool AccountTradingState::reconciliation_required() const noexcept
 {
     return impl_->reconciliation;
+}
+
+RiskRejectReason evaluate_risk(
+    const OrderIntent& intent,
+    const RiskSnapshot& snapshot,
+    const RiskLimits& limits) noexcept
+{
+    if (!snapshot.enabled) return RiskRejectReason::AccountDisabled;
+    if (!snapshot.authenticated) return RiskRejectReason::NotAuthenticated;
+    if (!snapshot.logged_in) return RiskRejectReason::NotLoggedIn;
+    if (!snapshot.reconciled) return RiskRejectReason::NotReconciled;
+    if (snapshot.frozen) return RiskRejectReason::AccountFrozen;
+    if (snapshot.exiting) return RiskRejectReason::Exiting;
+    if (!snapshot.trading_window_open) {
+        return RiskRejectReason::OutsideTradingWindow;
+    }
+    if (snapshot.global_kill_switch || snapshot.account_kill_switch) {
+        return RiskRejectReason::KillSwitch;
+    }
+    if (snapshot.result_unknown) return RiskRejectReason::ResultUnknown;
+    if (intent.instrument != limits.allowed_instrument) {
+        return RiskRejectReason::InstrumentNotAllowed;
+    }
+    if ((intent.direction == Direction::Buy && !limits.allow_buy)
+        || (intent.direction == Direction::Sell && !limits.allow_sell)) {
+        return RiskRejectReason::DirectionNotAllowed;
+    }
+    if ((intent.offset == Offset::Open && !limits.allow_open)
+        || (intent.offset == Offset::Close && !limits.allow_close)) {
+        return RiskRejectReason::OffsetNotAllowed;
+    }
+    if (intent.quantity <= 0) return RiskRejectReason::InvalidQuantity;
+    if (snapshot.daily_signals >= limits.max_daily_signals) {
+        return RiskRejectReason::DailySignalLimit;
+    }
+    if (snapshot.daily_orders >= limits.max_daily_orders) {
+        return RiskRejectReason::DailyOrderLimit;
+    }
+    if (!snapshot.market_valid
+        || snapshot.bid_price_ticks <= 0
+        || snapshot.ask_price_ticks <= 0
+        || snapshot.bid_price_ticks > snapshot.ask_price_ticks
+        || intent.limit_price_ticks <= 0) {
+        return RiskRejectReason::InvalidMarket;
+    }
+    if (snapshot.now_ns < snapshot.market_receive_ns
+        || snapshot.now_ns - snapshot.market_receive_ns
+            > limits.max_market_age_ns) {
+        return RiskRejectReason::StaleMarket;
+    }
+    const bool outside_price_limit = intent.direction == Direction::Buy
+        ? intent.limit_price_ticks
+            > snapshot.ask_price_ticks + limits.max_slippage_ticks
+        : intent.limit_price_ticks
+            < snapshot.bid_price_ticks - limits.max_slippage_ticks;
+    if (outside_price_limit) return RiskRejectReason::PriceProtection;
+
+    if (intent.offset == Offset::Open) {
+        if (!snapshot.funds_known) return RiskRejectReason::FundsUnknown;
+        const auto quantity = static_cast<std::int64_t>(intent.quantity);
+        if (limits.margin_per_lot < 0
+            || quantity > (std::numeric_limits<std::int64_t>::max()
+                            - limits.minimum_available_after_order)
+                    / std::max<std::int64_t>(limits.margin_per_lot, 1)
+            || snapshot.available_funds
+                < quantity * limits.margin_per_lot
+                    + limits.minimum_available_after_order) {
+            return RiskRejectReason::InsufficientFunds;
+        }
+        if (snapshot.active_open_orders >= limits.max_active_open_orders) {
+            return RiskRejectReason::TooManyActiveOpenOrders;
+        }
+        const auto net = snapshot.long_position - snapshot.short_position;
+        const auto next_net = intent.direction == Direction::Buy
+            ? net + intent.quantity : net - intent.quantity;
+        if (next_net > limits.max_net_open_position
+            || next_net < -limits.max_net_open_position) {
+            return RiskRejectReason::NetPositionLimit;
+        }
+    } else {
+        if (!snapshot.positions_known) {
+            return RiskRejectReason::PositionsUnknown;
+        }
+        const auto closable = intent.direction == Direction::Sell
+            ? snapshot.closable_long : snapshot.closable_short;
+        if (closable < intent.quantity) {
+            return RiskRejectReason::InsufficientPosition;
+        }
+    }
+    return RiskRejectReason::None;
+}
+
+namespace {
+
+struct SignalRecord {
+    bool occupied{false};
+    OrderIntent intent{};
+    SubmitResult result{};
+};
+
+bool same_intent(const OrderIntent& left, const OrderIntent& right) noexcept
+{
+    return left.signal_id == right.signal_id
+        && left.instrument == right.instrument
+        && left.direction == right.direction
+        && left.offset == right.offset
+        && left.quantity == right.quantity
+        && left.limit_price_ticks == right.limit_price_ticks;
+}
+
+template <std::size_t N>
+std::string_view field_view(const std::array<char, N>& field) noexcept
+{
+    const auto end = std::find(field.begin(), field.end(), '\0');
+    return {field.data(), static_cast<std::size_t>(end - field.begin())};
+}
+
+}
+
+struct AccountTradingSession::Impl {
+    Impl(
+        const AccountConfig& source,
+        RiskLimits risk_limits,
+        std::unique_ptr<TraderApi> trader_api,
+        std::size_t order_capacity,
+        std::size_t trade_capacity,
+        std::size_t signal_capacity,
+        std::uint64_t first_client_order_id,
+        std::uint64_t first_order_ref)
+        : account_id(source.alias()),
+          broker_id(source.broker_id()),
+          user_id(source.user_id()),
+          limits(std::move(risk_limits)),
+          api(std::move(trader_api)),
+          state(source.alias(), order_capacity, trade_capacity),
+          signals(signal_capacity),
+          next_client_order_id(first_client_order_id),
+          next_order_ref(first_order_ref)
+    {
+    }
+
+    std::string account_id;
+    std::string broker_id;
+    std::string user_id;
+    RiskLimits limits;
+    std::unique_ptr<TraderApi> api;
+    AccountTradingState state;
+    std::vector<SignalRecord> signals;
+    std::uint64_t next_client_order_id{1};
+    std::uint64_t next_order_ref{1};
+    std::uint32_t daily_signals{0};
+    std::uint32_t daily_orders{0};
+    std::int32_t active_open_orders{0};
+    int front_id{0};
+    int session_id{0};
+    int next_request_id{1};
+};
+
+AccountTradingSession::AccountTradingSession(
+    const AccountConfig& account,
+    RiskLimits limits,
+    std::unique_ptr<TraderApi> api,
+    std::size_t order_capacity,
+    std::size_t trade_capacity,
+    std::size_t signal_capacity,
+    std::size_t,
+    std::uint64_t next_client_order_id,
+    std::uint64_t persisted_next_order_ref)
+    : impl_(std::make_unique<Impl>(
+          account,
+          std::move(limits),
+          std::move(api),
+          order_capacity,
+          trade_capacity,
+          signal_capacity,
+          next_client_order_id,
+          persisted_next_order_ref))
+{
+    if (impl_->api) impl_->api->register_spi(this);
+}
+
+AccountTradingSession::~AccountTradingSession()
+{
+    if (impl_->api) {
+        impl_->api->register_spi(nullptr);
+        impl_->api->release();
+    }
+}
+
+void AccountTradingSession::activate(
+    int front_id,
+    int session_id,
+    std::string_view max_order_ref) noexcept
+{
+    impl_->front_id = front_id;
+    impl_->session_id = session_id;
+    std::uint64_t parsed = 0;
+    const auto result = std::from_chars(
+        max_order_ref.data(), max_order_ref.data() + max_order_ref.size(), parsed);
+    if (result.ec == std::errc{} && result.ptr == max_order_ref.data()
+            + max_order_ref.size()
+        && parsed < std::numeric_limits<std::uint64_t>::max()) {
+        impl_->next_order_ref = std::max(impl_->next_order_ref, parsed + 1);
+    }
+}
+
+SubmitResult AccountTradingSession::submit(
+    const OrderIntent& intent,
+    const RiskSnapshot& snapshot) noexcept
+{
+    SignalRecord* free_record = nullptr;
+    for (auto& record : impl_->signals) {
+        if (record.occupied && record.intent.signal_id == intent.signal_id) {
+            auto duplicate = record.result;
+            duplicate.code = same_intent(record.intent, intent)
+                ? SubmitCode::Duplicate : SubmitCode::RejectedLocally;
+            return duplicate;
+        }
+        if (!record.occupied && free_record == nullptr) free_record = &record;
+    }
+    if (free_record == nullptr) {
+        return {SubmitCode::CapacityExceeded};
+    }
+
+    free_record->occupied = true;
+    free_record->intent = intent;
+    free_record->result.client_order_id = impl_->next_client_order_id++;
+    ++impl_->daily_signals;
+
+    OrderSeed seed{};
+    seed.client_order_id = free_record->result.client_order_id;
+    seed.instrument = intent.instrument;
+    seed.direction = intent.direction;
+    seed.offset = intent.offset;
+    seed.quantity = intent.quantity;
+    if (impl_->state.create_order(seed).code != ApplyCode::Applied) {
+        free_record->result.code = SubmitCode::CapacityExceeded;
+        return free_record->result;
+    }
+
+    auto effective = snapshot;
+    effective.daily_signals = std::max(
+        snapshot.daily_signals, impl_->daily_signals - 1);
+    effective.daily_orders = std::max(snapshot.daily_orders, impl_->daily_orders);
+    effective.active_open_orders = std::max(
+        snapshot.active_open_orders, impl_->active_open_orders);
+    const auto reason = evaluate_risk(intent, effective, impl_->limits);
+    if (reason != RiskRejectReason::None) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::RiskRejected);
+        free_record->result.code = SubmitCode::RiskRejected;
+        free_record->result.risk_reason = reason;
+        return free_record->result;
+    }
+    impl_->state.apply_local_event(
+        free_record->result.client_order_id, LocalOrderEvent::RiskAccepted);
+
+    CThostFtdcInputOrderField request{};
+    copy_to_field(request.BrokerID, impl_->broker_id);
+    copy_to_field(request.InvestorID, impl_->user_id);
+    copy_to_field(request.UserID, impl_->user_id);
+    copy_to_field(request.InstrumentID, field_view(intent.instrument));
+    const auto order_ref = impl_->next_order_ref++;
+    const auto converted = std::to_chars(
+        std::begin(request.OrderRef), std::end(request.OrderRef) - 1, order_ref);
+    if (converted.ec != std::errc{}) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::SubmitRejected);
+        free_record->result.code = SubmitCode::RejectedLocally;
+        return free_record->result;
+    }
+    *converted.ptr = '\0';
+    request.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
+    request.Direction = intent.direction == Direction::Buy
+        ? THOST_FTDC_D_Buy : THOST_FTDC_D_Sell;
+    request.CombOffsetFlag[0] = intent.offset == Offset::Open
+        ? THOST_FTDC_OF_Open : THOST_FTDC_OF_Close;
+    request.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
+    request.LimitPrice = static_cast<double>(intent.limit_price_ticks);
+    request.VolumeTotalOriginal = intent.quantity;
+    request.TimeCondition = THOST_FTDC_TC_GFD;
+    request.VolumeCondition = THOST_FTDC_VC_AV;
+    request.MinVolume = 1;
+    request.ContingentCondition = THOST_FTDC_CC_Immediately;
+    request.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
+    request.IsAutoSuspend = 0;
+    request.UserForceClose = 0;
+
+    free_record->result.order_ref = order_ref;
+    ++impl_->daily_orders;
+    const int api_code = impl_->api == nullptr
+        ? -1
+        : impl_->api->request_order_insert(
+              &request, impl_->next_request_id++);
+    free_record->result.api_return_code = api_code;
+    if (api_code != 0) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::SubmitRejected);
+        free_record->result.code = SubmitCode::RejectedLocally;
+        return free_record->result;
+    }
+    impl_->state.apply_local_event(
+        free_record->result.client_order_id, LocalOrderEvent::Submitted);
+    if (intent.offset == Offset::Open) ++impl_->active_open_orders;
+    free_record->result.code = SubmitCode::Submitted;
+    return free_record->result;
 }
 
 }
