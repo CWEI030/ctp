@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 
 namespace ctp {
@@ -39,6 +40,34 @@ struct StrategyDecision {
 };
 
 static_assert(std::is_trivially_copyable<StrategyDecision>::value);
+
+inline constexpr std::string_view kReplayCsvHeader =
+    "format_version,instrument,market_seq,exchange_time_ms,recv_mono_ns,"
+    "decision_mono_ns,last_price_ticks,bid_price_ticks,ask_price_ticks,"
+    "bid_volume,ask_volume,volume,status";
+
+struct ReplayEvent {
+    std::uint32_t format_version{0};
+    MarketEvent market{};
+    std::int64_t decision_mono_ns{0};
+};
+
+enum class ReplayParseCode : std::uint8_t {
+    Parsed,
+    WrongColumnCount,
+    UnsupportedVersion,
+    InvalidField,
+    InvalidInstrument,
+    InvalidStatus,
+};
+
+struct ReplayParseResult {
+    ReplayParseCode code{ReplayParseCode::InvalidField};
+    ReplayEvent event{};
+};
+
+// 单行解析不读文件；调用者负责控制面的打开、逐行读取和表头校验。
+ReplayParseResult parse_replay_csv_line(std::string_view line) noexcept;
 
 // 一个实例只消费一个账户的有序行情；所有状态由该账户线程串行修改。
 class ThresholdStrategy {

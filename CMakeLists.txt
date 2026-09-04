@@ -142,7 +142,8 @@ if(BUILD_TESTING)
 
     add_executable(ctp_strategy_tests tests/strategy_test.cpp)
     target_compile_definitions(ctp_strategy_tests PRIVATE
-        CTP_TEST_WITH_TRADER_FAKE)
+        CTP_TEST_WITH_TRADER_FAKE
+        CTP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(ctp_strategy_tests PRIVATE tests)
     target_link_libraries(ctp_strategy_tests PRIVATE ctp_engine)
     target_compile_options(ctp_strategy_tests PRIVATE
