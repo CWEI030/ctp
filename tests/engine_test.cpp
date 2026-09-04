@@ -242,6 +242,61 @@ void test_lifecycle_invalid_data_and_hot_path_allocation(
         "ingress must ignore callbacks after stop");
 }
 
+ctp::MarketDataStatus normalize_price_status(
+    CThostFtdcDepthMarketDataField tick,
+    double minimum_price_increment)
+{
+    ctp::MarketIngress ingress{make_accounts(1), minimum_price_increment};
+    ingress.start();
+    ingress.ingest(&tick, 1);
+    ctp::MarketEvent event{};
+    ingress.try_pop(0, event);
+    return event.status;
+}
+
+void test_price_normalization_boundaries(test_support::TestRunner& runner)
+{
+    auto tick = make_tick(0);
+    tick.LastPrice = 100.20000000000002;
+    runner.expect(
+        normalize_price_status(tick, 0.2) == ctp::MarketDataStatus::Valid,
+        "binary floating representation near an exact tick must normalize");
+
+    tick = make_tick(0);
+    tick.LastPrice = 100.1;
+    runner.expect(
+        normalize_price_status(tick, 0.2)
+            == ctp::MarketDataStatus::InvalidPrice,
+        "a half-tick price must not be rounded into a tradable price");
+
+    tick = make_tick(0);
+    tick.LastPrice = -100.0;
+    runner.expect(
+        normalize_price_status(tick, 0.2)
+            == ctp::MarketDataStatus::InvalidPrice,
+        "a negative source price must be rejected");
+
+    tick = make_tick(0);
+    tick.AskPrice1 = std::numeric_limits<double>::infinity();
+    runner.expect(
+        normalize_price_status(tick, 0.2)
+            == ctp::MarketDataStatus::InvalidPrice,
+        "an infinite source price must be rejected");
+
+    tick = make_tick(0);
+    runner.expect(
+        normalize_price_status(tick, 0.0)
+            == ctp::MarketDataStatus::InvalidPrice,
+        "a non-positive minimum price increment must reject normalization");
+
+    tick = make_tick(0);
+    tick.BidPrice1 = std::numeric_limits<double>::max();
+    runner.expect(
+        normalize_price_status(tick, 0.2)
+            == ctp::MarketDataStatus::InvalidPrice,
+        "a tick conversion outside int64 range must be rejected");
+}
+
 }
 
 int main()
@@ -252,5 +307,6 @@ int main()
     test_normalization_and_four_account_distribution(runner);
     test_slow_account_does_not_block_other_accounts(runner);
     test_lifecycle_invalid_data_and_hot_path_allocation(runner);
+    test_price_normalization_boundaries(runner);
     return runner.finish();
 }
