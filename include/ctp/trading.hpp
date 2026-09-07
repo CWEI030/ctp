@@ -13,6 +13,8 @@
 namespace ctp {
 
 struct MarketEvent;
+class TraceSink;
+struct RestartImage;
 
 inline constexpr std::size_t kTradingDayCapacity = 9;
 inline constexpr std::size_t kExchangeIdCapacity = 9;
@@ -289,7 +291,9 @@ enum class RecoveryFailure : std::uint8_t {
     None,
     RequestRejected,
     ResponseError,
+    UnexpectedResponse,
     UnknownOrder,
+    MissingOrder,
     UnknownTrade,
     InvalidPosition,
     CapacityExceeded,
@@ -382,7 +386,9 @@ public:
         std::size_t callback_capacity,
         std::uint64_t next_client_order_id = 1,
         std::uint64_t persisted_next_order_ref = 1,
-        AutoClosePolicy auto_close_policy = {});
+        AutoClosePolicy auto_close_policy = {},
+        TraceSink* trace_sink = nullptr,
+        std::uint64_t run_id = 1);
     ~AccountTradingSession();
 
     AccountTradingSession(const AccountTradingSession&) = delete;
@@ -393,6 +399,7 @@ public:
         int session_id,
         std::string_view max_order_ref) noexcept;
     void start();
+    bool restore_restart_image(const RestartImage& image) noexcept;
     RecoverySnapshot recovery_snapshot() const noexcept;
     SubmitResult submit(
         const OrderIntent& intent,

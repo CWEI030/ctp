@@ -92,7 +92,7 @@ void test_truncated_journal_is_not_a_clean_restart(
     std::filesystem::remove(path);
     {
         std::ofstream output{path};
-        output << "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,quantity,instrument,code\n";
+        output << "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code\n";
         output << "ctp_trace_v1,account1,17,9001,1,100,signal,71";
     }
     const auto loaded = ctp::read_trace_journal(path);
@@ -100,6 +100,47 @@ void test_truncated_journal_is_not_a_clean_restart(
         !loaded.valid && !loaded.clean_shutdown,
         "a partial tail must never be accepted as a clean restart record");
     std::filesystem::remove(path);
+}
+
+void test_dropped_trace_journal_is_not_a_restart_source(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{"/tmp/ctp_batch007_trace_dropped.csv"};
+    std::filesystem::remove(path);
+    {
+        std::ofstream output{path};
+        output << "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code\n";
+        output << "ctp_trace_v1,account1,17,9001,1,100,order_submitted,71,41,4000,1,0,0,0,0,IF2609,0\n";
+        output << "ctp_trace_v1,account1,0,0,2,0,clean_stop,0,0,0,0,0,0,0,0,,1\n";
+    }
+    const auto loaded = ctp::read_trace_journal(path);
+    const auto image = ctp::build_restart_image(loaded);
+    runner.expect(
+        loaded.clean_shutdown && !loaded.valid && !image.valid,
+        "a clean file with dropped business facts must not drive restart");
+    std::filesystem::remove(path);
+}
+
+void test_restart_image_keeps_only_unresolved_orders(
+    test_support::TestRunner& runner)
+{
+    ctp::TraceJournalReadResult journal{};
+    journal.valid = true;
+    journal.clean_shutdown = true;
+    journal.account_id = "account1";
+    auto submitted = trace_event(1, ctp::TraceStage::OrderSubmitted);
+    auto filled = trace_event(2, ctp::TraceStage::OrderReport);
+    filled.code = static_cast<std::int32_t>(
+        ctp::TraceOrderReportCode::Filled);
+    journal.events = {submitted, filled};
+    journal.max_client_order_id = submitted.client_order_id;
+    journal.max_order_ref = submitted.order_ref;
+    const auto image = ctp::build_restart_image(journal);
+    runner.expect(
+        image.valid && image.uncertain_orders.empty()
+            && image.next_client_order_id == 72
+            && image.next_order_ref == 42,
+        "restart image must advance identities but omit terminal orders");
 }
 
 }
@@ -110,5 +151,7 @@ int main()
     test_trace_queue_is_nonblocking_and_counts_drops(runner);
     test_async_journal_round_trip_and_clean_marker(runner);
     test_truncated_journal_is_not_a_clean_restart(runner);
+    test_dropped_trace_journal_is_not_a_restart_source(runner);
+    test_restart_image_keeps_only_unresolved_orders(runner);
     return runner.finish();
 }

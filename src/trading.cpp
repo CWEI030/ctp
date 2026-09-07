@@ -1,5 +1,6 @@
 #include "ctp/trading.hpp"
 #include "ctp/engine.hpp"
+#include "ctp/telemetry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -746,6 +747,7 @@ struct SignalRecord {
     std::uint32_t market_events_waited{0};
     OrderIntent intent{};
     SubmitResult result{};
+    bool seen_during_recovery{false};
 };
 
 enum class CallbackType : std::uint8_t {
@@ -792,6 +794,34 @@ bool same_intent(const OrderIntent& left, const OrderIntent& right) noexcept
         && left.attempt == right.attempt;
 }
 
+bool queried_order_type(
+    const CThostFtdcOrderField& order,
+    OrderReportType& type) noexcept
+{
+    if (order.OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
+        type = OrderReportType::Rejected;
+        return true;
+    }
+    if (order.OrderStatus == THOST_FTDC_OST_AllTraded) {
+        type = OrderReportType::Filled;
+        return true;
+    }
+    if (order.OrderStatus == THOST_FTDC_OST_PartTradedQueueing
+        || order.OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing) {
+        type = OrderReportType::PartiallyFilled;
+        return true;
+    }
+    if (order.OrderStatus == THOST_FTDC_OST_Canceled) {
+        type = OrderReportType::Canceled;
+        return true;
+    }
+    if (order.OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
+        type = OrderReportType::Accepted;
+        return true;
+    }
+    return false;
+}
+
 struct ExitState {
     bool pending{false};
     bool active{false};
@@ -825,7 +855,9 @@ struct AccountTradingSession::Impl {
         std::size_t callback_capacity,
         std::uint64_t first_client_order_id,
         std::uint64_t first_order_ref,
-        AutoClosePolicy close_policy)
+        AutoClosePolicy close_policy,
+        TraceSink* trace_output,
+        std::uint64_t trace_run_id)
         : account_id(source.alias()),
           broker_id(source.broker_id()),
           user_id(source.user_id()),
@@ -840,7 +872,9 @@ struct AccountTradingSession::Impl {
           callbacks(callback_capacity + 1),
           next_client_order_id(first_client_order_id),
           next_order_ref(first_order_ref),
-          policy(close_policy)
+          policy(close_policy),
+          trace_sink(trace_output),
+          run_id(trace_run_id)
     {
     }
 
@@ -867,6 +901,7 @@ struct AccountTradingSession::Impl {
     int front_id{0};
     int session_id{0};
     int next_request_id{1};
+    int expected_recovery_request_id{0};
     int next_action_ref{1};
     std::uint32_t daily_cancels{0};
     bool reconciliation{false};
@@ -878,6 +913,82 @@ struct AccountTradingSession::Impl {
     AutoClosePolicy policy{};
     ExitState exit{};
     RecoverySnapshot recovery{};
+    TraceSink* trace_sink{nullptr};
+    std::uint64_t run_id{1};
+    std::uint64_t trace_sequence{0};
+
+    void trace(
+        TraceStage stage,
+        const SignalRecord* record = nullptr,
+        std::int32_t code = 0,
+        std::int32_t quantity = 0) noexcept
+    {
+        if (trace_sink == nullptr) return;
+        TraceEvent event{};
+        event.trace_id.run_id = run_id;
+        event.sequence = ++trace_sequence;
+        event.stage = stage;
+        event.code = code;
+        event.quantity = quantity;
+        if (record != nullptr) {
+            event.trace_id.signal_id = record->intent.signal_id;
+            event.client_order_id = record->result.client_order_id;
+            event.order_ref = record->result.order_ref;
+            event.limit_price_ticks = record->intent.limit_price_ticks;
+            event.quantity = quantity == 0 ? record->intent.quantity : quantity;
+            event.attempt = record->intent.attempt;
+            event.direction = static_cast<std::uint8_t>(record->intent.direction);
+            event.offset = static_cast<std::uint8_t>(record->intent.offset);
+            event.purpose = static_cast<std::uint8_t>(record->intent.purpose);
+            event.instrument = record->intent.instrument;
+        }
+        trace_sink->try_record(event);
+    }
+
+    void release_terminal_open(SignalRecord& record) noexcept
+    {
+        OrderSnapshot snapshot{};
+        if (record.active_open
+            && state.order_snapshot(record.result.client_order_id, snapshot)
+            && is_terminal(snapshot.state)) {
+            record.active_open = false;
+            --active_open_orders;
+        }
+    }
+
+    void apply_trade_effect(
+        SignalRecord& record,
+        const TradeReport& trade,
+        const ApplyResult& result) noexcept
+    {
+        if (!policy.enabled || result.code != ApplyCode::Applied
+            || !result.position_changed) {
+            return;
+        }
+        if (record.intent.offset == Offset::Open) {
+            const bool incompatible = (exit.pending || exit.active)
+                && (exit.signal_id != record.intent.signal_id
+                    || exit.instrument != trade.instrument);
+            if (incompatible
+                || trade.quantity > std::numeric_limits<std::int32_t>::max()
+                        - exit.pending_quantity) {
+                set_fault(AccountFault::StateConflict);
+                return;
+            }
+            exit.pending = true;
+            exit.instrument = trade.instrument;
+            exit.direction = trade.direction == Direction::Buy
+                ? Direction::Sell : Direction::Buy;
+            exit.signal_id = record.intent.signal_id;
+            exit.pending_quantity += trade.quantity;
+            return;
+        }
+        PositionSnapshot held{};
+        if (state.position_snapshot(field_view(trade.instrument), held)
+            && held.long_quantity == 0 && held.short_quantity == 0) {
+            exit = {};
+        }
+    }
 
     void set_fault(AccountFault reason) noexcept
     {
@@ -890,9 +1001,12 @@ struct AccountTradingSession::Impl {
 
     void recovery_failure(RecoveryFailure reason) noexcept
     {
+        if (recovery.phase == RecoveryPhase::Frozen) return;
         recovery.phase = RecoveryPhase::Frozen;
         recovery.failure = reason;
         set_fault(AccountFault::RecoveryFailed);
+        trace(TraceStage::RecoveryFrozen, nullptr,
+              static_cast<std::int32_t>(reason));
     }
 
     int request_authentication() noexcept
@@ -903,7 +1017,9 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.AppID, app_id);
         copy_to_field(request.AuthCode, auth_code);
         recovery.phase = RecoveryPhase::Authenticating;
-        return api->request_authenticate(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_authenticate(
+            &request, expected_recovery_request_id);
     }
 
     int request_login() noexcept
@@ -913,7 +1029,8 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.UserID, user_id);
         copy_to_field(request.Password, password);
         recovery.phase = RecoveryPhase::LoggingIn;
-        return api->request_user_login(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_user_login(&request, expected_recovery_request_id);
     }
 
     int request_orders() noexcept
@@ -922,7 +1039,8 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
         recovery.phase = RecoveryPhase::QueryingOrders;
-        return api->request_order_query(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_order_query(&request, expected_recovery_request_id);
     }
 
     int request_trades() noexcept
@@ -931,7 +1049,8 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
         recovery.phase = RecoveryPhase::QueryingTrades;
-        return api->request_trade_query(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_trade_query(&request, expected_recovery_request_id);
     }
 
     int request_positions() noexcept
@@ -941,7 +1060,9 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.InvestorID, user_id);
         state.begin_position_reconciliation();
         recovery.phase = RecoveryPhase::QueryingPositions;
-        return api->request_investor_position(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_investor_position(
+            &request, expected_recovery_request_id);
     }
 
     int request_funds() noexcept
@@ -950,7 +1071,9 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
         recovery.phase = RecoveryPhase::QueryingFunds;
-        return api->request_trading_account(&request, next_request_id++);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_trading_account(
+            &request, expected_recovery_request_id);
     }
 
     bool push_callback(const CallbackEvent& event) noexcept
@@ -1008,7 +1131,9 @@ AccountTradingSession::AccountTradingSession(
     std::size_t callback_capacity,
     std::uint64_t next_client_order_id,
     std::uint64_t persisted_next_order_ref,
-    AutoClosePolicy auto_close_policy)
+    AutoClosePolicy auto_close_policy,
+    TraceSink* trace_sink,
+    std::uint64_t run_id)
     : impl_(std::make_unique<Impl>(
           account,
           std::move(limits),
@@ -1019,7 +1144,9 @@ AccountTradingSession::AccountTradingSession(
           callback_capacity,
           next_client_order_id,
           persisted_next_order_ref,
-          auto_close_policy))
+          auto_close_policy,
+          trace_sink,
+          run_id))
 {
     if (impl_->api) impl_->api->register_spi(this);
     if (impl_->policy.enabled
@@ -1064,6 +1191,72 @@ void AccountTradingSession::start()
     impl_->api->subscribe_public_topic(THOST_TERT_QUICK);
     impl_->api->register_front(impl_->trader_front);
     impl_->api->init();
+}
+
+bool AccountTradingSession::restore_restart_image(
+    const RestartImage& image) noexcept
+{
+    if (!image.valid || image.account_id != impl_->account_id
+        || impl_->recovery.phase != RecoveryPhase::Idle
+        || image.uncertain_orders.size() > impl_->signals.size()) {
+        return false;
+    }
+    for (const auto& restored : image.uncertain_orders) {
+        if (restored.trace_id.run_id == 0 || restored.trace_id.signal_id == 0
+            || restored.client_order_id == 0 || restored.order_ref == 0
+            || restored.quantity <= 0
+            || field_view(restored.instrument).empty()
+            || image.next_client_order_id <= restored.client_order_id
+            || image.next_order_ref <= restored.order_ref
+            || restored.direction > static_cast<std::uint8_t>(Direction::Sell)
+            || restored.offset > static_cast<std::uint8_t>(Offset::Close)
+            || restored.purpose > static_cast<std::uint8_t>(OrderPurpose::Exit)) {
+            return false;
+        }
+    }
+    std::size_t index = 0;
+    for (const auto& restored : image.uncertain_orders) {
+        auto& record = impl_->signals[index++];
+        record.occupied = true;
+        record.intent.signal_id = restored.trace_id.signal_id;
+        record.intent.instrument = restored.instrument;
+        record.intent.direction = static_cast<Direction>(restored.direction);
+        record.intent.offset = static_cast<Offset>(restored.offset);
+        record.intent.quantity = restored.quantity;
+        record.intent.limit_price_ticks = restored.limit_price_ticks;
+        record.intent.purpose = static_cast<OrderPurpose>(restored.purpose);
+        record.intent.attempt = restored.attempt;
+        record.result.code = SubmitCode::Submitted;
+        record.result.client_order_id = restored.client_order_id;
+        record.result.order_ref = restored.order_ref;
+        OrderSeed seed{};
+        seed.client_order_id = restored.client_order_id;
+        seed.instrument = restored.instrument;
+        seed.direction = record.intent.direction;
+        seed.offset = record.intent.offset;
+        seed.quantity = restored.quantity;
+        if (impl_->state.create_order(seed).code != ApplyCode::Applied
+            || impl_->state.apply_local_event(
+                   restored.client_order_id,
+                   LocalOrderEvent::RiskAccepted).code != ApplyCode::Applied
+            || impl_->state.apply_local_event(
+                   restored.client_order_id,
+                   LocalOrderEvent::Submitted).code != ApplyCode::Applied) {
+            impl_->recovery_failure(RecoveryFailure::CapacityExceeded);
+            return false;
+        }
+        if (record.intent.offset == Offset::Open) {
+            record.active_open = true;
+            ++impl_->active_open_orders;
+        }
+    }
+    impl_->next_client_order_id = std::max(
+        impl_->next_client_order_id, image.next_client_order_id);
+    impl_->next_order_ref = std::max(
+        impl_->next_order_ref, image.next_order_ref);
+    impl_->frozen = true;
+    impl_->reconciliation = true;
+    return true;
 }
 
 RecoverySnapshot AccountTradingSession::recovery_snapshot() const noexcept
@@ -1127,6 +1320,10 @@ SubmitResult AccountTradingSession::submit(
             LocalOrderEvent::RiskRejected);
         free_record->result.code = SubmitCode::RiskRejected;
         free_record->result.risk_reason = reason;
+        impl_->trace(
+            TraceStage::RiskRejected,
+            free_record,
+            static_cast<std::int32_t>(reason));
         return free_record->result;
     }
     impl_->state.apply_local_event(
@@ -1143,6 +1340,7 @@ SubmitResult AccountTradingSession::submit(
             free_record->result.client_order_id,
             LocalOrderEvent::SubmitRejected);
         free_record->result.code = SubmitCode::RejectedLocally;
+        impl_->trace(TraceStage::OrderRejected, free_record, -1);
         return free_record->result;
     }
     const auto order_ref = impl_->next_order_ref++;
@@ -1153,6 +1351,7 @@ SubmitResult AccountTradingSession::submit(
             free_record->result.client_order_id,
             LocalOrderEvent::SubmitRejected);
         free_record->result.code = SubmitCode::RejectedLocally;
+        impl_->trace(TraceStage::OrderRejected, free_record, -1);
         return free_record->result;
     }
     *converted.ptr = '\0';
@@ -1173,6 +1372,7 @@ SubmitResult AccountTradingSession::submit(
     request.UserForceClose = 0;
 
     free_record->result.order_ref = order_ref;
+    impl_->trace(TraceStage::RiskAccepted, free_record);
     ++impl_->daily_orders;
     const int api_code = impl_->api == nullptr
         ? -1
@@ -1184,6 +1384,7 @@ SubmitResult AccountTradingSession::submit(
             free_record->result.client_order_id,
             LocalOrderEvent::SubmitRejected);
         free_record->result.code = SubmitCode::RejectedLocally;
+        impl_->trace(TraceStage::OrderRejected, free_record, api_code);
         return free_record->result;
     }
     impl_->state.apply_local_event(
@@ -1193,6 +1394,7 @@ SubmitResult AccountTradingSession::submit(
         free_record->active_open = true;
     }
     free_record->result.code = SubmitCode::Submitted;
+    impl_->trace(TraceStage::OrderSubmitted, free_record);
     return free_record->result;
 }
 
@@ -1250,6 +1452,7 @@ CancelResult AccountTradingSession::cancel(
             {client_order_id, OrderReportType::CancelRejected, 0});
         return {CancelCode::RejectedLocally, client_order_id, api_code};
     }
+    impl_->trace(TraceStage::CancelRequested, record);
     return {CancelCode::Requested, client_order_id, 0};
 }
 
@@ -1313,6 +1516,10 @@ ExecutionStepResult AccountTradingSession::on_market(
         intent.limit_price_ticks = price;
         intent.purpose = OrderPurpose::Exit;
         intent.attempt = impl_->exit.attempt;
+
+        SignalRecord exit_trace{};
+        exit_trace.intent = intent;
+        impl_->trace(TraceStage::ExitIntent, &exit_trace);
 
         auto effective = snapshot;
         effective.market_valid = true;
@@ -1420,18 +1627,23 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             impl_->frozen = true;
             impl_->reconciliation = true;
             impl_->set_fault(AccountFault::Disconnected);
+            impl_->trace(TraceStage::Disconnected);
             continue;
         }
         if (event.type == CallbackType::Connected) {
             impl_->frozen = true;
             impl_->reconciliation = true;
+            impl_->trace(TraceStage::RecoveryStarted);
             if (impl_->request_authentication() != 0) {
                 impl_->recovery_failure(RecoveryFailure::RequestRejected);
             }
             continue;
         }
         if (event.type == CallbackType::Authenticated) {
-            if (event.error_id != 0 || !event.is_last) {
+            if (impl_->recovery.phase != RecoveryPhase::Authenticating
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+            } else if (event.error_id != 0 || !event.is_last) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
             } else if (impl_->request_login() != 0) {
                 impl_->recovery_failure(RecoveryFailure::RequestRejected);
@@ -1439,7 +1651,11 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             continue;
         }
         if (event.type == CallbackType::LoggedIn) {
-            if (event.error_id != 0 || !event.is_last || !event.has_payload) {
+            if (impl_->recovery.phase != RecoveryPhase::LoggingIn
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+            } else if (event.error_id != 0 || !event.is_last
+                       || !event.has_payload) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
             } else {
                 activate(
@@ -1449,6 +1665,9 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 impl_->recovery.queried_orders = 0;
                 impl_->recovery.queried_trades = 0;
                 impl_->recovery.queried_positions = 0;
+                for (auto& record : impl_->signals) {
+                    record.seen_during_recovery = false;
+                }
                 if (impl_->request_orders() != 0) {
                     impl_->recovery_failure(RecoveryFailure::RequestRejected);
                 }
@@ -1456,6 +1675,11 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             continue;
         }
         if (event.type == CallbackType::QueryOrder) {
+            if (impl_->recovery.phase != RecoveryPhase::QueryingOrders
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+                continue;
+            }
             if (event.error_id != 0) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
                 continue;
@@ -1470,22 +1694,12 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     impl_->recovery_failure(RecoveryFailure::UnknownOrder);
                     continue;
                 }
+                record->seen_during_recovery = true;
                 ++impl_->recovery.queried_orders;
-                OrderReportType type = OrderReportType::Accepted;
-                if (event.queried_order.OrderSubmitStatus
-                        == THOST_FTDC_OSS_InsertRejected) {
-                    type = OrderReportType::Rejected;
-                } else if (event.queried_order.OrderStatus
-                           == THOST_FTDC_OST_AllTraded) {
-                    type = OrderReportType::Filled;
-                } else if (event.queried_order.OrderStatus
-                               == THOST_FTDC_OST_PartTradedQueueing
-                           || event.queried_order.OrderStatus
-                               == THOST_FTDC_OST_PartTradedNotQueueing) {
-                    type = OrderReportType::PartiallyFilled;
-                } else if (event.queried_order.OrderStatus
-                           == THOST_FTDC_OST_Canceled) {
-                    type = OrderReportType::Canceled;
+                OrderReportType type{};
+                if (!queried_order_type(event.queried_order, type)) {
+                    impl_->recovery_failure(RecoveryFailure::UnknownOrder);
+                    continue;
                 }
                 const auto applied = impl_->state.apply_order_report({
                     record->result.client_order_id,
@@ -1495,18 +1709,59 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     impl_->recovery_failure(RecoveryFailure::UnknownOrder);
                     continue;
                 }
+                impl_->trace(
+                    TraceStage::OrderReport,
+                    record,
+                    static_cast<std::int32_t>(type),
+                    event.queried_order.VolumeTraded);
+                impl_->release_terminal_open(*record);
             }
-            if (event.is_last && impl_->request_trades() != 0) {
-                impl_->recovery_failure(RecoveryFailure::RequestRejected);
+            if (event.is_last) {
+                bool missing = false;
+                for (auto& candidate : impl_->signals) {
+                    OrderSnapshot snapshot{};
+                    if (candidate.occupied && !candidate.seen_during_recovery
+                        && impl_->state.order_snapshot(
+                            candidate.result.client_order_id, snapshot)
+                        && !is_terminal(snapshot.state)) {
+                        missing = true;
+                        break;
+                    }
+                }
+                if (missing) {
+                    impl_->recovery_failure(RecoveryFailure::MissingOrder);
+                } else if (impl_->request_trades() != 0) {
+                    impl_->recovery_failure(RecoveryFailure::RequestRejected);
+                }
             }
             continue;
         }
         if (event.type == CallbackType::QueryTrade) {
+            if (impl_->recovery.phase != RecoveryPhase::QueryingTrades
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+                continue;
+            }
             if (event.error_id != 0) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
                 continue;
             }
             if (event.has_payload) {
+                const bool valid_direction =
+                    event.queried_trade.Direction == THOST_FTDC_D_Buy
+                    || event.queried_trade.Direction == THOST_FTDC_D_Sell;
+                const bool valid_offset =
+                    event.queried_trade.OffsetFlag == THOST_FTDC_OF_Open
+                    || event.queried_trade.OffsetFlag == THOST_FTDC_OF_Close
+                    || event.queried_trade.OffsetFlag
+                        == THOST_FTDC_OF_CloseToday
+                    || event.queried_trade.OffsetFlag
+                        == THOST_FTDC_OF_CloseYesterday;
+                if (!valid_direction || !valid_offset
+                    || event.queried_trade.Volume <= 0) {
+                    impl_->recovery_failure(RecoveryFailure::UnknownTrade);
+                    continue;
+                }
                 std::array<char, 13> queried_ref{};
                 copy_from_ctp(queried_ref, event.queried_trade.OrderRef);
                 std::uint64_t order_ref = 0;
@@ -1522,9 +1777,11 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 copy_from_ctp(report.exchange_id, event.queried_trade.ExchangeID);
                 copy_from_ctp(report.trade_id, event.queried_trade.TradeID);
                 copy_from_ctp(report.instrument, event.queried_trade.InstrumentID);
-                report.direction = event.queried_trade.Direction == THOST_FTDC_D_Buy
+                report.direction = event.queried_trade.Direction
+                        == THOST_FTDC_D_Buy
                     ? Direction::Buy : Direction::Sell;
-                report.offset = event.queried_trade.OffsetFlag == THOST_FTDC_OF_Open
+                report.offset = event.queried_trade.OffsetFlag
+                        == THOST_FTDC_OF_Open
                     ? Offset::Open : Offset::Close;
                 report.quantity = event.queried_trade.Volume;
                 const auto applied = impl_->state.apply_trade(report);
@@ -1537,6 +1794,9 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     continue;
                 }
                 ++impl_->recovery.queried_trades;
+                impl_->trace(
+                    TraceStage::Trade, record, 0, event.queried_trade.Volume);
+                impl_->apply_trade_effect(*record, report, applied);
             }
             if (event.is_last && impl_->request_positions() != 0) {
                 impl_->recovery_failure(RecoveryFailure::RequestRejected);
@@ -1544,22 +1804,39 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             continue;
         }
         if (event.type == CallbackType::QueryPosition) {
+            if (impl_->recovery.phase != RecoveryPhase::QueryingPositions
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+                continue;
+            }
             if (event.error_id != 0) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
                 continue;
             }
             if (event.has_payload) {
                 const auto& position = event.queried_position;
+                std::array<char, kInstrumentIdCapacity> instrument_field{};
+                copy_from_ctp(instrument_field, position.InstrumentID);
+                const auto instrument = field_view(instrument_field);
                 if (position.HedgeFlag != THOST_FTDC_HF_Speculation
                     || position.Position < 0
+                    || instrument.empty()
                     || (position.PosiDirection != THOST_FTDC_PD_Long
                         && position.PosiDirection != THOST_FTDC_PD_Short)) {
                     impl_->recovery_failure(RecoveryFailure::InvalidPosition);
                     continue;
                 }
                 PositionSnapshot existing{};
-                const std::string_view instrument{position.InstrumentID};
                 impl_->state.position_snapshot(instrument, existing);
+                const auto existing_quantity = position.PosiDirection
+                        == THOST_FTDC_PD_Long
+                    ? existing.long_quantity : existing.short_quantity;
+                if (position.Position
+                    > std::numeric_limits<std::int32_t>::max()
+                        - existing_quantity) {
+                    impl_->recovery_failure(RecoveryFailure::InvalidPosition);
+                    continue;
+                }
                 const auto long_quantity = position.PosiDirection
                         == THOST_FTDC_PD_Long
                     ? existing.long_quantity + position.Position
@@ -1582,7 +1859,11 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             continue;
         }
         if (event.type == CallbackType::QueryFunds) {
-            if (event.error_id != 0 || !event.is_last) {
+            if (impl_->recovery.phase != RecoveryPhase::QueryingFunds
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+            } else if (event.error_id != 0 || !event.is_last
+                       || !event.has_payload) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
             } else {
                 impl_->recovery.phase = RecoveryPhase::Reconciling;
@@ -1591,6 +1872,7 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 impl_->frozen = false;
                 impl_->recovery.failure = RecoveryFailure::None;
                 impl_->recovery.phase = RecoveryPhase::Ready;
+                impl_->trace(TraceStage::RecoveryReady);
             }
             continue;
         }
@@ -1612,6 +1894,8 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
         if (event.type == CallbackType::Trade) {
             event.trade.client_order_id = record->result.client_order_id;
             result = impl_->state.apply_trade(event.trade);
+            impl_->trace(
+                TraceStage::Trade, record, 0, event.trade.quantity);
         } else {
             const auto type = event.type == CallbackType::InsertRejected
                 ? OrderReportType::Rejected
@@ -1621,6 +1905,11 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 {record->result.client_order_id,
                  type,
                  event.cumulative_filled});
+            impl_->trace(
+                TraceStage::OrderReport,
+                record,
+                static_cast<std::int32_t>(type),
+                event.cumulative_filled);
         }
         if (result.reconciliation_required
             || result.code == ApplyCode::Conflict
@@ -1638,35 +1927,8 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             }
         }
 
-        if (impl_->policy.enabled && event.type == CallbackType::Trade
-            && result.code == ApplyCode::Applied
-            && result.position_changed) {
-            if (record->intent.offset == Offset::Open) {
-                const bool incompatible =
-                    (impl_->exit.pending || impl_->exit.active)
-                    && (impl_->exit.signal_id != record->intent.signal_id
-                        || impl_->exit.instrument != event.trade.instrument);
-                if (incompatible
-                    || event.trade.quantity
-                        > std::numeric_limits<std::int32_t>::max()
-                            - impl_->exit.pending_quantity) {
-                    impl_->set_fault(AccountFault::StateConflict);
-                } else {
-                    impl_->exit.pending = true;
-                    impl_->exit.instrument = event.trade.instrument;
-                    impl_->exit.direction = event.trade.direction
-                        == Direction::Buy ? Direction::Sell : Direction::Buy;
-                    impl_->exit.signal_id = record->intent.signal_id;
-                    impl_->exit.pending_quantity += event.trade.quantity;
-                }
-            } else {
-                PositionSnapshot held{};
-                if (impl_->state.position_snapshot(
-                        field_view(event.trade.instrument), held)
-                    && held.long_quantity == 0 && held.short_quantity == 0) {
-                    impl_->exit = {};
-                }
-            }
+        if (event.type == CallbackType::Trade) {
+            impl_->apply_trade_effect(*record, event.trade, result);
         }
 
         if (event.type == CallbackType::Order
@@ -1693,14 +1955,7 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 }
             }
         }
-        OrderSnapshot snapshot{};
-        if (record->active_open
-            && impl_->state.order_snapshot(
-                record->result.client_order_id, snapshot)
-            && is_terminal(snapshot.state)) {
-            record->active_open = false;
-            --impl_->active_open_orders;
-        }
+        impl_->release_terminal_open(*record);
     }
     return applied_count;
 }

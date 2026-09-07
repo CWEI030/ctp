@@ -1,5 +1,6 @@
 #include "ctp/field.hpp"
 #include "ctp/engine.hpp"
+#include "ctp/telemetry.hpp"
 #include "ctp/trading.hpp"
 #define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
@@ -7,8 +8,22 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <vector>
 
 namespace {
+
+class CapturingTraceSink final : public ctp::TraceSink {
+public:
+    bool try_record(const ctp::TraceEvent& event) noexcept override
+    {
+        if (size == events.size()) return false;
+        events[size++] = event;
+        return true;
+    }
+
+    std::array<ctp::TraceEvent, 64> events{};
+    std::size_t size{0};
+};
 
 ctp::OrderSeed order_seed(std::uint64_t id = 1, int quantity = 5)
 {
@@ -1029,9 +1044,10 @@ void test_open_fill_submits_one_close_and_reaches_zero(
     auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
     auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
     auto* view = fake.get();
+    CapturingTraceSink trace;
     ctp::AccountTradingSession session{
         account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
-        auto_close_policy()};
+        auto_close_policy(), &trace, 77};
     const auto entry = session.submit(opening_intent(801), healthy_risk_snapshot());
     emit_trade(view->spi(), "1", "open-801", ctp::Direction::Buy, ctp::Offset::Open);
     session.drain_callbacks();
@@ -1065,6 +1081,27 @@ void test_open_fill_submits_one_close_and_reaches_zero(
             && execution.close_orders_submitted == 1
             && execution.active_exit_order_id == 0,
         "the closing fill must reach zero and release lifecycle state once");
+    const std::array expected_stages{
+        ctp::TraceStage::RiskAccepted,
+        ctp::TraceStage::OrderSubmitted,
+        ctp::TraceStage::Trade,
+        ctp::TraceStage::ExitIntent,
+        ctp::TraceStage::RiskAccepted,
+        ctp::TraceStage::OrderSubmitted,
+        ctp::TraceStage::Trade,
+    };
+    runner.expect(
+        trace.size == expected_stages.size(),
+        "one lifecycle must emit every decision and effect stage");
+    for (std::size_t index = 0;
+         index < trace.size && index < expected_stages.size(); ++index) {
+        runner.expect(
+            trace.events[index].stage == expected_stages[index]
+                && trace.events[index].trace_id.run_id == 77
+                && trace.events[index].trace_id.signal_id == 801
+                && trace.events[index].sequence == index + 1,
+            "entry and exit must retain one trace identity in causal order");
+    }
 }
 
 void test_entry_timeout_cancels_once(test_support::TestRunner& runner)
@@ -1192,7 +1229,8 @@ void complete_empty_recovery(
     session.drain_callbacks();
     api.spi()->OnRspQryInvestorPosition(nullptr, &ok, 5, true);
     session.drain_callbacks();
-    api.spi()->OnRspQryTradingAccount(nullptr, &ok, 6, true);
+    CThostFtdcTradingAccountField funds{};
+    api.spi()->OnRspQryTradingAccount(&funds, &ok, 6, true);
     session.drain_callbacks();
 }
 
@@ -1251,10 +1289,12 @@ void test_unknown_recovery_order_never_resubmits(
     view->spi()->OnFrontConnected();
     session.drain_callbacks();
     CThostFtdcRspInfoField ok{};
-    view->spi()->OnRspAuthenticate(nullptr, &ok, 1, true);
+    view->spi()->OnRspAuthenticate(
+        nullptr, &ok, metrics->authenticate_request_id, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
-    view->spi()->OnRspUserLogin(&login, &ok, 2, true);
+    view->spi()->OnRspUserLogin(
+        &login, &ok, metrics->login_request_id, true);
     session.drain_callbacks();
     CThostFtdcOrderField unknown{};
     ctp::copy_to_field(unknown.OrderRef, "777");
@@ -1268,6 +1308,261 @@ void test_unknown_recovery_order_never_resubmits(
                 == ctp::RecoveryFailure::UnknownOrder
             && metrics->order_insert_calls == 0,
         "an unknown queried order must freeze without submitting a replacement");
+}
+
+void test_session_emits_one_order_trace_without_allocating(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    CapturingTraceSink trace;
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16,
+        1, 1, {}, &trace, 77};
+
+    test_support::AllocationProbe probe;
+    const auto submitted = session.submit(
+        opening_intent(9101), healthy_risk_snapshot());
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "1");
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRtnOrder(&accepted);
+    session.drain_callbacks();
+    session.cancel(submitted.client_order_id);
+    probe.stop();
+
+    runner.expect(
+        probe.count() == 0 && trace.size == 4
+            && trace.events[0].stage == ctp::TraceStage::RiskAccepted
+            && trace.events[1].stage == ctp::TraceStage::OrderSubmitted
+            && trace.events[2].stage == ctp::TraceStage::OrderReport
+            && trace.events[3].stage == ctp::TraceStage::CancelRequested,
+        "session decisions and CTP effects must enter the trace without allocation");
+    for (std::size_t index = 0; index < trace.size; ++index) {
+        runner.expect(
+            trace.events[index].trace_id.run_id == 77
+                && trace.events[index].trace_id.signal_id == 9101
+                && trace.events[index].sequence == index + 1,
+            "one order trace must keep stable identity and monotonic sequence");
+    }
+}
+
+void test_restart_restores_identity_without_resubmitting(
+    test_support::TestRunner& runner)
+{
+    ctp::TraceJournalReadResult journal{};
+    journal.valid = true;
+    journal.clean_shutdown = true;
+    journal.account_id = "account1";
+    ctp::TraceEvent submitted{};
+    submitted.trace_id = {81, 9201};
+    submitted.sequence = 1;
+    submitted.stage = ctp::TraceStage::OrderSubmitted;
+    submitted.client_order_id = 9;
+    submitted.order_ref = 17;
+    submitted.quantity = 1;
+    submitted.limit_price_ticks = 4'002;
+    submitted.direction = static_cast<std::uint8_t>(ctp::Direction::Buy);
+    submitted.offset = static_cast<std::uint8_t>(ctp::Offset::Open);
+    submitted.purpose = static_cast<std::uint8_t>(ctp::OrderPurpose::Entry);
+    ctp::copy_to_field(submitted.instrument, "IF2609");
+    journal.events.push_back(submitted);
+    journal.max_client_order_id = 9;
+    journal.max_order_ref = 17;
+    const auto image = ctp::build_restart_image(journal);
+
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32, 1, 1,
+        auto_close_policy()};
+    runner.expect(
+        session.restore_restart_image(image),
+        "a valid journal must restore the uncertain local order identity");
+    const auto duplicate = session.submit(
+        opening_intent(9201), healthy_risk_snapshot());
+    runner.expect(
+        duplicate.code == ctp::SubmitCode::Duplicate
+            && duplicate.client_order_id == 9
+            && duplicate.order_ref == 17
+            && metrics->order_insert_calls == 0,
+        "restart must return the restored identity without repeating CTP insert");
+
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspAuthenticate(
+        nullptr, &ok, metrics->authenticate_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    login.FrontID = 7;
+    login.SessionID = 9;
+    ctp::copy_to_field(login.MaxOrderRef, "40");
+    view->spi()->OnRspUserLogin(
+        &login, &ok, metrics->login_request_id, true);
+    session.drain_callbacks();
+
+    CThostFtdcOrderField filled{};
+    ctp::copy_to_field(filled.OrderRef, "17");
+    filled.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    filled.OrderStatus = THOST_FTDC_OST_AllTraded;
+    filled.VolumeTraded = 1;
+    view->spi()->OnRspQryOrder(
+        &filled, &ok, metrics->order_query_request_id, true);
+    session.drain_callbacks();
+
+    CThostFtdcTradeField trade{};
+    ctp::copy_to_field(trade.OrderRef, "17");
+    ctp::copy_to_field(trade.TradingDay, "20260907");
+    ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+    ctp::copy_to_field(trade.TradeID, "restart-open-9201");
+    ctp::copy_to_field(trade.InstrumentID, "IF2609");
+    trade.Direction = THOST_FTDC_D_Buy;
+    trade.OffsetFlag = THOST_FTDC_OF_Open;
+    trade.Volume = 1;
+    view->spi()->OnRspQryTrade(
+        &trade, &ok, metrics->trade_query_request_id, true);
+    session.drain_callbacks();
+
+    CThostFtdcInvestorPositionField position{};
+    ctp::copy_to_field(position.InstrumentID, "IF2609");
+    position.PosiDirection = THOST_FTDC_PD_Long;
+    position.HedgeFlag = THOST_FTDC_HF_Speculation;
+    position.Position = 1;
+    view->spi()->OnRspQryInvestorPosition(
+        &position, &ok, metrics->position_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcTradingAccountField funds{};
+    view->spi()->OnRspQryTradingAccount(
+        &funds, &ok, metrics->account_request_id, true);
+    session.drain_callbacks();
+
+    const auto exit = session.on_market(
+        valid_market(2), healthy_risk_snapshot());
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Ready
+            && exit.action == ctp::ExecutionAction::ExitSubmitted
+            && metrics->order_insert_calls == 1
+            && std::string_view{metrics->last_order.OrderRef} == "41"
+            && metrics->last_order.CombOffsetFlag[0] == THOST_FTDC_OF_Close,
+        "queried fill and position must resume at close without replaying the open");
+}
+
+void test_missing_uncertain_order_stays_frozen(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+    session.submit(opening_intent(9301), healthy_risk_snapshot());
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspAuthenticate(
+        nullptr, &ok, metrics->authenticate_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    view->spi()->OnRspUserLogin(
+        &login, &ok, metrics->login_request_id, true);
+    session.drain_callbacks();
+    view->spi()->OnRspQryOrder(
+        nullptr, &ok, metrics->order_query_request_id, true);
+    session.drain_callbacks();
+
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+            && session.recovery_snapshot().failure
+                == ctp::RecoveryFailure::MissingOrder
+            && metrics->trade_query_calls == 0
+            && metrics->order_insert_calls == 1,
+        "an uncertain local order missing from CTP query must not be guessed away");
+}
+
+void test_one_of_four_recovery_failures_is_isolated(
+    test_support::TestRunner& runner)
+{
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> metrics;
+    std::vector<test_support::FakeTraderApi*> api_views;
+    std::vector<std::unique_ptr<ctp::AccountTradingSession>> sessions;
+    for (int index = 0; index < 4; ++index) {
+        const ctp::AccountConfig account{
+            "account" + std::to_string(index + 1),
+            "9999", "user", "password", "app", "auth", "front"};
+        auto account_metrics =
+            std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(account_metrics);
+        api_views.push_back(fake.get());
+        metrics.push_back(account_metrics);
+        sessions.push_back(std::make_unique<ctp::AccountTradingSession>(
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32));
+        sessions.back()->start();
+    }
+
+    for (int index = 0; index < 4; ++index) {
+        if (index == 1) {
+            api_views[index]->spi()->OnFrontConnected();
+            sessions[index]->drain_callbacks();
+            CThostFtdcRspInfoField error{};
+            error.ErrorID = 7;
+            api_views[index]->spi()->OnRspAuthenticate(
+                nullptr, &error, 1, true);
+            sessions[index]->drain_callbacks();
+        } else {
+            complete_empty_recovery(*sessions[index], *api_views[index]);
+        }
+    }
+
+    for (int index = 0; index < 4; ++index) {
+        const auto result = sessions[index]->submit(
+            opening_intent(9400 + index), healthy_risk_snapshot());
+        if (index == 1) {
+            runner.expect(
+                result.code == ctp::SubmitCode::RiskRejected
+                    && metrics[index]->order_insert_calls == 0,
+                "the failed account must remain frozen");
+        } else {
+            runner.expect(
+                result.code == ctp::SubmitCode::Submitted
+                    && metrics[index]->order_insert_calls == 1,
+                "each healthy account must recover and submit independently");
+        }
+    }
+}
+
+void test_stale_recovery_response_cannot_advance_phase(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16};
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspAuthenticate(nullptr, &ok, 99, true);
+    session.drain_callbacks();
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+            && session.recovery_snapshot().failure
+                == ctp::RecoveryFailure::UnexpectedResponse
+            && metrics->login_calls == 0,
+        "a stale request id must freeze instead of advancing recovery");
 }
 
 }
@@ -1300,5 +1595,10 @@ int main()
     test_close_fill_wins_cancel_race_without_reprice(runner);
     test_reconnect_queries_before_unfreezing(runner);
     test_unknown_recovery_order_never_resubmits(runner);
+    test_session_emits_one_order_trace_without_allocating(runner);
+    test_restart_restores_identity_without_resubmitting(runner);
+    test_missing_uncertain_order_stays_frozen(runner);
+    test_one_of_four_recovery_failures_is_isolated(runner);
+    test_stale_recovery_response_cannot_advance_phase(runner);
     return runner.finish();
 }

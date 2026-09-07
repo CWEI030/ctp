@@ -38,6 +38,15 @@ enum class TraceStage : std::uint8_t {
     CleanStop,
 };
 
+enum class TraceOrderReportCode : std::int32_t {
+    Accepted,
+    Rejected,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    CancelRejected,
+};
+
 // 交易线程只复制定长事实；文本格式化和磁盘写入由后台线程完成。
 struct TraceEvent {
     TraceId trace_id{};
@@ -45,9 +54,14 @@ struct TraceEvent {
     std::int64_t mono_ns{0};
     std::uint64_t client_order_id{0};
     std::uint64_t order_ref{0};
+    std::int64_t limit_price_ticks{0};
     TraceStage stage{TraceStage::Market};
     std::int32_t quantity{0};
     std::int32_t code{0};
+    std::uint32_t attempt{0};
+    std::uint8_t direction{0};
+    std::uint8_t offset{0};
+    std::uint8_t purpose{0};
     std::array<char, kInstrumentIdCapacity> instrument{};
 };
 
@@ -95,5 +109,29 @@ struct TraceJournalReadResult {
 };
 
 TraceJournalReadResult read_trace_journal(const std::filesystem::path& path);
+
+// 重启只恢复本地身份和单调编号；是否成交仍由重新登录后的 CTP 查询裁定。
+struct RestartOrder {
+    TraceId trace_id{};
+    std::uint64_t client_order_id{0};
+    std::uint64_t order_ref{0};
+    std::int64_t limit_price_ticks{0};
+    std::int32_t quantity{0};
+    std::uint32_t attempt{0};
+    std::uint8_t direction{0};
+    std::uint8_t offset{0};
+    std::uint8_t purpose{0};
+    std::array<char, kInstrumentIdCapacity> instrument{};
+};
+
+struct RestartImage {
+    bool valid{false};
+    std::string account_id;
+    std::uint64_t next_client_order_id{1};
+    std::uint64_t next_order_ref{1};
+    std::vector<RestartOrder> uncertain_orders;
+};
+
+RestartImage build_restart_image(const TraceJournalReadResult& journal);
 
 }

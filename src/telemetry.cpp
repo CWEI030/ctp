@@ -6,6 +6,7 @@
 #include <atomic>
 #include <charconv>
 #include <fstream>
+#include <limits>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -14,7 +15,7 @@ namespace ctp {
 namespace {
 
 constexpr std::string_view kHeader =
-    "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,quantity,instrument,code";
+    "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code";
 
 std::string_view stage_name(TraceStage stage) noexcept
 {
@@ -65,11 +66,11 @@ bool parse_integer(std::string_view text, Integer& value) noexcept
         && result.ptr == text.data() + text.size();
 }
 
-std::array<std::string_view, 12> split_line(
+std::array<std::string_view, 17> split_line(
     const std::string& line,
     bool& valid) noexcept
 {
-    std::array<std::string_view, 12> fields{};
+    std::array<std::string_view, 17> fields{};
     std::size_t begin = 0;
     for (std::size_t index = 0; index < fields.size(); ++index) {
         const auto comma = line.find(',', begin);
@@ -108,7 +109,11 @@ struct AsyncTraceJournal::Impl {
                << event.trace_id.run_id << ',' << event.trace_id.signal_id << ','
                << event.sequence << ',' << event.mono_ns << ','
                << stage_name(event.stage) << ',' << event.client_order_id << ','
-               << event.order_ref << ',' << event.quantity << ','
+               << event.order_ref << ',' << event.limit_price_ticks << ','
+               << event.quantity << ',' << event.attempt << ','
+               << static_cast<unsigned>(event.direction) << ','
+               << static_cast<unsigned>(event.offset) << ','
+               << static_cast<unsigned>(event.purpose) << ','
                << instrument_view(event) << ',' << event.code << '\n';
     }
 
@@ -181,7 +186,21 @@ void AsyncTraceJournal::stop() noexcept
     stop_event.sequence =
         impl_->largest_sequence.load(std::memory_order_relaxed) + 1;
     stop_event.stage = TraceStage::CleanStop;
-    while (!impl_->queue.try_push(stop_event)) std::this_thread::yield();
+    const auto dropped = impl_->queue.dropped_count();
+    stop_event.code = dropped > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())
+        ? std::numeric_limits<std::int32_t>::max()
+        : static_cast<std::int32_t>(dropped);
+    // CleanStop 属于控制面屏障。先等消费者腾出位置，避免等待本身被计入业务丢弃。
+    while (impl_->queue.depth() == kTraceQueueCapacity) {
+        std::this_thread::yield();
+    }
+    if (!impl_->queue.try_push(stop_event)) {
+        impl_->running.store(false, std::memory_order_release);
+        if (impl_->writer.joinable()) impl_->writer.join();
+        impl_->output.close();
+        return;
+    }
     impl_->running.store(false, std::memory_order_release);
     if (impl_->writer.joinable()) impl_->writer.join();
     impl_->output.close();
@@ -209,6 +228,9 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
         const auto fields = split_line(line, split_valid);
         TraceEvent event{};
         std::int32_t stage_code = 0;
+        unsigned direction = 0;
+        unsigned offset = 0;
+        unsigned purpose = 0;
         if (!split_valid || fields[0] != "ctp_trace_v1"
             || fields[1].empty()
             || !parse_integer(fields[2], event.trace_id.run_id)
@@ -218,14 +240,22 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
             || !parse_stage(fields[6], event.stage)
             || !parse_integer(fields[7], event.client_order_id)
             || !parse_integer(fields[8], event.order_ref)
-            || !parse_integer(fields[9], event.quantity)
-            || fields[10].size() >= event.instrument.size()
-            || !parse_integer(fields[11], stage_code)
+            || !parse_integer(fields[9], event.limit_price_ticks)
+            || !parse_integer(fields[10], event.quantity)
+            || !parse_integer(fields[11], event.attempt)
+            || !parse_integer(fields[12], direction) || direction > 1
+            || !parse_integer(fields[13], offset) || offset > 1
+            || !parse_integer(fields[14], purpose) || purpose > 1
+            || fields[15].size() >= event.instrument.size()
+            || !parse_integer(fields[16], stage_code)
             || (previous_sequence != 0 && event.sequence <= previous_sequence)) {
             return {};
         }
         event.code = stage_code;
-        copy_to_field(event.instrument, fields[10]);
+        event.direction = static_cast<std::uint8_t>(direction);
+        event.offset = static_cast<std::uint8_t>(offset);
+        event.purpose = static_cast<std::uint8_t>(purpose);
+        copy_to_field(event.instrument, fields[15]);
         if (result.account_id.empty()) result.account_id = std::string{fields[1]};
         if (result.account_id != fields[1]) return {};
         previous_sequence = event.sequence;
@@ -236,8 +266,72 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
     }
     if (!input.eof() || result.events.empty()) return {};
     result.clean_shutdown = result.events.back().stage == TraceStage::CleanStop;
-    result.valid = result.clean_shutdown;
+    // 只要热路径曾丢过事实，这份文件仍可审计，但不能作为重启事实源。
+    result.valid = result.clean_shutdown && result.events.back().code == 0;
     return result;
+}
+
+RestartImage build_restart_image(const TraceJournalReadResult& journal)
+{
+    RestartImage image{};
+    if (!journal.valid || !journal.clean_shutdown || journal.account_id.empty()) {
+        return image;
+    }
+    image.account_id = journal.account_id;
+    image.next_client_order_id = journal.max_client_order_id + 1;
+    image.next_order_ref = journal.max_order_ref + 1;
+    for (const auto& event : journal.events) {
+        if (event.stage == TraceStage::OrderSubmitted) {
+            const auto duplicate = std::find_if(
+                image.uncertain_orders.begin(),
+                image.uncertain_orders.end(),
+                [&event](const RestartOrder& order) {
+                    return order.client_order_id == event.client_order_id
+                        || order.order_ref == event.order_ref
+                        || order.trace_id.signal_id == event.trace_id.signal_id;
+                });
+            if (event.trace_id.run_id == 0 || event.trace_id.signal_id == 0
+                || event.client_order_id == 0 || event.order_ref == 0
+                || event.quantity <= 0
+                || instrument_view(event).empty()
+                || event.direction > 1 || event.offset > 1 || event.purpose > 1
+                || duplicate != image.uncertain_orders.end()) {
+                return {};
+            }
+            RestartOrder order{};
+            order.trace_id = event.trace_id;
+            order.client_order_id = event.client_order_id;
+            order.order_ref = event.order_ref;
+            order.limit_price_ticks = event.limit_price_ticks;
+            order.quantity = event.quantity;
+            order.attempt = event.attempt;
+            order.direction = event.direction;
+            order.offset = event.offset;
+            order.purpose = event.purpose;
+            order.instrument = event.instrument;
+            image.uncertain_orders.push_back(order);
+            continue;
+        }
+        const bool terminal_report = event.stage == TraceStage::OrderRejected
+            || (event.stage == TraceStage::OrderReport
+                && (event.code == static_cast<std::int32_t>(
+                        TraceOrderReportCode::Rejected)
+                    || event.code == static_cast<std::int32_t>(
+                        TraceOrderReportCode::Filled)
+                    || event.code == static_cast<std::int32_t>(
+                        TraceOrderReportCode::Canceled)));
+        if (!terminal_report) continue;
+        image.uncertain_orders.erase(
+            std::remove_if(
+                image.uncertain_orders.begin(),
+                image.uncertain_orders.end(),
+                [&event](const RestartOrder& order) {
+                    return order.client_order_id == event.client_order_id;
+                }),
+            image.uncertain_orders.end());
+    }
+    image.valid = image.next_client_order_id != 0 && image.next_order_ref != 0;
+    return image;
 }
 
 }
