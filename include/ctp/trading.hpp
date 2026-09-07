@@ -296,6 +296,7 @@ enum class RecoveryFailure : std::uint8_t {
     MissingOrder,
     UnknownTrade,
     InvalidPosition,
+    InvalidFunds,
     CapacityExceeded,
 };
 
@@ -306,6 +307,9 @@ struct RecoverySnapshot {
     std::uint32_t queried_orders{0};
     std::uint32_t queried_trades{0};
     std::uint32_t queried_positions{0};
+    // 风控资金统一使用“分”，避免热路径使用浮点数比较。
+    bool funds_known{false};
+    std::int64_t available_funds{0};
 };
 
 enum class ExecutionAction : std::uint8_t {
@@ -388,7 +392,8 @@ public:
         std::uint64_t persisted_next_order_ref = 1,
         AutoClosePolicy auto_close_policy = {},
         TraceSink* trace_sink = nullptr,
-        std::uint64_t run_id = 1);
+        std::uint64_t run_id = 1,
+        double minimum_price_increment = 1.0);
     ~AccountTradingSession();
 
     AccountTradingSession(const AccountTradingSession&) = delete;

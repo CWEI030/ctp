@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -745,6 +746,37 @@ void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
         "the accepted intent must be translated into the CTP order request");
 }
 
+void test_order_price_converts_ticks_to_ctp_price(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto api = std::make_unique<test_support::FakeTraderApi>(metrics);
+    ctp::AccountTradingSession session{
+        account,
+        risk_limits(),
+        std::move(api),
+        8,
+        16,
+        8,
+        8,
+        1,
+        1,
+        {},
+        nullptr,
+        1,
+        0.2};
+
+    const auto submitted = session.submit(
+        opening_intent(), healthy_risk_snapshot());
+
+    runner.expect(
+        submitted.code == ctp::SubmitCode::Submitted
+            && std::abs(metrics->last_order.LimitPrice - 800.4) < 1e-9,
+        "integer ticks must be converted to the CTP decimal price");
+}
+
 void test_ctp_callbacks_are_drained_on_account_thread(
     test_support::TestRunner& runner)
 {
@@ -1274,6 +1306,50 @@ void test_reconnect_queries_before_unfreezing(test_support::TestRunner& runner)
         "successful recovery must resume with MaxOrderRef plus one");
 }
 
+void test_recovery_persists_available_funds(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspAuthenticate(
+        nullptr, &ok, metrics->authenticate_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    view->spi()->OnRspUserLogin(
+        &login, &ok, metrics->login_request_id, true);
+    session.drain_callbacks();
+    view->spi()->OnRspQryOrder(
+        nullptr, &ok, metrics->order_query_request_id, true);
+    session.drain_callbacks();
+    view->spi()->OnRspQryTrade(
+        nullptr, &ok, metrics->trade_query_request_id, true);
+    session.drain_callbacks();
+    view->spi()->OnRspQryInvestorPosition(
+        nullptr, &ok, metrics->position_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcTradingAccountField funds{};
+    funds.Available = 12'345.67;
+    view->spi()->OnRspQryTradingAccount(
+        &funds, &ok, metrics->account_request_id, true);
+    session.drain_callbacks();
+
+    const auto recovered = session.recovery_snapshot();
+    runner.expect(
+        recovered.phase == ctp::RecoveryPhase::Ready
+            && recovered.funds_known
+            && recovered.available_funds == 1'234'567,
+        "recovery must retain available funds in fixed-point cents");
+}
+
 void test_unknown_recovery_order_never_resubmits(
     test_support::TestRunner& runner)
 {
@@ -1649,6 +1725,7 @@ int main()
     test_trading_hot_path_does_not_allocate(runner);
     test_risk_boundaries_have_stable_reasons(runner);
     test_one_signal_submits_at_most_once(runner);
+    test_order_price_converts_ticks_to_ctp_price(runner);
     test_ctp_callbacks_are_drained_on_account_thread(runner);
     test_cancel_fill_race_calls_ctp_once(runner);
     test_unknown_callback_freezes_only_its_account(runner);
@@ -1661,6 +1738,7 @@ int main()
     test_entry_timeout_cancels_once(runner);
     test_close_fill_wins_cancel_race_without_reprice(runner);
     test_reconnect_queries_before_unfreezing(runner);
+    test_recovery_persists_available_funds(runner);
     test_unknown_recovery_order_never_resubmits(runner);
     test_session_emits_one_order_trace_without_allocating(runner);
     test_restart_restores_identity_without_resubmitting(runner);

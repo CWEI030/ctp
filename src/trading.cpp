@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -776,6 +777,7 @@ struct CallbackEvent {
     CThostFtdcOrderField queried_order{};
     CThostFtdcTradeField queried_trade{};
     CThostFtdcInvestorPositionField queried_position{};
+    CThostFtdcTradingAccountField queried_account{};
     int error_id{0};
     int request_id{0};
     bool has_payload{false};
@@ -857,7 +859,8 @@ struct AccountTradingSession::Impl {
         std::uint64_t first_order_ref,
         AutoClosePolicy close_policy,
         TraceSink* trace_output,
-        std::uint64_t trace_run_id)
+        std::uint64_t trace_run_id,
+        double price_increment)
         : account_id(source.alias()),
           broker_id(source.broker_id()),
           user_id(source.user_id()),
@@ -874,7 +877,8 @@ struct AccountTradingSession::Impl {
           next_order_ref(first_order_ref),
           policy(close_policy),
           trace_sink(trace_output),
-          run_id(trace_run_id)
+          run_id(trace_run_id),
+          minimum_price_increment(price_increment)
     {
     }
 
@@ -916,6 +920,7 @@ struct AccountTradingSession::Impl {
     TraceSink* trace_sink{nullptr};
     std::uint64_t run_id{1};
     std::uint64_t trace_sequence{0};
+    double minimum_price_increment{1.0};
 
     void trace(
         TraceStage stage,
@@ -1133,7 +1138,8 @@ AccountTradingSession::AccountTradingSession(
     std::uint64_t persisted_next_order_ref,
     AutoClosePolicy auto_close_policy,
     TraceSink* trace_sink,
-    std::uint64_t run_id)
+    std::uint64_t run_id,
+    double minimum_price_increment)
     : impl_(std::make_unique<Impl>(
           account,
           std::move(limits),
@@ -1146,9 +1152,14 @@ AccountTradingSession::AccountTradingSession(
           persisted_next_order_ref,
           auto_close_policy,
           trace_sink,
-          run_id))
+          run_id,
+          minimum_price_increment))
 {
     if (impl_->api) impl_->api->register_spi(this);
+    if (!std::isfinite(impl_->minimum_price_increment)
+        || impl_->minimum_price_increment <= 0.0) {
+        impl_->set_fault(AccountFault::Configuration);
+    }
     if (impl_->policy.enabled
         && (impl_->policy.close_reprice_interval_market_events == 0
             || impl_->policy.close_protection_ticks < 0)) {
@@ -1361,7 +1372,16 @@ SubmitResult AccountTradingSession::submit(
     request.CombOffsetFlag[0] = intent.offset == Offset::Open
         ? THOST_FTDC_OF_Open : THOST_FTDC_OF_Close;
     request.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
-    request.LimitPrice = static_cast<double>(intent.limit_price_ticks);
+    request.LimitPrice = static_cast<double>(intent.limit_price_ticks)
+        * impl_->minimum_price_increment;
+    if (!std::isfinite(request.LimitPrice)) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::SubmitRejected);
+        free_record->result.code = SubmitCode::RejectedLocally;
+        impl_->trace(TraceStage::OrderRejected, free_record, -1);
+        return free_record->result;
+    }
     request.VolumeTotalOriginal = intent.quantity;
     request.TimeCondition = THOST_FTDC_TC_GFD;
     request.VolumeCondition = THOST_FTDC_VC_AV;
@@ -1866,6 +1886,19 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                        || !event.has_payload) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
             } else {
+                const double available_cents =
+                    event.queried_account.Available * 100.0;
+                if (!std::isfinite(available_cents)
+                    || available_cents < 0.0
+                    || available_cents
+                        > static_cast<double>(
+                            std::numeric_limits<std::int64_t>::max())) {
+                    impl_->recovery_failure(RecoveryFailure::InvalidFunds);
+                    continue;
+                }
+                impl_->recovery.available_funds =
+                    static_cast<std::int64_t>(std::llround(available_cents));
+                impl_->recovery.funds_known = true;
                 impl_->recovery.phase = RecoveryPhase::Reconciling;
                 impl_->state.complete_reconciliation();
                 impl_->reconciliation = false;
@@ -2104,6 +2137,7 @@ void AccountTradingSession::OnRspQryTradingAccount(
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = account != nullptr;
+    if (account != nullptr) event.queried_account = *account;
     impl_->push_callback(event);
 }
 
