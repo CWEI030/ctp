@@ -1171,6 +1171,105 @@ void test_close_retry_exhaustion_freezes_without_faking_zero(
         "retry exhaustion must freeze once while preserving the real position");
 }
 
+void complete_empty_recovery(
+    ctp::AccountTradingSession& session,
+    test_support::FakeTraderApi& api)
+{
+    api.spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    api.spi()->OnRspAuthenticate(nullptr, &ok, 1, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    login.FrontID = 7;
+    login.SessionID = 9;
+    ctp::copy_to_field(login.MaxOrderRef, "40");
+    api.spi()->OnRspUserLogin(&login, &ok, 2, true);
+    session.drain_callbacks();
+    api.spi()->OnRspQryOrder(nullptr, &ok, 3, true);
+    session.drain_callbacks();
+    api.spi()->OnRspQryTrade(nullptr, &ok, 4, true);
+    session.drain_callbacks();
+    api.spi()->OnRspQryInvestorPosition(nullptr, &ok, 5, true);
+    session.drain_callbacks();
+    api.spi()->OnRspQryTradingAccount(nullptr, &ok, 6, true);
+    session.drain_callbacks();
+}
+
+void test_reconnect_queries_before_unfreezing(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth",
+        "tcp://127.0.0.1:41001"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+
+    session.start();
+    view->spi()->OnFrontDisconnected(0x1001);
+    session.drain_callbacks();
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Disconnected
+            && session.execution_snapshot().frozen,
+        "disconnect must freeze only this account before recovery");
+
+    complete_empty_recovery(session, *view);
+    const auto recovered = session.recovery_snapshot();
+    runner.expect(
+        recovered.phase == ctp::RecoveryPhase::Ready
+            && !session.execution_snapshot().frozen
+            && metrics->authenticate_calls == 1
+            && metrics->login_calls == 1
+            && metrics->order_query_calls == 1
+            && metrics->trade_query_calls == 1
+            && metrics->position_calls == 1
+            && metrics->account_calls == 1,
+        "reconnect must complete authentication and four serial queries");
+
+    const auto submitted = session.submit(
+        opening_intent(9001), healthy_risk_snapshot());
+    runner.expect(
+        submitted.code == ctp::SubmitCode::Submitted
+            && submitted.order_ref == 41,
+        "successful recovery must resume with MaxOrderRef plus one");
+}
+
+void test_unknown_recovery_order_never_resubmits(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth",
+        "tcp://127.0.0.1:41001"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspAuthenticate(nullptr, &ok, 1, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    view->spi()->OnRspUserLogin(&login, &ok, 2, true);
+    session.drain_callbacks();
+    CThostFtdcOrderField unknown{};
+    ctp::copy_to_field(unknown.OrderRef, "777");
+    unknown.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRspQryOrder(&unknown, &ok, 3, true);
+    session.drain_callbacks();
+
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+            && session.recovery_snapshot().failure
+                == ctp::RecoveryFailure::UnknownOrder
+            && metrics->order_insert_calls == 0,
+        "an unknown queried order must freeze without submitting a replacement");
+}
+
 }
 
 int main()
@@ -1199,5 +1298,7 @@ int main()
     test_close_retry_exhaustion_freezes_without_faking_zero(runner);
     test_entry_timeout_cancels_once(runner);
     test_close_fill_wins_cancel_race_without_reprice(runner);
+    test_reconnect_queries_before_unfreezing(runner);
+    test_unknown_recovery_order_never_resubmits(runner);
     return runner.finish();
 }

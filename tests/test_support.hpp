@@ -101,6 +101,8 @@ struct FakeTraderMetrics {
     int position_request_id{0};
     int order_insert_request_id{0};
     int order_action_request_id{0};
+    int order_query_request_id{0};
+    int trade_query_request_id{0};
     std::string front;
     std::string broker_id;
     std::string user_id;
@@ -226,15 +228,19 @@ public:
         return order_action_return_code;
     }
 
-    int request_order_query(CThostFtdcQryOrderField*, int) override
+    int request_order_query(CThostFtdcQryOrderField*, int request_id) override
     {
         ++metrics_->order_query_calls;
+        metrics_->order_query_request_id = request_id;
+        if (on_order_query) on_order_query(*this);
         return order_query_return_code;
     }
 
-    int request_trade_query(CThostFtdcQryTradeField*, int) override
+    int request_trade_query(CThostFtdcQryTradeField*, int request_id) override
     {
         ++metrics_->trade_query_calls;
+        metrics_->trade_query_request_id = request_id;
+        if (on_trade_query) on_trade_query(*this);
         return trade_query_return_code;
     }
 
@@ -256,6 +262,8 @@ public:
     std::function<void(FakeTraderApi&)> on_position;
     std::function<void(FakeTraderApi&)> on_order_insert;
     std::function<void(FakeTraderApi&)> on_order_action;
+    std::function<void(FakeTraderApi&)> on_order_query;
+    std::function<void(FakeTraderApi&)> on_trade_query;
     int authenticate_return_code{0};
     int login_return_code{0};
     int account_return_code{0};

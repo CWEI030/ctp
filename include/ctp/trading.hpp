@@ -267,6 +267,41 @@ enum class AccountFault : std::uint8_t {
     CloseCancelRejected,
     CloseRetryExhausted,
     PriceOverflow,
+    RecoveryFailed,
+};
+
+enum class RecoveryPhase : std::uint8_t {
+    Idle,
+    Disconnected,
+    Connecting,
+    Authenticating,
+    LoggingIn,
+    QueryingOrders,
+    QueryingTrades,
+    QueryingPositions,
+    QueryingFunds,
+    Reconciling,
+    Ready,
+    Frozen,
+};
+
+enum class RecoveryFailure : std::uint8_t {
+    None,
+    RequestRejected,
+    ResponseError,
+    UnknownOrder,
+    UnknownTrade,
+    InvalidPosition,
+    CapacityExceeded,
+};
+
+struct RecoverySnapshot {
+    RecoveryPhase phase{RecoveryPhase::Idle};
+    RecoveryFailure failure{RecoveryFailure::None};
+    std::uint32_t generation{0};
+    std::uint32_t queried_orders{0};
+    std::uint32_t queried_trades{0};
+    std::uint32_t queried_positions{0};
 };
 
 enum class ExecutionAction : std::uint8_t {
@@ -322,6 +357,12 @@ public:
         std::string_view instrument,
         PositionSnapshot& snapshot) const noexcept;
     bool reconciliation_required() const noexcept;
+    void begin_position_reconciliation() noexcept;
+    ApplyResult set_reconciled_position(
+        std::string_view instrument,
+        std::int32_t long_quantity,
+        std::int32_t short_quantity) noexcept;
+    void complete_reconciliation() noexcept;
 
 private:
     struct Impl;
@@ -351,6 +392,8 @@ public:
         int front_id,
         int session_id,
         std::string_view max_order_ref) noexcept;
+    void start();
+    RecoverySnapshot recovery_snapshot() const noexcept;
     SubmitResult submit(
         const OrderIntent& intent,
         const RiskSnapshot& snapshot) noexcept;
@@ -369,7 +412,39 @@ public:
         PositionSnapshot& snapshot) const noexcept;
     bool reconciliation_required() const noexcept;
 
+    void OnFrontConnected() override;
     void OnFrontDisconnected(int reason) override;
+
+    void OnRspAuthenticate(
+        CThostFtdcRspAuthenticateField* response,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspUserLogin(
+        CThostFtdcRspUserLoginField* response,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryOrder(
+        CThostFtdcOrderField* order,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryTrade(
+        CThostFtdcTradeField* trade,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryInvestorPosition(
+        CThostFtdcInvestorPositionField* position,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
+    void OnRspQryTradingAccount(
+        CThostFtdcTradingAccountField* account,
+        CThostFtdcRspInfoField* info,
+        int request_id,
+        bool is_last) override;
 
     void OnRspOrderInsert(
         CThostFtdcInputOrderField* order,
