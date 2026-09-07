@@ -1,4 +1,5 @@
 #include "ctp/config.hpp"
+#include "ctp/engine.hpp"
 #include "ctp/interrupt.hpp"
 #include "ctp/market_client.hpp"
 #include "ctp/telemetry.hpp"
@@ -26,13 +27,6 @@ int main(int argc, char* argv[])
     if (config.mode() == ctp::Mode::Benchmark) {
         return ctp::run_benchmark(config, std::cout, std::cerr);
     }
-    if (config.mode() == ctp::Mode::Engine) {
-        std::cerr
-            << "[error] engine live runtime is not connected yet; "
-               "offline market distribution is available\n";
-        return 3;
-    }
-
     ctp::SigintHandler sigint;
     if (!sigint.installed()) {
         std::cerr << "[error] failed to install SIGINT handler\n";
@@ -42,12 +36,16 @@ int main(int argc, char* argv[])
     const ctp::StopRequested stop_requested = [&sigint] {
         return sigint.stop_requested();
     };
+    if (config.mode() == ctp::Mode::Engine) {
+        return ctp::run_live_engine(
+            config, std::cout, std::cerr, stop_requested);
+    }
     if (config.mode() == ctp::Mode::Market) {
         return ctp::run_market(
             config, std::chrono::seconds{15}, stop_requested);
     }
 
-    // Engine 模式已在上方返回；这里只有兼容保留的单账户查询模式。
+    // 这里只有兼容保留的单账户查询模式。
     return ctp::run_account(
         config, std::chrono::seconds{15}, stop_requested);
 }

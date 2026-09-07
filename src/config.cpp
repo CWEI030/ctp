@@ -66,6 +66,22 @@ bool is_tcp_front(std::string_view value)
     return value.size() > prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
+bool is_safe_account_alias(std::string_view value)
+{
+    if (value.empty() || value.size() > 64) return false;
+    for (const char character : value) {
+        const bool ascii_letter =
+            (character >= 'a' && character <= 'z')
+            || (character >= 'A' && character <= 'Z');
+        const bool ascii_digit = character >= '0' && character <= '9';
+        if (!ascii_letter && !ascii_digit
+            && character != '_' && character != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
 ConfigResult parse_engine_config(
     const std::vector<std::string_view>& arguments,
     const EnvironmentReader& read_environment)
@@ -172,6 +188,9 @@ ConfigResult parse_engine_config(
             }
 
             std::string alias = section_name.substr(prefix.size());
+            if (!is_safe_account_alias(alias)) {
+                return failure("account config contains an invalid alias");
+            }
             if (!aliases.insert(alias).second) {
                 return failure("account config contains a duplicate alias");
             }

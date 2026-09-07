@@ -435,6 +435,19 @@ void test_engine_requires_private_regular_config_file(TestRunner& runner)
 void test_engine_rejects_invalid_account_schema(TestRunner& runner)
 {
     {
+        std::string unsafe_alias = make_accounts_ini(1);
+        unsafe_alias.replace(
+            unsafe_alias.find("account.account1"),
+            std::string{"account.account1"}.size(),
+            "account../outside");
+        TemporaryAccountFile file{unsafe_alias};
+        expect_error_contains(
+            runner,
+            parse({"engine", "--mode", "live", "--config", file.path()}, {}),
+            "alias");
+    }
+
+    {
         TemporaryAccountFile file{make_accounts_ini(1) + make_accounts_ini(1)};
         expect_error_contains(
             runner,
