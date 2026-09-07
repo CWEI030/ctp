@@ -31,6 +31,34 @@ struct BenchmarkConfig {
     std::uint32_t burst_seconds{0};
 };
 
+struct LiveConfig {
+    std::string config_path;
+    std::string profile;
+    std::string market_front;
+    std::string exchange_id;
+    std::string instrument;
+    double minimum_price_increment{0.0};
+    bool allow_orders{false};
+    bool strategy_enabled{false};
+    std::int64_t trigger_price_ticks{0};
+    std::int64_t entry_protection_ticks{0};
+    std::uint32_t cancel_after_market_ticks{0};
+    std::uint32_t max_signals_per_run{0};
+    std::uint32_t close_reprice_after_market_ticks{0};
+    std::uint32_t max_close_reprices{0};
+    std::int32_t max_order_volume{0};
+    std::int32_t max_net_position{0};
+    std::int32_t max_active_open_orders{0};
+    std::uint32_t max_orders_per_day{0};
+    std::uint32_t max_cancels_per_day{0};
+    std::uint32_t max_order_rate_per_second{0};
+    std::int64_t max_price_deviation_ticks{0};
+    // 配置文件使用元，进入运行配置后统一换算为分。
+    std::int64_t minimum_available_funds{0};
+    std::int64_t market_stale_after_ns{0};
+    bool kill_switch{true};
+};
+
 inline constexpr std::size_t kBrokerIdCapacity = 11;
 inline constexpr std::size_t kUserIdCapacity = 16;
 inline constexpr std::size_t kPasswordCapacity = 41;
@@ -82,7 +110,8 @@ public:
         std::string instrument,
         int ticks,
         std::vector<AccountConfig> accounts = {},
-        BenchmarkConfig benchmark = {});
+        BenchmarkConfig benchmark = {},
+        LiveConfig live = {});
 
     Mode mode() const { return mode_; }
     const std::string& profile() const { return profile_; }
@@ -97,6 +126,7 @@ public:
     int ticks() const { return ticks_; }
     const std::vector<AccountConfig>& accounts() const { return accounts_; }
     const BenchmarkConfig& benchmark() const { return benchmark_; }
+    const LiveConfig& live() const { return live_; }
 
 private:
     Mode mode_;
@@ -112,6 +142,7 @@ private:
     int ticks_;
     std::vector<AccountConfig> accounts_;
     BenchmarkConfig benchmark_;
+    LiveConfig live_;
 };
 
 struct ConfigResult {

@@ -3,6 +3,7 @@
 #include "ThostFtdcUserApiDataType.h"
 
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -71,24 +72,31 @@ ConfigResult parse_engine_config(
 {
     std::string engine_mode;
     std::string config_path;
+    bool allow_orders = false;
     std::unordered_set<std::string_view> seen_options;
 
-    for (std::size_t index = 1; index < arguments.size(); index += 2) {
+    for (std::size_t index = 1; index < arguments.size(); ++index) {
         const auto option = arguments[index];
-        if (option != "--mode" && option != "--config") {
+        if (option != "--mode" && option != "--config"
+            && option != "--allow-orders") {
             return failure("unknown engine command-line option");
         }
         if (!seen_options.insert(option).second) {
             return failure("duplicate engine command-line option");
         }
+        if (option == "--allow-orders") {
+            allow_orders = true;
+            continue;
+        }
         if (index + 1 >= arguments.size()) {
             return failure("engine command-line option is missing a value");
         }
+        ++index;
 
         if (option == "--mode") {
-            engine_mode = std::string{arguments[index + 1]};
+            engine_mode = std::string{arguments[index]};
         } else {
-            config_path = std::string{arguments[index + 1]};
+            config_path = std::string{arguments[index]};
         }
     }
 
@@ -124,8 +132,12 @@ ConfigResult parse_engine_config(
     }
 
     std::vector<AccountSection> sections;
+    std::unordered_map<std::string, std::string> engine_fields;
+    std::unordered_map<std::string, std::string> strategy_fields;
+    std::unordered_map<std::string, std::string> risk_fields;
+    std::unordered_set<std::string> control_sections;
     std::unordered_set<std::string> aliases;
-    AccountSection* current_section = nullptr;
+    std::unordered_map<std::string, std::string>* current_fields = nullptr;
     std::string line;
     std::size_t line_number = 0;
 
@@ -144,9 +156,19 @@ ConfigResult parse_engine_config(
             constexpr std::string_view prefix{"account."};
             const std::string section_name =
                 cleaned.substr(1, cleaned.size() - 2);
+            if (section_name == "engine" || section_name == "strategy"
+                || section_name == "risk") {
+                if (!control_sections.insert(section_name).second) {
+                    return failure("account config contains a duplicate section");
+                }
+                current_fields = section_name == "engine" ? &engine_fields
+                    : section_name == "strategy" ? &strategy_fields
+                    : &risk_fields;
+                continue;
+            }
             if (section_name.size() <= prefix.size()
                 || section_name.compare(0, prefix.size(), prefix) != 0) {
-                return failure("account config section must use [account.alias]");
+                return failure("unknown account config section");
             }
 
             std::string alias = section_name.substr(prefix.size());
@@ -154,11 +176,11 @@ ConfigResult parse_engine_config(
                 return failure("account config contains a duplicate alias");
             }
             sections.push_back({std::move(alias), {}});
-            current_section = &sections.back();
+            current_fields = &sections.back().fields;
             continue;
         }
 
-        if (current_section == nullptr) {
+        if (current_fields == nullptr) {
             return failure("account config field appears before a section");
         }
 
@@ -174,9 +196,180 @@ ConfigResult parse_engine_config(
         if (key.empty()) {
             return failure("account config contains an empty field name");
         }
-        if (!current_section->fields.emplace(std::move(key), std::move(value)).second) {
+        if (!current_fields->emplace(std::move(key), std::move(value)).second) {
             return failure("account config contains a duplicate field");
         }
+    }
+
+    LiveConfig live{};
+    live.config_path = config_path;
+    live.allow_orders = allow_orders;
+    const auto reject_unknown = [](const auto& fields, const auto& allowed) {
+        for (const auto& [name, ignored] : fields) {
+            (void)ignored;
+            if (allowed.find(name) == allowed.end()) return name;
+        }
+        return std::string{};
+    };
+    const std::unordered_set<std::string> allowed_engine{
+        "profile", "market_front", "exchange_id", "instrument",
+        "minimum_price_increment"};
+    const std::unordered_set<std::string> allowed_strategy{
+        "enabled", "trigger_price_ticks", "entry_protection_ticks",
+        "cancel_after_market_ticks", "max_signals_per_run",
+        "close_reprice_after_market_ticks", "max_close_reprices"};
+    const std::unordered_set<std::string> allowed_risk{
+        "max_order_volume", "max_net_position", "max_active_open_orders",
+        "max_orders_per_day", "max_cancels_per_day",
+        "max_order_rate_per_second", "max_price_deviation_ticks",
+        "min_available_funds", "market_stale_after_ms", "kill_switch"};
+    std::string unknown = reject_unknown(engine_fields, allowed_engine);
+    if (unknown.empty()) {
+        unknown = reject_unknown(strategy_fields, allowed_strategy);
+    }
+    if (unknown.empty()) {
+        unknown = reject_unknown(risk_fields, allowed_risk);
+    }
+    if (!unknown.empty()) {
+        return failure("unknown live config field '" + unknown + "'");
+    }
+    const auto value = [](const auto& fields, std::string_view name) {
+        const auto found = fields.find(std::string{name});
+        return found == fields.end() ? std::string_view{} : std::string_view{found->second};
+    };
+    const auto parse_i64 = [](std::string_view text, std::int64_t& output) {
+        const auto parsed = std::from_chars(
+            text.data(), text.data() + text.size(), output);
+        return !text.empty() && parsed.ec == std::errc{}
+            && parsed.ptr == text.data() + text.size();
+    };
+    const auto parse_u32 = [](std::string_view text, std::uint32_t& output) {
+        const auto parsed = std::from_chars(
+            text.data(), text.data() + text.size(), output);
+        return !text.empty() && parsed.ec == std::errc{}
+            && parsed.ptr == text.data() + text.size();
+    };
+    const auto parse_bool = [](std::string_view text, bool& output) {
+        if (text == "true") output = true;
+        else if (text == "false") output = false;
+        else return false;
+        return true;
+    };
+    const auto parse_double = [](std::string_view text, double& output) {
+        if (text.empty()) return false;
+        std::string owned{text};
+        char* end = nullptr;
+        output = std::strtod(owned.c_str(), &end);
+        return end == owned.c_str() + owned.size() && std::isfinite(output);
+    };
+    live.profile = std::string{value(engine_fields, "profile")};
+    live.market_front = std::string{value(engine_fields, "market_front")};
+    live.exchange_id = std::string{value(engine_fields, "exchange_id")};
+    live.instrument = std::string{value(engine_fields, "instrument")};
+    if (const auto text = value(engine_fields, "minimum_price_increment");
+        !text.empty() && (!parse_double(text, live.minimum_price_increment)
+                          || live.minimum_price_increment <= 0.0)) {
+        return failure("minimum_price_increment must be positive");
+    }
+    if (!live.profile.empty()) {
+        const Profile* selected = nullptr;
+        for (const auto& profile : kProfiles) {
+            if (profile.name == live.profile) selected = &profile;
+        }
+        if (selected == nullptr) return failure("unknown engine profile");
+        if (live.market_front.empty()) {
+            live.market_front = std::string{selected->market_front};
+        }
+    }
+    if (!live.market_front.empty() && !is_tcp_front(live.market_front)) {
+        return failure("engine market_front must use tcp://");
+    }
+    if (live.instrument.size() >= kInstrumentIdCapacity) {
+        return failure("engine instrument exceeds CTP field capacity");
+    }
+    if (const auto text = value(strategy_fields, "enabled");
+        !text.empty() && !parse_bool(text, live.strategy_enabled)) {
+        return failure("strategy enabled must be true or false");
+    }
+    if (const auto text = value(strategy_fields, "trigger_price_ticks");
+        !text.empty() && !parse_i64(text, live.trigger_price_ticks)) {
+        return failure("trigger_price_ticks must be an integer");
+    }
+    if (const auto text = value(strategy_fields, "entry_protection_ticks");
+        !text.empty() && (!parse_i64(text, live.entry_protection_ticks)
+                          || live.entry_protection_ticks < 0)) {
+        return failure("entry_protection_ticks must be non-negative");
+    }
+    struct UnsignedField {
+        std::string_view name;
+        std::uint32_t* target;
+    };
+    const UnsignedField strategy_unsigned[]{
+        {"cancel_after_market_ticks", &live.cancel_after_market_ticks},
+        {"max_signals_per_run", &live.max_signals_per_run},
+        {"close_reprice_after_market_ticks", &live.close_reprice_after_market_ticks},
+        {"max_close_reprices", &live.max_close_reprices},
+    };
+    for (const auto& field : strategy_unsigned) {
+        const auto text = value(strategy_fields, field.name);
+        if (!text.empty() && !parse_u32(text, *field.target)) {
+            return failure(std::string{field.name} + " must be a non-negative integer");
+        }
+    }
+    struct PositiveRiskField {
+        std::string_view name;
+        std::uint32_t* target;
+    };
+    std::uint32_t max_order_volume = 0;
+    std::uint32_t max_net_position = 0;
+    std::uint32_t max_active_orders = 0;
+    const PositiveRiskField risk_unsigned[]{
+        {"max_order_volume", &max_order_volume},
+        {"max_net_position", &max_net_position},
+        {"max_active_open_orders", &max_active_orders},
+        {"max_orders_per_day", &live.max_orders_per_day},
+        {"max_cancels_per_day", &live.max_cancels_per_day},
+        {"max_order_rate_per_second", &live.max_order_rate_per_second},
+    };
+    for (const auto& field : risk_unsigned) {
+        const auto text = value(risk_fields, field.name);
+        if (!text.empty() && (!parse_u32(text, *field.target) || *field.target == 0)) {
+            return failure(std::string{field.name} + " must be a positive integer");
+        }
+    }
+    if (max_order_volume > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+        || max_net_position > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+        || max_active_orders > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        return failure("risk position limit exceeds int32 capacity");
+    }
+    live.max_order_volume = static_cast<std::int32_t>(max_order_volume);
+    live.max_net_position = static_cast<std::int32_t>(max_net_position);
+    live.max_active_open_orders = static_cast<std::int32_t>(max_active_orders);
+    if (const auto text = value(risk_fields, "max_price_deviation_ticks");
+        !text.empty() && (!parse_i64(text, live.max_price_deviation_ticks)
+                          || live.max_price_deviation_ticks < 0)) {
+        return failure("max_price_deviation_ticks must be non-negative");
+    }
+    if (const auto text = value(risk_fields, "market_stale_after_ms"); !text.empty()) {
+        std::int64_t milliseconds = 0;
+        if (!parse_i64(text, milliseconds) || milliseconds <= 0
+            || milliseconds > std::numeric_limits<std::int64_t>::max() / 1'000'000) {
+            return failure("market_stale_after_ms must be a positive integer");
+        }
+        live.market_stale_after_ns = milliseconds * 1'000'000;
+    }
+    if (const auto text = value(risk_fields, "min_available_funds"); !text.empty()) {
+        double amount = 0.0;
+        if (!parse_double(text, amount) || amount < 0.0
+            || amount * 100.0 > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+            return failure("min_available_funds must be a non-negative amount");
+        }
+        live.minimum_available_funds =
+            static_cast<std::int64_t>(std::llround(amount * 100.0));
+    }
+    if (const auto text = value(risk_fields, "kill_switch");
+        !text.empty() && !parse_bool(text, live.kill_switch)) {
+        return failure("risk kill_switch must be true or false");
     }
 
     std::vector<AccountConfig> accounts;
@@ -274,7 +467,9 @@ ConfigResult parse_engine_config(
         {},
         {},
         0,
-        std::move(accounts)};
+        std::move(accounts),
+        {},
+        std::move(live)};
     return {std::move(config), {}};
 }
 
@@ -424,7 +619,8 @@ RuntimeConfig::RuntimeConfig(
     std::string instrument,
     int ticks,
     std::vector<AccountConfig> accounts,
-    BenchmarkConfig benchmark)
+    BenchmarkConfig benchmark,
+    LiveConfig live)
     : mode_(mode),
       profile_(std::move(profile)),
       broker_id_(std::move(broker_id)),
@@ -437,7 +633,8 @@ RuntimeConfig::RuntimeConfig(
       instrument_(std::move(instrument)),
       ticks_(ticks),
       accounts_(std::move(accounts)),
-      benchmark_(std::move(benchmark))
+      benchmark_(std::move(benchmark)),
+      live_(std::move(live))
 {
 }
 

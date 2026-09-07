@@ -134,6 +134,37 @@ std::string make_accounts_ini(std::size_t enabled_accounts, bool add_disabled = 
     return output.str();
 }
 
+std::string make_live_ini(std::size_t enabled_accounts)
+{
+    return
+        "[engine]\n"
+        "profile=simnow-7x24\n"
+        "market_front=tcp://127.0.0.1:42001\n"
+        "exchange_id=CFFEX\n"
+        "instrument=IF2609\n"
+        "minimum_price_increment=0.2\n\n"
+        "[strategy]\n"
+        "enabled=true\n"
+        "trigger_price_ticks=4000\n"
+        "entry_protection_ticks=2\n"
+        "cancel_after_market_ticks=10\n"
+        "max_signals_per_run=1\n"
+        "close_reprice_after_market_ticks=10\n"
+        "max_close_reprices=3\n\n"
+        "[risk]\n"
+        "max_order_volume=1\n"
+        "max_net_position=1\n"
+        "max_active_open_orders=1\n"
+        "max_orders_per_day=2\n"
+        "max_cancels_per_day=4\n"
+        "max_order_rate_per_second=1\n"
+        "max_price_deviation_ticks=2\n"
+        "min_available_funds=10000.50\n"
+        "market_stale_after_ms=1000\n"
+        "kill_switch=false\n\n"
+        + make_accounts_ini(enabled_accounts);
+}
+
 std::string replace_account_field(
     std::string ini,
     std::string_view field,
@@ -276,6 +307,36 @@ void test_engine_accepts_variable_account_count(TestRunner& runner)
                 "each account trader front must be retained");
         }
     }
+}
+
+void test_engine_parses_live_runtime_and_explicit_order_gate(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_live_ini(1)};
+    const auto result = parse(
+        {"engine", "--mode", "live", "--config", file.path(),
+         "--allow-orders"},
+        {});
+
+    runner.expect(result.config.has_value(), "complete live runtime must parse");
+    if (!result.config) return;
+    const auto& live = result.config->live();
+    runner.expect(
+        live.allow_orders
+            && live.market_front == "tcp://127.0.0.1:42001"
+            && live.exchange_id == "CFFEX"
+            && live.instrument == "IF2609"
+            && live.minimum_price_increment == 0.2
+            && live.strategy_enabled
+            && live.trigger_price_ticks == 4000
+            && live.minimum_available_funds == 1'000'050
+            && !live.kill_switch,
+        "live sections and the command-line order gate must be retained");
+
+    const auto observed = parse(
+        {"engine", "--mode", "live", "--config", file.path()}, {});
+    runner.expect(
+        observed.config.has_value() && !observed.config->live().allow_orders,
+        "orders must remain disabled unless --allow-orders is explicit");
 }
 
 void test_benchmark_configuration(TestRunner& runner)
@@ -601,6 +662,7 @@ int main()
     test_valid_market(runner);
     test_valid_account(runner);
     test_engine_accepts_variable_account_count(runner);
+    test_engine_parses_live_runtime_and_explicit_order_gate(runner);
     test_benchmark_configuration(runner);
     test_engine_uses_default_account_config_path(runner);
     test_engine_rejects_zero_enabled_accounts(runner);
