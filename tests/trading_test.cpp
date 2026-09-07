@@ -81,6 +81,7 @@ ctp::RiskLimits risk_limits()
     limits.max_daily_signals = 10;
     limits.max_daily_orders = 10;
     limits.max_daily_cancels = 10;
+    limits.max_order_volume = 5;
     limits.max_active_open_orders = 1;
     limits.max_net_open_position = 1;
     return limits;
@@ -645,6 +646,11 @@ void test_risk_boundaries_have_stable_reasons(
         ctp::evaluate_risk(bad_quantity, healthy, limits)
                 == ctp::RiskRejectReason::InvalidQuantity,
         "a zero quantity must be rejected");
+    bad_quantity.quantity = limits.max_order_volume + 1;
+    runner.expect(
+        ctp::evaluate_risk(bad_quantity, healthy, limits)
+                == ctp::RiskRejectReason::InvalidQuantity,
+        "an order beyond the configured lot limit must be rejected");
     auto signal_limited = healthy;
     signal_limited.daily_signals = limits.max_daily_signals;
     runner.expect(

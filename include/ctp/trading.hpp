@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -156,6 +157,7 @@ struct RiskLimits {
     std::uint32_t max_daily_signals{0};
     std::uint32_t max_daily_orders{0};
     std::uint32_t max_daily_cancels{0};
+    std::int32_t max_order_volume{std::numeric_limits<std::int32_t>::max()};
     std::int32_t max_active_open_orders{0};
     std::int32_t max_net_open_position{0};
     bool allow_buy{true};
@@ -406,6 +408,10 @@ public:
     void start();
     bool restore_restart_image(const RestartImage& image) noexcept;
     RecoverySnapshot recovery_snapshot() const noexcept;
+    void trace_market(const MarketEvent& market) noexcept;
+    void trace_signal(
+        const OrderIntent& intent,
+        std::int64_t decision_mono_ns) noexcept;
     SubmitResult submit(
         const OrderIntent& intent,
         const RiskSnapshot& snapshot) noexcept;

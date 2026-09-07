@@ -7,12 +7,18 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <iosfwd>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
 
 namespace ctp {
+
+class MarketApi;
+class TraderApi;
 
 inline constexpr std::size_t kMarketQueueCapacity = 1024;
 
@@ -173,5 +179,19 @@ private:
     std::uint64_t next_market_seq_{1};
     std::atomic<bool> accepting_{false};
 };
+
+struct LiveEngineDependencies {
+    std::function<std::unique_ptr<MarketApi>()> create_market;
+    std::function<std::unique_ptr<TraderApi>(const std::string&)> create_trader;
+    std::string trace_root{"runtime/traces"};
+};
+
+// 返回 0 表示收到停止请求并完成清理；配置或运行故障返回非零。
+int run_live_engine(
+    const RuntimeConfig& config,
+    std::ostream& output,
+    std::ostream& error,
+    const std::function<bool()>& stop_requested,
+    LiveEngineDependencies dependencies = {});
 
 }

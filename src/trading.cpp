@@ -662,7 +662,9 @@ RiskRejectReason evaluate_risk(
         || (intent.offset == Offset::Close && !limits.allow_close)) {
         return RiskRejectReason::OffsetNotAllowed;
     }
-    if (intent.quantity <= 0) return RiskRejectReason::InvalidQuantity;
+    if (intent.quantity <= 0 || intent.quantity > limits.max_order_volume) {
+        return RiskRejectReason::InvalidQuantity;
+    }
     if (intent.offset == Offset::Open
         && snapshot.daily_signals >= limits.max_daily_signals) {
         return RiskRejectReason::DailySignalLimit;
@@ -1273,6 +1275,40 @@ bool AccountTradingSession::restore_restart_image(
 RecoverySnapshot AccountTradingSession::recovery_snapshot() const noexcept
 {
     return impl_->recovery;
+}
+
+void AccountTradingSession::trace_market(const MarketEvent& market) noexcept
+{
+    if (impl_->trace_sink == nullptr) return;
+    TraceEvent event{};
+    event.trace_id.run_id = impl_->run_id;
+    event.sequence = ++impl_->trace_sequence;
+    event.mono_ns = market.recv_mono_ns;
+    event.limit_price_ticks = market.last_price_ticks;
+    event.stage = TraceStage::Market;
+    event.code = static_cast<std::int32_t>(market.status);
+    event.instrument = market.instrument;
+    impl_->trace_sink->try_record(event);
+}
+
+void AccountTradingSession::trace_signal(
+    const OrderIntent& intent,
+    std::int64_t decision_mono_ns) noexcept
+{
+    if (impl_->trace_sink == nullptr) return;
+    TraceEvent event{};
+    event.trace_id = {impl_->run_id, intent.signal_id};
+    event.sequence = ++impl_->trace_sequence;
+    event.mono_ns = decision_mono_ns;
+    event.limit_price_ticks = intent.limit_price_ticks;
+    event.stage = TraceStage::Signal;
+    event.quantity = intent.quantity;
+    event.attempt = intent.attempt;
+    event.direction = static_cast<std::uint8_t>(intent.direction);
+    event.offset = static_cast<std::uint8_t>(intent.offset);
+    event.purpose = static_cast<std::uint8_t>(intent.purpose);
+    event.instrument = intent.instrument;
+    impl_->trace_sink->try_record(event);
 }
 
 SubmitResult AccountTradingSession::submit(
