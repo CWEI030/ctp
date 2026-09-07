@@ -14,6 +14,7 @@
 namespace ctp {
 
 inline constexpr std::size_t kTraceQueueCapacity = 1024;
+inline constexpr std::size_t kPerformanceQueueCapacity = 4096;
 
 struct TraceId {
     std::uint64_t run_id{0};
@@ -69,6 +70,45 @@ static_assert(std::is_trivially_copyable<TraceEvent>::value);
 
 using TraceQueue = SpscQueue<TraceEvent, kTraceQueueCapacity>;
 
+enum class PerformanceStage : std::uint8_t {
+    MarketToSignal,
+    SignalToOrderCall,
+    CallbackToState,
+    SimulatedEndToEnd,
+};
+
+// 采样点只复制整数时间和本地账户序号，禁止把凭据或可变字符串带入热路径。
+struct PerformanceSample {
+    std::uint64_t sequence{0};
+    std::int64_t mono_ns{0};
+    std::int64_t latency_ns{0};
+    std::uint32_t account_index{0};
+    PerformanceStage stage{PerformanceStage::MarketToSignal};
+};
+
+static_assert(std::is_trivially_copyable<PerformanceSample>::value);
+
+using PerformanceQueue = SpscQueue<PerformanceSample, kPerformanceQueueCapacity>;
+
+struct LatencyStatistics {
+    std::uint64_t count{0};
+    std::int64_t minimum_ns{0};
+    std::int64_t p50_ns{0};
+    std::int64_t p95_ns{0};
+    std::int64_t p99_ns{0};
+    std::int64_t p999_ns{0};
+    std::int64_t maximum_ns{0};
+    double mean_ns{0.0};
+    double standard_deviation_ns{0.0};
+    std::int64_t jitter_p99_p50_ns{0};
+    std::int64_t jitter_p999_p50_ns{0};
+    std::int64_t maximum_pause_ns{0};
+};
+
+// 排序和统计属于控制面；调用者保留原始样本以便独立重算。
+LatencyStatistics compute_latency_statistics(
+    const std::vector<std::int64_t>& samples);
+
 struct TraceQueueSnapshot {
     std::size_t depth{0};
     std::size_t high_watermark{0};
@@ -91,6 +131,24 @@ public:
 
     bool start();
     bool try_record(const TraceEvent& event) noexcept override;
+    void stop() noexcept;
+    TraceQueueSnapshot snapshot() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class AsyncPerformanceRecorder final {
+public:
+    explicit AsyncPerformanceRecorder(std::filesystem::path path);
+    ~AsyncPerformanceRecorder();
+
+    AsyncPerformanceRecorder(const AsyncPerformanceRecorder&) = delete;
+    AsyncPerformanceRecorder& operator=(const AsyncPerformanceRecorder&) = delete;
+
+    bool start();
+    bool try_record(const PerformanceSample& sample) noexcept;
     void stop() noexcept;
     TraceQueueSnapshot snapshot() const noexcept;
 

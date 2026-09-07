@@ -7,6 +7,8 @@
 #include <charconv>
 #include <fstream>
 #include <limits>
+#include <cmath>
+#include <numeric>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -95,6 +97,57 @@ std::string_view instrument_view(const TraceEvent& event) noexcept
             static_cast<std::size_t>(end - event.instrument.begin())};
 }
 
+std::string_view performance_stage_name(PerformanceStage stage) noexcept
+{
+    switch (stage) {
+    case PerformanceStage::MarketToSignal: return "market_to_signal";
+    case PerformanceStage::SignalToOrderCall: return "signal_to_order_call";
+    case PerformanceStage::CallbackToState: return "callback_to_state";
+    case PerformanceStage::SimulatedEndToEnd: return "simulated_end_to_end";
+    }
+    return "invalid";
+}
+
+}
+
+LatencyStatistics compute_latency_statistics(
+    const std::vector<std::int64_t>& samples)
+{
+    LatencyStatistics result{};
+    if (samples.empty()) return result;
+
+    std::vector<std::int64_t> ordered = samples;
+    std::sort(ordered.begin(), ordered.end());
+    const auto percentile = [&ordered](std::uint64_t numerator) {
+        const std::uint64_t rank =
+            (numerator * ordered.size() + 999) / 1000;
+        return ordered[static_cast<std::size_t>(std::max<std::uint64_t>(1, rank) - 1)];
+    };
+
+    result.count = ordered.size();
+    result.minimum_ns = ordered.front();
+    result.p50_ns = percentile(500);
+    result.p95_ns = percentile(950);
+    result.p99_ns = percentile(990);
+    result.p999_ns = percentile(999);
+    result.maximum_ns = ordered.back();
+    const long double sum = std::accumulate(
+        ordered.begin(), ordered.end(), 0.0L);
+    result.mean_ns = static_cast<double>(sum / ordered.size());
+    long double squared_difference = 0.0L;
+    for (const auto value : ordered) {
+        const long double difference = value - result.mean_ns;
+        squared_difference += difference * difference;
+    }
+    result.standard_deviation_ns = static_cast<double>(
+        std::sqrt(squared_difference / ordered.size()));
+    result.jitter_p99_p50_ns = result.p99_ns - result.p50_ns;
+    result.jitter_p999_p50_ns = result.p999_ns - result.p50_ns;
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+        result.maximum_pause_ns = std::max(
+            result.maximum_pause_ns, ordered[index] - ordered[index - 1]);
+    }
+    return result;
 }
 
 struct AsyncTraceJournal::Impl {
@@ -207,6 +260,79 @@ void AsyncTraceJournal::stop() noexcept
 }
 
 TraceQueueSnapshot AsyncTraceJournal::snapshot() const noexcept
+{
+    return {
+        impl_->queue.depth(),
+        impl_->queue.high_watermark(),
+        impl_->queue.dropped_count(),
+    };
+}
+
+struct AsyncPerformanceRecorder::Impl {
+    explicit Impl(std::filesystem::path output_path)
+        : path(std::move(output_path))
+    {
+    }
+
+    void run()
+    {
+        PerformanceSample sample{};
+        while (running.load(std::memory_order_acquire) || queue.depth() != 0) {
+            if (queue.try_pop(sample)) {
+                output << sample.sequence << ',' << sample.mono_ns << ','
+                       << sample.account_index << ','
+                       << performance_stage_name(sample.stage) << ','
+                       << sample.latency_ns << '\n';
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        output.flush();
+    }
+
+    std::filesystem::path path;
+    PerformanceQueue queue;
+    std::ofstream output;
+    std::thread writer;
+    std::atomic<bool> running{false};
+};
+
+AsyncPerformanceRecorder::AsyncPerformanceRecorder(std::filesystem::path path)
+    : impl_(std::make_unique<Impl>(std::move(path)))
+{
+}
+
+AsyncPerformanceRecorder::~AsyncPerformanceRecorder()
+{
+    stop();
+}
+
+bool AsyncPerformanceRecorder::start()
+{
+    if (impl_->running.load(std::memory_order_acquire)) return true;
+    impl_->output.open(impl_->path, std::ios::out | std::ios::trunc);
+    if (!impl_->output) return false;
+    impl_->output << "sequence,mono_ns,account_index,stage,latency_ns\n";
+    impl_->running.store(true, std::memory_order_release);
+    impl_->writer = std::thread([this] { impl_->run(); });
+    return true;
+}
+
+bool AsyncPerformanceRecorder::try_record(
+    const PerformanceSample& sample) noexcept
+{
+    if (!impl_->running.load(std::memory_order_acquire)) return false;
+    return impl_->queue.try_push(sample);
+}
+
+void AsyncPerformanceRecorder::stop() noexcept
+{
+    impl_->running.store(false, std::memory_order_release);
+    if (impl_->writer.joinable()) impl_->writer.join();
+    impl_->output.close();
+}
+
+TraceQueueSnapshot AsyncPerformanceRecorder::snapshot() const noexcept
 {
     return {
         impl_->queue.depth(),

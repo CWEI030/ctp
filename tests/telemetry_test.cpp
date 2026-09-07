@@ -8,6 +8,7 @@
 #include <iterator>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -143,6 +144,74 @@ void test_restart_image_keeps_only_unresolved_orders(
         "restart image must advance identities but omit terminal orders");
 }
 
+void test_latency_statistics_include_tail_and_jitter(
+    test_support::TestRunner& runner)
+{
+    const std::vector<std::int64_t> samples{1, 2, 3, 4, 5, 100};
+    const auto statistics = ctp::compute_latency_statistics(samples);
+
+    runner.expect(
+        statistics.count == 6 && statistics.minimum_ns == 1
+            && statistics.p50_ns == 3 && statistics.p95_ns == 100
+            && statistics.p99_ns == 100 && statistics.p999_ns == 100
+            && statistics.maximum_ns == 100,
+        "latency statistics must retain the complete tail distribution");
+    runner.expect(
+        statistics.jitter_p99_p50_ns == 97
+            && statistics.jitter_p999_p50_ns == 97
+            && statistics.maximum_pause_ns == 95,
+        "latency statistics must report tail jitter and maximum pause");
+}
+
+void test_performance_queue_is_fixed_and_counts_drops(
+    test_support::TestRunner& runner)
+{
+    ctp::PerformanceQueue queue;
+    ctp::PerformanceSample sample{};
+    sample.stage = ctp::PerformanceStage::MarketToSignal;
+    sample.latency_ns = 17;
+
+    test_support::AllocationProbe probe;
+    for (std::size_t index = 0; index < ctp::kPerformanceQueueCapacity; ++index) {
+        sample.sequence = index + 1;
+        runner.expect(queue.try_push(sample), "available performance slot must accept a sample");
+    }
+    runner.expect(
+        !queue.try_push(sample),
+        "a full performance queue must reject without waiting");
+    probe.stop();
+
+    runner.expect(
+        probe.count() == 0 && queue.dropped_count() == 1
+            && queue.high_watermark() == ctp::kPerformanceQueueCapacity,
+        "performance collection must not allocate and must expose exact overflow");
+}
+
+void test_performance_recorder_writes_raw_samples(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{"/tmp/ctp_performance_raw.csv"};
+    std::filesystem::remove(path);
+    ctp::AsyncPerformanceRecorder recorder{path};
+    runner.expect(recorder.start(), "performance recorder must open its raw file");
+    runner.expect(
+        recorder.try_record({1, 100, 17, 0, ctp::PerformanceStage::MarketToSignal})
+            && recorder.try_record({2, 120, 19, 1, ctp::PerformanceStage::CallbackToState}),
+        "fixed performance samples must enter the asynchronous recorder");
+    recorder.stop();
+
+    std::ifstream input{path};
+    const std::string text{
+        std::istreambuf_iterator<char>{input},
+        std::istreambuf_iterator<char>{}};
+    runner.expect(
+        text == "sequence,mono_ns,account_index,stage,latency_ns\n"
+                "1,100,0,market_to_signal,17\n"
+                "2,120,1,callback_to_state,19\n",
+        "raw performance output must preserve order, account and stage");
+    std::filesystem::remove(path);
+}
+
 }
 
 int main()
@@ -153,5 +222,8 @@ int main()
     test_truncated_journal_is_not_a_clean_restart(runner);
     test_dropped_trace_journal_is_not_a_restart_source(runner);
     test_restart_image_keeps_only_unresolved_orders(runner);
+    test_latency_statistics_include_tail_and_jitter(runner);
+    test_performance_queue_is_fixed_and_counts_drops(runner);
+    test_performance_recorder_writes_raw_samples(runner);
     return runner.finish();
 }
