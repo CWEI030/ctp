@@ -1565,6 +1565,73 @@ void test_stale_recovery_response_cannot_advance_phase(
         "a stale request id must freeze instead of advancing recovery");
 }
 
+void test_each_recovery_query_error_stays_frozen(
+    test_support::TestRunner& runner)
+{
+    for (int failed_query = 0; failed_query < 4; ++failed_query) {
+        const ctp::AccountConfig account{
+            "account" + std::to_string(failed_query + 1),
+            "9999", "user", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+
+        session.start();
+        view->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        CThostFtdcRspInfoField ok{};
+        view->spi()->OnRspAuthenticate(
+            nullptr, &ok, metrics->authenticate_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcRspUserLoginField login{};
+        view->spi()->OnRspUserLogin(
+            &login, &ok, metrics->login_request_id, true);
+        session.drain_callbacks();
+
+        CThostFtdcRspInfoField error{};
+        error.ErrorID = 7;
+        if (failed_query == 0) {
+            view->spi()->OnRspQryOrder(
+                nullptr, &error, metrics->order_query_request_id, true);
+        } else {
+            view->spi()->OnRspQryOrder(
+                nullptr, &ok, metrics->order_query_request_id, true);
+            session.drain_callbacks();
+        }
+        if (failed_query == 1) {
+            view->spi()->OnRspQryTrade(
+                nullptr, &error, metrics->trade_query_request_id, true);
+        } else if (failed_query > 1) {
+            view->spi()->OnRspQryTrade(
+                nullptr, &ok, metrics->trade_query_request_id, true);
+            session.drain_callbacks();
+        }
+        if (failed_query == 2) {
+            view->spi()->OnRspQryInvestorPosition(
+                nullptr, &error, metrics->position_request_id, true);
+        } else if (failed_query > 2) {
+            view->spi()->OnRspQryInvestorPosition(
+                nullptr, &ok, metrics->position_request_id, true);
+            session.drain_callbacks();
+        }
+        if (failed_query == 3) {
+            view->spi()->OnRspQryTradingAccount(
+                nullptr, &error, metrics->account_request_id, true);
+        }
+        session.drain_callbacks();
+
+        const auto recovery = session.recovery_snapshot();
+        runner.expect(
+            recovery.phase == ctp::RecoveryPhase::Frozen
+                && recovery.failure == ctp::RecoveryFailure::ResponseError
+                && session.execution_snapshot().frozen
+                && metrics->order_insert_calls == 0,
+            "every failed recovery query must keep its account frozen");
+    }
+}
+
 }
 
 int main()
@@ -1600,5 +1667,6 @@ int main()
     test_missing_uncertain_order_stays_frozen(runner);
     test_one_of_four_recovery_failures_is_isolated(runner);
     test_stale_recovery_response_cannot_advance_phase(runner);
+    test_each_recovery_query_error_stays_frozen(runner);
     return runner.finish();
 }
