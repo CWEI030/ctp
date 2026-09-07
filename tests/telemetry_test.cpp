@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -212,6 +213,60 @@ void test_performance_recorder_writes_raw_samples(
     std::filesystem::remove(path);
 }
 
+void test_offline_benchmark_writes_complete_evidence(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path output_path{"/tmp/ctp-benchmark-evidence-test"};
+    std::filesystem::remove_all(output_path);
+    ctp::BenchmarkConfig benchmark{};
+    benchmark.config_path = "config/accounts.local.ini";
+    benchmark.input_path =
+        std::string{CTP_SOURCE_DIR} + "/tests/data/replay/minimal_signal_v1.csv";
+    benchmark.output_path = output_path.string();
+    benchmark.account_count = 1;
+    const std::vector<ctp::AccountConfig> accounts{
+        {"account1", "9999", "user1", "test-password", "app", "auth", "front"}};
+    const ctp::RuntimeConfig config{
+        ctp::Mode::Benchmark, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0,
+        accounts, benchmark};
+    std::ostringstream output;
+    std::ostringstream error;
+
+    runner.expect(
+        ctp::run_benchmark(config, output, error) == 0,
+        "offline benchmark must finish without a real CTP connection");
+    constexpr std::string_view files[]{
+        "manifest.json", "latency_raw.csv", "queue_raw.csv", "cpu_raw.csv",
+        "events_summary.json", "report.md", "reproduce.sh", "SHA256SUMS"};
+    bool complete = true;
+    for (const auto file : files) {
+        const auto path = output_path / file;
+        complete = complete && std::filesystem::exists(path)
+            && std::filesystem::file_size(path) > 0;
+    }
+    runner.expect(complete, "benchmark must preserve every required evidence file");
+
+    std::ifstream manifest{output_path / "manifest.json"};
+    const std::string manifest_text{
+        std::istreambuf_iterator<char>{manifest},
+        std::istreambuf_iterator<char>{}};
+    std::ifstream events{output_path / "events_summary.json"};
+    const std::string event_text{
+        std::istreambuf_iterator<char>{events},
+        std::istreambuf_iterator<char>{}};
+    runner.expect(
+        manifest_text.find(
+            "7843b7698379db7b5d9352e4db1ae97db77c868d7be9646f7a2f98c30c2ce116")
+                != std::string::npos
+            && event_text.find("\"submitted\": 0") == std::string::npos
+            && event_text.find("\"api_order_calls\": 0") == std::string::npos,
+        "evidence must identify its replay input and prove entry into submit");
+    runner.expect(
+        manifest_text.find("test-password") == std::string::npos,
+        "benchmark metadata must not expose account credentials");
+    std::filesystem::remove_all(output_path);
+}
+
 }
 
 int main()
@@ -225,5 +280,6 @@ int main()
     test_latency_statistics_include_tail_and_jitter(runner);
     test_performance_queue_is_fixed_and_counts_drops(runner);
     test_performance_recorder_writes_raw_samples(runner);
+    test_offline_benchmark_writes_complete_evidence(runner);
     return runner.finish();
 }

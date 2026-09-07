@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <ctime>
 #include <fstream>
 #include <limits>
 #include <cmath>
@@ -276,6 +277,9 @@ struct AsyncPerformanceRecorder::Impl {
 
     void run()
     {
+        timespec cpu_start{};
+        timespec cpu_finish{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start);
         PerformanceSample sample{};
         while (running.load(std::memory_order_acquire) || queue.depth() != 0) {
             if (queue.try_pop(sample)) {
@@ -288,6 +292,11 @@ struct AsyncPerformanceRecorder::Impl {
             }
         }
         output.flush();
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_finish);
+        writer_thread_cpu_ns.store(
+            (cpu_finish.tv_sec - cpu_start.tv_sec) * 1'000'000'000LL
+                + cpu_finish.tv_nsec - cpu_start.tv_nsec,
+            std::memory_order_release);
     }
 
     std::filesystem::path path;
@@ -295,6 +304,7 @@ struct AsyncPerformanceRecorder::Impl {
     std::ofstream output;
     std::thread writer;
     std::atomic<bool> running{false};
+    std::atomic<std::int64_t> writer_thread_cpu_ns{0};
 };
 
 AsyncPerformanceRecorder::AsyncPerformanceRecorder(std::filesystem::path path)
@@ -332,12 +342,13 @@ void AsyncPerformanceRecorder::stop() noexcept
     impl_->output.close();
 }
 
-TraceQueueSnapshot AsyncPerformanceRecorder::snapshot() const noexcept
+PerformanceRecorderSnapshot AsyncPerformanceRecorder::snapshot() const noexcept
 {
     return {
         impl_->queue.depth(),
         impl_->queue.high_watermark(),
         impl_->queue.dropped_count(),
+        impl_->writer_thread_cpu_ns.load(std::memory_order_acquire),
     };
 }
 

@@ -278,6 +278,40 @@ void test_engine_accepts_variable_account_count(TestRunner& runner)
     }
 }
 
+void test_benchmark_configuration(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_accounts_ini(4)};
+    const std::string path = file.path();
+    const auto result = parse(
+        {"benchmark", "--config", path, "--input", "market.csv",
+         "--output", "runtime/performance/run-1", "--accounts", "2",
+         "--rate", "1000", "--warmup-seconds", "1",
+         "--duration-seconds", "3", "--burst-rate", "2000",
+         "--burst-seconds", "1"},
+        {});
+
+    runner.expect(result.config.has_value(), "valid benchmark options must parse");
+    if (!result.config) return;
+    const auto& benchmark = result.config->benchmark();
+    runner.expect(
+        result.config->mode() == ctp::Mode::Benchmark
+            && result.config->accounts().size() == 4
+            && benchmark.config_path == path
+            && benchmark.account_count == 2
+            && benchmark.rate_per_second == 1000
+            && benchmark.duration_seconds == 3
+            && benchmark.burst_rate_per_second == 2000,
+        "benchmark options and account configuration must share one immutable config");
+
+    const auto missing = parse(
+        {"benchmark", "--config", path, "--input", "market.csv"}, {});
+    expect_error_contains(runner, missing, "--input and --output");
+    const auto too_many = parse(
+        {"benchmark", "--config", path, "--input", "market.csv",
+         "--output", "result", "--accounts", "5"}, {});
+    expect_error_contains(runner, too_many, "exceeds enabled account count");
+}
+
 void test_engine_uses_default_account_config_path(TestRunner& runner)
 {
     TemporaryDefaultConfigDirectory directory{make_accounts_ini(2)};
@@ -567,6 +601,7 @@ int main()
     test_valid_market(runner);
     test_valid_account(runner);
     test_engine_accepts_variable_account_count(runner);
+    test_benchmark_configuration(runner);
     test_engine_uses_default_account_config_path(runner);
     test_engine_rejects_zero_enabled_accounts(runner);
     test_engine_requires_private_regular_config_file(runner);

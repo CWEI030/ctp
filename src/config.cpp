@@ -278,6 +278,86 @@ ConfigResult parse_engine_config(
     return {std::move(config), {}};
 }
 
+ConfigResult parse_benchmark_config(
+    const std::vector<std::string_view>& arguments,
+    const EnvironmentReader& read_environment)
+{
+    BenchmarkConfig benchmark{};
+    std::string config_path{"config/accounts.local.ini"};
+    std::unordered_set<std::string_view> seen_options;
+
+    const auto parse_unsigned = [](std::string_view text, auto& value) {
+        const auto parsed = std::from_chars(
+            text.data(), text.data() + text.size(), value);
+        return !text.empty() && parsed.ec == std::errc{}
+            && parsed.ptr == text.data() + text.size();
+    };
+
+    for (std::size_t index = 1; index < arguments.size(); index += 2) {
+        const auto option = arguments[index];
+        if (index + 1 >= arguments.size()) {
+            return failure("benchmark command-line option is missing a value");
+        }
+        if (!seen_options.insert(option).second) {
+            return failure("duplicate benchmark command-line option");
+        }
+        const auto value = arguments[index + 1];
+        if (option == "--config") config_path = std::string{value};
+        else if (option == "--input") benchmark.input_path = std::string{value};
+        else if (option == "--output") benchmark.output_path = std::string{value};
+        else if (option == "--accounts") {
+            if (!parse_unsigned(value, benchmark.account_count)
+                || benchmark.account_count == 0) {
+                return failure("benchmark accounts must be a positive integer");
+            }
+        } else if (option == "--rate") {
+            if (!parse_unsigned(value, benchmark.rate_per_second)) {
+                return failure("benchmark rate must be a non-negative integer");
+            }
+        } else if (option == "--warmup-seconds") {
+            if (!parse_unsigned(value, benchmark.warmup_seconds)) {
+                return failure("benchmark warmup seconds must be a non-negative integer");
+            }
+        } else if (option == "--duration-seconds") {
+            if (!parse_unsigned(value, benchmark.duration_seconds)
+                || benchmark.duration_seconds == 0) {
+                return failure("benchmark duration seconds must be a positive integer");
+            }
+        } else if (option == "--burst-rate") {
+            if (!parse_unsigned(value, benchmark.burst_rate_per_second)) {
+                return failure("benchmark burst rate must be a non-negative integer");
+            }
+        } else if (option == "--burst-seconds") {
+            if (!parse_unsigned(value, benchmark.burst_seconds)) {
+                return failure("benchmark burst seconds must be a non-negative integer");
+            }
+        } else {
+            return failure("unknown benchmark command-line option");
+        }
+    }
+    if (benchmark.input_path.empty() || benchmark.output_path.empty()) {
+        return failure("benchmark requires --input and --output");
+    }
+    if ((benchmark.burst_rate_per_second == 0) != (benchmark.burst_seconds == 0)) {
+        return failure("benchmark burst rate and seconds must be specified together");
+    }
+
+    benchmark.config_path = config_path;
+    const std::vector<std::string_view> engine_arguments{
+        "engine", "--mode", "live", "--config", config_path};
+    auto accounts_result = parse_engine_config(engine_arguments, read_environment);
+    if (!accounts_result.config) return accounts_result;
+    auto accounts = accounts_result.config->accounts();
+    if (benchmark.account_count != 0 && benchmark.account_count > accounts.size()) {
+        return failure("benchmark accounts exceeds enabled account count");
+    }
+
+    RuntimeConfig config{
+        Mode::Benchmark, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0,
+        std::move(accounts), std::move(benchmark)};
+    return {std::move(config), {}};
+}
+
 const Profile* find_profile(std::string_view name)
 {
     for (const auto& profile : kProfiles) {
@@ -343,7 +423,8 @@ RuntimeConfig::RuntimeConfig(
     std::string trader_front,
     std::string instrument,
     int ticks,
-    std::vector<AccountConfig> accounts)
+    std::vector<AccountConfig> accounts,
+    BenchmarkConfig benchmark)
     : mode_(mode),
       profile_(std::move(profile)),
       broker_id_(std::move(broker_id)),
@@ -355,7 +436,8 @@ RuntimeConfig::RuntimeConfig(
       trader_front_(std::move(trader_front)),
       instrument_(std::move(instrument)),
       ticks_(ticks),
-      accounts_(std::move(accounts))
+      accounts_(std::move(accounts)),
+      benchmark_(std::move(benchmark))
 {
 }
 
@@ -369,6 +451,9 @@ ConfigResult parse_config(
 
     if (arguments.front() == "engine") {
         return parse_engine_config(arguments, read_environment);
+    }
+    if (arguments.front() == "benchmark") {
+        return parse_benchmark_config(arguments, read_environment);
     }
 
     Mode mode;

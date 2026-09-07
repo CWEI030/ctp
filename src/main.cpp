@@ -1,6 +1,7 @@
 #include "ctp/config.hpp"
 #include "ctp/interrupt.hpp"
 #include "ctp/market_client.hpp"
+#include "ctp/telemetry.hpp"
 #include "ctp/trader_client.hpp"
 
 #include <chrono>
@@ -22,6 +23,9 @@ int main(int argc, char* argv[])
     }
 
     const auto& config = *result.config;
+    if (config.mode() == ctp::Mode::Benchmark) {
+        return ctp::run_benchmark(config, std::cout, std::cerr);
+    }
     if (config.mode() == ctp::Mode::Engine) {
         std::cerr
             << "[error] engine live runtime is not connected yet; "

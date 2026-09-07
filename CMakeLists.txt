@@ -59,6 +59,7 @@ target_compile_options(ctp_market PRIVATE
     -Wpedantic)
 
 add_library(ctp_engine
+    src/benchmark.cpp
     src/engine.cpp
     src/strategy.cpp
     src/trading.cpp
@@ -70,6 +71,8 @@ target_compile_options(ctp_engine PRIVATE
     -Wall
     -Wextra
     -Wpedantic)
+target_compile_definitions(ctp_engine PRIVATE
+    CTP_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
 
 add_library(ctp_trader src/trader_client.cpp)
 target_include_directories(ctp_trader PUBLIC include)
@@ -171,7 +174,8 @@ if(BUILD_TESTING)
 
     add_executable(ctp_telemetry_tests tests/telemetry_test.cpp)
     target_compile_definitions(ctp_telemetry_tests PRIVATE
-        CTP_TEST_DEFINE_ALLOCATION_OPERATORS)
+        CTP_TEST_DEFINE_ALLOCATION_OPERATORS
+        CTP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(ctp_telemetry_tests PRIVATE tests)
     target_link_libraries(ctp_telemetry_tests PRIVATE ctp_engine)
     target_compile_options(ctp_telemetry_tests PRIVATE

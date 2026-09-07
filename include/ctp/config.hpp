@@ -3,6 +3,7 @@
 #include "ctp/field.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -15,6 +16,19 @@ enum class Mode {
     Market,
     Account,
     Engine,
+    Benchmark,
+};
+
+struct BenchmarkConfig {
+    std::string config_path;
+    std::string input_path;
+    std::string output_path;
+    std::size_t account_count{0};
+    std::uint64_t rate_per_second{0};
+    std::uint32_t warmup_seconds{0};
+    std::uint32_t duration_seconds{1};
+    std::uint64_t burst_rate_per_second{0};
+    std::uint32_t burst_seconds{0};
 };
 
 inline constexpr std::size_t kBrokerIdCapacity = 11;
@@ -67,7 +81,8 @@ public:
         std::string trader_front,
         std::string instrument,
         int ticks,
-        std::vector<AccountConfig> accounts = {});
+        std::vector<AccountConfig> accounts = {},
+        BenchmarkConfig benchmark = {});
 
     Mode mode() const { return mode_; }
     const std::string& profile() const { return profile_; }
@@ -81,6 +96,7 @@ public:
     const std::string& instrument() const { return instrument_; }
     int ticks() const { return ticks_; }
     const std::vector<AccountConfig>& accounts() const { return accounts_; }
+    const BenchmarkConfig& benchmark() const { return benchmark_; }
 
 private:
     Mode mode_;
@@ -95,6 +111,7 @@ private:
     std::string instrument_;
     int ticks_;
     std::vector<AccountConfig> accounts_;
+    BenchmarkConfig benchmark_;
 };
 
 struct ConfigResult {

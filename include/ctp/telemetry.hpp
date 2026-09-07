@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -115,6 +116,13 @@ struct TraceQueueSnapshot {
     std::uint64_t dropped{0};
 };
 
+struct PerformanceRecorderSnapshot {
+    std::size_t depth{0};
+    std::size_t high_watermark{0};
+    std::uint64_t dropped{0};
+    std::int64_t writer_thread_cpu_ns{0};
+};
+
 class TraceSink {
 public:
     virtual ~TraceSink() = default;
@@ -150,7 +158,7 @@ public:
     bool start();
     bool try_record(const PerformanceSample& sample) noexcept;
     void stop() noexcept;
-    TraceQueueSnapshot snapshot() const noexcept;
+    PerformanceRecorderSnapshot snapshot() const noexcept;
 
 private:
     struct Impl;
@@ -191,5 +199,11 @@ struct RestartImage {
 };
 
 RestartImage build_restart_image(const TraceJournalReadResult& journal);
+
+// 离线基准复用策略、风控、下单会话和回报归并链路，不连接真实柜台。
+int run_benchmark(
+    const RuntimeConfig& config,
+    std::ostream& output,
+    std::ostream& error);
 
 }
