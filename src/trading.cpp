@@ -1,4 +1,5 @@
 #include "ctp/trading.hpp"
+#include "ctp/engine.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -602,8 +603,8 @@ RiskRejectReason evaluate_risk(
     if (!snapshot.enabled) return RiskRejectReason::AccountDisabled;
     if (!snapshot.authenticated) return RiskRejectReason::NotAuthenticated;
     if (!snapshot.logged_in) return RiskRejectReason::NotLoggedIn;
-    if (!snapshot.reconciled) return RiskRejectReason::NotReconciled;
     if (snapshot.frozen) return RiskRejectReason::AccountFrozen;
+    if (!snapshot.reconciled) return RiskRejectReason::NotReconciled;
     if (snapshot.exiting) return RiskRejectReason::Exiting;
     if (!snapshot.trading_window_open) {
         return RiskRejectReason::OutsideTradingWindow;
@@ -624,7 +625,8 @@ RiskRejectReason evaluate_risk(
         return RiskRejectReason::OffsetNotAllowed;
     }
     if (intent.quantity <= 0) return RiskRejectReason::InvalidQuantity;
-    if (snapshot.daily_signals >= limits.max_daily_signals) {
+    if (intent.offset == Offset::Open
+        && snapshot.daily_signals >= limits.max_daily_signals) {
         return RiskRejectReason::DailySignalLimit;
     }
     if (snapshot.daily_orders >= limits.max_daily_orders) {
@@ -701,6 +703,7 @@ struct SignalRecord {
     bool occupied{false};
     bool active_open{false};
     bool cancel_requested{false};
+    std::uint32_t market_events_waited{0};
     OrderIntent intent{};
     SubmitResult result{};
 };
@@ -711,6 +714,7 @@ enum class CallbackType : std::uint8_t {
     InsertRejected,
     CancelRejected,
     Unknown,
+    Disconnected,
 };
 
 struct CallbackEvent {
@@ -728,8 +732,23 @@ bool same_intent(const OrderIntent& left, const OrderIntent& right) noexcept
         && left.direction == right.direction
         && left.offset == right.offset
         && left.quantity == right.quantity
-        && left.limit_price_ticks == right.limit_price_ticks;
+        && left.limit_price_ticks == right.limit_price_ticks
+        && left.purpose == right.purpose
+        && left.attempt == right.attempt;
 }
+
+struct ExitState {
+    bool pending{false};
+    bool active{false};
+    bool freeze_after_cancel{false};
+    std::array<char, kInstrumentIdCapacity> instrument{};
+    Direction direction{Direction::Sell};
+    std::uint64_t signal_id{0};
+    std::uint64_t active_client_order_id{0};
+    std::int32_t pending_quantity{0};
+    std::uint32_t attempt{0};
+    std::uint32_t market_events_waited{0};
+};
 
 template <std::size_t N>
 std::string_view field_view(const std::array<char, N>& field) noexcept
@@ -750,7 +769,8 @@ struct AccountTradingSession::Impl {
         std::size_t signal_capacity,
         std::size_t callback_capacity,
         std::uint64_t first_client_order_id,
-        std::uint64_t first_order_ref)
+        std::uint64_t first_order_ref,
+        AutoClosePolicy close_policy)
         : account_id(source.alias()),
           broker_id(source.broker_id()),
           user_id(source.user_id()),
@@ -760,7 +780,8 @@ struct AccountTradingSession::Impl {
           signals(signal_capacity),
           callbacks(callback_capacity + 1),
           next_client_order_id(first_client_order_id),
-          next_order_ref(first_order_ref)
+          next_order_ref(first_order_ref),
+          policy(close_policy)
     {
     }
 
@@ -786,6 +807,22 @@ struct AccountTradingSession::Impl {
     int next_action_ref{1};
     std::uint32_t daily_cancels{0};
     bool reconciliation{false};
+    bool frozen{false};
+    AccountFault fault{AccountFault::None};
+    std::uint32_t alert_count{0};
+    std::uint32_t close_orders_submitted{0};
+    std::uint32_t close_reprices{0};
+    AutoClosePolicy policy{};
+    ExitState exit{};
+
+    void set_fault(AccountFault reason) noexcept
+    {
+        if (fault != AccountFault::None) return;
+        fault = reason;
+        frozen = true;
+        reconciliation = true;
+        ++alert_count;
+    }
 
     bool push_callback(const CallbackEvent& event) noexcept
     {
@@ -841,7 +878,8 @@ AccountTradingSession::AccountTradingSession(
     std::size_t signal_capacity,
     std::size_t callback_capacity,
     std::uint64_t next_client_order_id,
-    std::uint64_t persisted_next_order_ref)
+    std::uint64_t persisted_next_order_ref,
+    AutoClosePolicy auto_close_policy)
     : impl_(std::make_unique<Impl>(
           account,
           std::move(limits),
@@ -851,9 +889,15 @@ AccountTradingSession::AccountTradingSession(
           signal_capacity,
           callback_capacity,
           next_client_order_id,
-          persisted_next_order_ref))
+          persisted_next_order_ref,
+          auto_close_policy))
 {
     if (impl_->api) impl_->api->register_spi(this);
+    if (impl_->policy.enabled
+        && (impl_->policy.close_reprice_interval_market_events == 0
+            || impl_->policy.close_protection_ticks < 0)) {
+        impl_->set_fault(AccountFault::Configuration);
+    }
 }
 
 AccountTradingSession::~AccountTradingSession()
@@ -887,7 +931,10 @@ SubmitResult AccountTradingSession::submit(
 {
     SignalRecord* free_record = nullptr;
     for (auto& record : impl_->signals) {
-        if (record.occupied && record.intent.signal_id == intent.signal_id) {
+        if (record.occupied
+            && record.intent.signal_id == intent.signal_id
+            && record.intent.purpose == intent.purpose
+            && record.intent.attempt == intent.attempt) {
             auto duplicate = record.result;
             duplicate.code = same_intent(record.intent, intent)
                 ? SubmitCode::Duplicate : SubmitCode::RejectedLocally;
@@ -902,7 +949,7 @@ SubmitResult AccountTradingSession::submit(
     free_record->occupied = true;
     free_record->intent = intent;
     free_record->result.client_order_id = impl_->next_client_order_id++;
-    ++impl_->daily_signals;
+    if (intent.offset == Offset::Open) ++impl_->daily_signals;
 
     OrderSeed seed{};
     seed.client_order_id = free_record->result.client_order_id;
@@ -917,7 +964,8 @@ SubmitResult AccountTradingSession::submit(
 
     auto effective = snapshot;
     effective.daily_signals = std::max(
-        snapshot.daily_signals, impl_->daily_signals - 1);
+        snapshot.daily_signals,
+        impl_->daily_signals - (intent.offset == Offset::Open ? 1U : 0U));
     effective.daily_orders = std::max(snapshot.daily_orders, impl_->daily_orders);
     effective.active_open_orders = std::max(
         snapshot.active_open_orders, impl_->active_open_orders);
@@ -925,6 +973,7 @@ SubmitResult AccountTradingSession::submit(
         && !impl_->reconciliation
         && !impl_->state.reconciliation_required()
         && !impl_->callback_overflow.load(std::memory_order_acquire);
+    effective.frozen = snapshot.frozen || impl_->frozen;
     const auto reason = evaluate_risk(intent, effective, impl_->limits);
     if (reason != RiskRejectReason::None) {
         impl_->state.apply_local_event(
@@ -1058,6 +1107,131 @@ CancelResult AccountTradingSession::cancel(
     return {CancelCode::Requested, client_order_id, 0};
 }
 
+ExecutionStepResult AccountTradingSession::on_market(
+    const MarketEvent& market,
+    const RiskSnapshot& snapshot) noexcept
+{
+    ExecutionStepResult step{};
+    if (impl_->frozen || !impl_->policy.enabled) return step;
+    if (market.status != MarketDataStatus::Valid
+        || market.instrument != impl_->limits.allowed_instrument
+        || market.bid_price_ticks <= 0
+        || market.ask_price_ticks <= 0
+        || market.bid_price_ticks > market.ask_price_ticks) {
+        return step;
+    }
+
+    if (impl_->exit.pending && !impl_->exit.active) {
+        PositionSnapshot held{};
+        if (!impl_->state.position_snapshot(
+                field_view(impl_->exit.instrument), held)
+            || !held.known) {
+            impl_->set_fault(AccountFault::StateConflict);
+            step.action = ExecutionAction::Frozen;
+            return step;
+        }
+        const auto closable = impl_->exit.direction == Direction::Sell
+            ? held.long_quantity : held.short_quantity;
+        if (closable <= 0) {
+            impl_->exit = {};
+            return step;
+        }
+
+        std::int64_t price = 0;
+        if (impl_->exit.direction == Direction::Sell) {
+            if (market.bid_price_ticks <= impl_->policy.close_protection_ticks) {
+                impl_->set_fault(AccountFault::PriceOverflow);
+                step.action = ExecutionAction::Frozen;
+                return step;
+            }
+            price = market.bid_price_ticks
+                - impl_->policy.close_protection_ticks;
+        } else {
+            if (market.ask_price_ticks
+                > std::numeric_limits<std::int64_t>::max()
+                    - impl_->policy.close_protection_ticks) {
+                impl_->set_fault(AccountFault::PriceOverflow);
+                step.action = ExecutionAction::Frozen;
+                return step;
+            }
+            price = market.ask_price_ticks
+                + impl_->policy.close_protection_ticks;
+        }
+
+        OrderIntent intent{};
+        intent.signal_id = impl_->exit.signal_id;
+        intent.instrument = impl_->exit.instrument;
+        intent.direction = impl_->exit.direction;
+        intent.offset = Offset::Close;
+        intent.quantity = std::min(closable, impl_->exit.pending_quantity);
+        intent.limit_price_ticks = price;
+        intent.purpose = OrderPurpose::Exit;
+        intent.attempt = impl_->exit.attempt;
+
+        auto effective = snapshot;
+        effective.market_valid = true;
+        effective.market_receive_ns = market.recv_mono_ns;
+        effective.bid_price_ticks = market.bid_price_ticks;
+        effective.ask_price_ticks = market.ask_price_ticks;
+        effective.positions_known = held.known;
+        effective.long_position = held.long_quantity;
+        effective.short_position = held.short_quantity;
+        effective.closable_long = held.long_quantity;
+        effective.closable_short = held.short_quantity;
+        step.submit = submit(intent, effective);
+        if (step.submit.code != SubmitCode::Submitted) {
+            impl_->set_fault(step.submit.code == SubmitCode::CapacityExceeded
+                    ? AccountFault::CapacityExceeded
+                    : AccountFault::StateConflict);
+            step.action = ExecutionAction::Frozen;
+            return step;
+        }
+        impl_->exit.pending = false;
+        impl_->exit.active = true;
+        impl_->exit.active_client_order_id = step.submit.client_order_id;
+        impl_->exit.market_events_waited = 0;
+        impl_->exit.freeze_after_cancel = false;
+        ++impl_->close_orders_submitted;
+        step.action = ExecutionAction::ExitSubmitted;
+        return step;
+    }
+
+    if (impl_->exit.active) {
+        ++impl_->exit.market_events_waited;
+        if (impl_->exit.market_events_waited
+            >= impl_->policy.close_reprice_interval_market_events) {
+            step.cancel = cancel(impl_->exit.active_client_order_id);
+            if (step.cancel.code == CancelCode::Requested) {
+                impl_->exit.freeze_after_cancel =
+                    impl_->exit.attempt >= impl_->policy.max_close_reprices;
+                step.action = ExecutionAction::ExitCancelRequested;
+            } else if (step.cancel.code != CancelCode::Duplicate) {
+                impl_->set_fault(AccountFault::CloseCancelRejected);
+                step.action = ExecutionAction::Frozen;
+            }
+        }
+        return step;
+    }
+
+    if (impl_->policy.entry_timeout_market_events == 0) return step;
+    for (auto& record : impl_->signals) {
+        if (!record.occupied || !record.active_open
+            || record.cancel_requested) continue;
+        ++record.market_events_waited;
+        if (record.market_events_waited
+            < impl_->policy.entry_timeout_market_events) continue;
+        step.cancel = cancel(record.result.client_order_id);
+        if (step.cancel.code == CancelCode::Requested) {
+            step.action = ExecutionAction::EntryCancelRequested;
+        } else if (step.cancel.code != CancelCode::Duplicate) {
+            impl_->set_fault(AccountFault::CloseCancelRejected);
+            step.action = ExecutionAction::Frozen;
+        }
+        return step;
+    }
+    return step;
+}
+
 namespace {
 
 bool parse_order_ref(
@@ -1087,24 +1261,28 @@ void copy_from_ctp(std::array<char, N>& destination, const char* source) noexcep
 std::size_t AccountTradingSession::drain_callbacks() noexcept
 {
     if (impl_->callback_overflow.exchange(false, std::memory_order_acq_rel)) {
-        impl_->reconciliation = true;
+        impl_->set_fault(AccountFault::CallbackQueueOverflow);
     }
     std::size_t applied_count = 0;
     CallbackEvent event{};
     while (impl_->pop_callback(event)) {
         ++applied_count;
+        if (event.type == CallbackType::Disconnected) {
+            impl_->set_fault(AccountFault::Disconnected);
+            continue;
+        }
         std::uint64_t order_ref = 0;
         if (!parse_order_ref(event.order_ref, order_ref)) {
-            impl_->reconciliation = true;
+            impl_->set_fault(AccountFault::UnknownCallback);
             continue;
         }
         auto* record = impl_->find_order_ref(order_ref);
         if (record == nullptr) {
-            impl_->reconciliation = true;
+            impl_->set_fault(AccountFault::UnknownCallback);
             continue;
         }
         if (event.type == CallbackType::Unknown) {
-            impl_->reconciliation = true;
+            impl_->set_fault(AccountFault::UnknownCallback);
             continue;
         }
         ApplyResult result{};
@@ -1123,9 +1301,74 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
         }
         if (result.reconciliation_required
             || result.code == ApplyCode::Conflict
-            || result.code == ApplyCode::UnknownOrder
-            || result.code == ApplyCode::CapacityExceeded) {
-            impl_->reconciliation = true;
+            || result.code == ApplyCode::UnknownOrder) {
+            impl_->set_fault(AccountFault::StateConflict);
+        } else if (result.code == ApplyCode::CapacityExceeded) {
+            impl_->set_fault(AccountFault::CapacityExceeded);
+        }
+
+        if (event.type == CallbackType::CancelRejected) {
+            record->cancel_requested = false;
+            if (record->result.client_order_id
+                == impl_->exit.active_client_order_id) {
+                impl_->set_fault(AccountFault::CloseCancelRejected);
+            }
+        }
+
+        if (impl_->policy.enabled && event.type == CallbackType::Trade
+            && result.code == ApplyCode::Applied
+            && result.position_changed) {
+            if (record->intent.offset == Offset::Open) {
+                const bool incompatible =
+                    (impl_->exit.pending || impl_->exit.active)
+                    && (impl_->exit.signal_id != record->intent.signal_id
+                        || impl_->exit.instrument != event.trade.instrument);
+                if (incompatible
+                    || event.trade.quantity
+                        > std::numeric_limits<std::int32_t>::max()
+                            - impl_->exit.pending_quantity) {
+                    impl_->set_fault(AccountFault::StateConflict);
+                } else {
+                    impl_->exit.pending = true;
+                    impl_->exit.instrument = event.trade.instrument;
+                    impl_->exit.direction = event.trade.direction
+                        == Direction::Buy ? Direction::Sell : Direction::Buy;
+                    impl_->exit.signal_id = record->intent.signal_id;
+                    impl_->exit.pending_quantity += event.trade.quantity;
+                }
+            } else {
+                PositionSnapshot held{};
+                if (impl_->state.position_snapshot(
+                        field_view(event.trade.instrument), held)
+                    && held.long_quantity == 0 && held.short_quantity == 0) {
+                    impl_->exit = {};
+                }
+            }
+        }
+
+        if (event.type == CallbackType::Order
+            && event.order_type == OrderReportType::Canceled
+            && result.code == ApplyCode::Applied
+            && record->result.client_order_id
+                == impl_->exit.active_client_order_id) {
+            impl_->exit.active = false;
+            impl_->exit.active_client_order_id = 0;
+            if (impl_->exit.freeze_after_cancel) {
+                impl_->set_fault(AccountFault::CloseRetryExhausted);
+            } else {
+                PositionSnapshot held{};
+                if (!impl_->state.position_snapshot(
+                        field_view(impl_->exit.instrument), held)) {
+                    impl_->set_fault(AccountFault::StateConflict);
+                } else {
+                    impl_->exit.pending_quantity =
+                        impl_->exit.direction == Direction::Sell
+                        ? held.long_quantity : held.short_quantity;
+                    impl_->exit.pending = impl_->exit.pending_quantity > 0;
+                    ++impl_->exit.attempt;
+                    ++impl_->close_reprices;
+                }
+            }
         }
         OrderSnapshot snapshot{};
         if (record->active_open
@@ -1157,6 +1400,33 @@ bool AccountTradingSession::reconciliation_required() const noexcept
 {
     return impl_->reconciliation || impl_->state.reconciliation_required()
         || impl_->callback_overflow.load(std::memory_order_acquire);
+}
+
+void AccountTradingSession::mark_fault(AccountFault fault) noexcept
+{
+    if (fault != AccountFault::None) impl_->set_fault(fault);
+}
+
+AccountExecutionSnapshot AccountTradingSession::execution_snapshot() const noexcept
+{
+    return {
+        impl_->frozen,
+        reconciliation_required(),
+        impl_->fault,
+        impl_->alert_count,
+        impl_->close_orders_submitted,
+        impl_->close_reprices,
+        impl_->active_open_orders,
+        impl_->exit.pending_quantity,
+        impl_->exit.active_client_order_id,
+    };
+}
+
+void AccountTradingSession::OnFrontDisconnected(int)
+{
+    CallbackEvent event{};
+    event.type = CallbackType::Disconnected;
+    impl_->push_callback(event);
 }
 
 void AccountTradingSession::OnRtnOrder(CThostFtdcOrderField* order)

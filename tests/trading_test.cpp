@@ -1,4 +1,5 @@
 #include "ctp/field.hpp"
+#include "ctp/engine.hpp"
 #include "ctp/trading.hpp"
 #define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
@@ -97,6 +98,62 @@ ctp::OrderIntent opening_intent(std::uint64_t signal_id = 41)
     intent.quantity = 1;
     intent.limit_price_ticks = 4'002;
     return intent;
+}
+
+ctp::AutoClosePolicy auto_close_policy()
+{
+    ctp::AutoClosePolicy policy{};
+    policy.enabled = true;
+    policy.entry_timeout_market_events = 3;
+    policy.close_protection_ticks = 1;
+    policy.close_reprice_interval_market_events = 2;
+    policy.max_close_reprices = 1;
+    return policy;
+}
+
+ctp::MarketEvent valid_market(std::uint64_t sequence = 1)
+{
+    ctp::MarketEvent market{};
+    market.market_seq = sequence;
+    market.recv_mono_ns = 1'500'000;
+    market.last_price_ticks = 4'000;
+    market.bid_price_ticks = 3'999;
+    market.ask_price_ticks = 4'000;
+    market.bid_volume = 1;
+    market.ask_volume = 1;
+    market.status = ctp::MarketDataStatus::Valid;
+    ctp::copy_to_field(market.instrument, "IF2609");
+    return market;
+}
+
+void emit_trade(
+    CThostFtdcTraderSpi* spi,
+    std::string_view order_ref,
+    std::string_view trade_id,
+    ctp::Direction direction,
+    ctp::Offset offset)
+{
+    CThostFtdcTradeField trade{};
+    ctp::copy_to_field(trade.OrderRef, order_ref);
+    ctp::copy_to_field(trade.TradingDay, "20260907");
+    ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+    ctp::copy_to_field(trade.TradeID, trade_id);
+    ctp::copy_to_field(trade.InstrumentID, "IF2609");
+    trade.Direction = direction == ctp::Direction::Buy
+        ? THOST_FTDC_D_Buy : THOST_FTDC_D_Sell;
+    trade.OffsetFlag = offset == ctp::Offset::Open
+        ? THOST_FTDC_OF_Open : THOST_FTDC_OF_Close;
+    trade.Volume = 1;
+    spi->OnRtnTrade(&trade);
+}
+
+void emit_canceled(CThostFtdcTraderSpi* spi, std::string_view order_ref)
+{
+    CThostFtdcOrderField order{};
+    ctp::copy_to_field(order.OrderRef, order_ref);
+    order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    order.OrderStatus = THOST_FTDC_OST_Canceled;
+    spi->OnRtnOrder(&order);
 }
 
 void test_local_order_states(test_support::TestRunner& runner)
@@ -814,7 +871,9 @@ void test_unknown_callback_freezes_only_its_account(
         first.reconciliation_required()
             && !second.reconciliation_required()
             && blocked.code == ctp::SubmitCode::RiskRejected
-            && blocked.risk_reason == ctp::RiskRejectReason::NotReconciled
+            && blocked.risk_reason == ctp::RiskRejectReason::AccountFrozen
+            && first.execution_snapshot().fault
+                == ctp::AccountFault::UnknownCallback
             && first_metrics->order_insert_calls == 0,
         "an unknown callback must freeze only the owning account session");
 }
@@ -949,6 +1008,92 @@ void test_session_hot_path_does_not_allocate(
         "submit, callback enqueue/drain, cancel, and snapshot must not allocate");
 }
 
+void test_open_fill_submits_one_close_and_reaches_zero(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy()};
+    const auto entry = session.submit(opening_intent(801), healthy_risk_snapshot());
+    emit_trade(view->spi(), "1", "open-801", ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+
+    const auto step = session.on_market(valid_market(), healthy_risk_snapshot());
+    runner.expect(
+        step.action == ctp::ExecutionAction::ExitSubmitted
+            && metrics->order_insert_calls == 2
+            && metrics->last_order.Direction == THOST_FTDC_D_Sell
+            && metrics->last_order.CombOffsetFlag[0] == THOST_FTDC_OF_Close
+            && metrics->last_order.VolumeTotalOriginal == 1
+            && metrics->last_order.LimitPrice == 3'998,
+        "an opening fill must submit exactly one protected closing order");
+    session.on_market(valid_market(2), healthy_risk_snapshot());
+    runner.expect(
+        metrics->order_insert_calls == 2,
+        "later market events must not duplicate an active closing order");
+
+    emit_trade(view->spi(), "2", "close-801", ctp::Direction::Sell, ctp::Offset::Close);
+    session.drain_callbacks();
+    ctp::PositionSnapshot position{};
+    session.position_snapshot("IF2609", position);
+    const auto execution = session.execution_snapshot();
+    runner.expect(
+        entry.code == ctp::SubmitCode::Submitted
+            && position.long_quantity == 0
+            && execution.active_open_orders == 0
+            && execution.close_orders_submitted == 1
+            && execution.active_exit_order_id == 0,
+        "the closing fill must reach zero and release lifecycle state once");
+}
+
+void test_close_retry_exhaustion_freezes_without_faking_zero(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy()};
+    session.submit(opening_intent(802), healthy_risk_snapshot());
+    emit_trade(view->spi(), "1", "open-802", ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    session.on_market(valid_market(1), healthy_risk_snapshot());
+    session.on_market(valid_market(2), healthy_risk_snapshot());
+    session.on_market(valid_market(3), healthy_risk_snapshot());
+    emit_canceled(view->spi(), "2");
+    session.drain_callbacks();
+    session.on_market(valid_market(4), healthy_risk_snapshot());
+    session.on_market(valid_market(5), healthy_risk_snapshot());
+    session.on_market(valid_market(6), healthy_risk_snapshot());
+    emit_canceled(view->spi(), "3");
+    session.drain_callbacks();
+
+    ctp::PositionSnapshot position{};
+    session.position_snapshot("IF2609", position);
+    const auto execution = session.execution_snapshot();
+    const auto blocked = session.submit(
+        opening_intent(803), healthy_risk_snapshot());
+    runner.expect(
+        metrics->order_insert_calls == 3
+            && metrics->order_action_calls == 2
+            && position.long_quantity == 1
+            && execution.frozen
+            && execution.reconciliation_required
+            && execution.fault == ctp::AccountFault::CloseRetryExhausted
+            && execution.alert_count == 1
+            && blocked.code == ctp::SubmitCode::RiskRejected
+            && blocked.risk_reason == ctp::RiskRejectReason::AccountFrozen,
+        "retry exhaustion must freeze once while preserving the real position");
+}
+
 }
 
 int main()
@@ -973,5 +1118,7 @@ int main()
     test_callback_queue_overflow_is_explicit(runner);
     test_cancel_rejection_and_daily_limit(runner);
     test_session_hot_path_does_not_allocate(runner);
+    test_open_fill_submits_one_close_and_reaches_zero(runner);
+    test_close_retry_exhaustion_freezes_without_faking_zero(runner);
     return runner.finish();
 }

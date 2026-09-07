@@ -12,6 +12,8 @@
 
 namespace ctp {
 
+struct MarketEvent;
+
 inline constexpr std::size_t kTradingDayCapacity = 9;
 inline constexpr std::size_t kExchangeIdCapacity = 9;
 inline constexpr std::size_t kTradeIdCapacity = 21;
@@ -24,6 +26,11 @@ enum class Direction : std::uint8_t {
 enum class Offset : std::uint8_t {
     Open,
     Close,
+};
+
+enum class OrderPurpose : std::uint8_t {
+    Entry,
+    Exit,
 };
 
 enum class OrderState : std::uint8_t {
@@ -125,6 +132,16 @@ struct OrderIntent {
     Offset offset{Offset::Open};
     std::int32_t quantity{0};
     std::int64_t limit_price_ticks{0};
+    OrderPurpose purpose{OrderPurpose::Entry};
+    std::uint32_t attempt{0};
+};
+
+struct AutoClosePolicy {
+    bool enabled{false};
+    std::uint32_t entry_timeout_market_events{0};
+    std::int64_t close_protection_ticks{0};
+    std::uint32_t close_reprice_interval_market_events{0};
+    std::uint32_t max_close_reprices{0};
 };
 
 struct RiskLimits {
@@ -236,6 +253,46 @@ struct CancelResult {
     int api_return_code{0};
 };
 
+enum class AccountFault : std::uint8_t {
+    None,
+    Configuration,
+    Disconnected,
+    MarketQueueOverflow,
+    CallbackQueueOverflow,
+    UnknownCallback,
+    StateConflict,
+    CapacityExceeded,
+    CloseCancelRejected,
+    CloseRetryExhausted,
+    PriceOverflow,
+};
+
+enum class ExecutionAction : std::uint8_t {
+    None,
+    EntryCancelRequested,
+    ExitSubmitted,
+    ExitCancelRequested,
+    Frozen,
+};
+
+struct ExecutionStepResult {
+    ExecutionAction action{ExecutionAction::None};
+    SubmitResult submit{};
+    CancelResult cancel{};
+};
+
+struct AccountExecutionSnapshot {
+    bool frozen{false};
+    bool reconciliation_required{false};
+    AccountFault fault{AccountFault::None};
+    std::uint32_t alert_count{0};
+    std::uint32_t close_orders_submitted{0};
+    std::uint32_t close_reprices{0};
+    std::int32_t active_open_orders{0};
+    std::int32_t pending_close_quantity{0};
+    std::uint64_t active_exit_order_id{0};
+};
+
 // 一个实例只属于一个账户，并由该账户执行线程串行修改。
 class AccountTradingState {
 public:
@@ -281,7 +338,8 @@ public:
         std::size_t signal_capacity,
         std::size_t callback_capacity,
         std::uint64_t next_client_order_id = 1,
-        std::uint64_t persisted_next_order_ref = 1);
+        std::uint64_t persisted_next_order_ref = 1,
+        AutoClosePolicy auto_close_policy = {});
     ~AccountTradingSession();
 
     AccountTradingSession(const AccountTradingSession&) = delete;
@@ -295,6 +353,11 @@ public:
         const OrderIntent& intent,
         const RiskSnapshot& snapshot) noexcept;
     CancelResult cancel(std::uint64_t client_order_id) noexcept;
+    ExecutionStepResult on_market(
+        const MarketEvent& market,
+        const RiskSnapshot& snapshot) noexcept;
+    void mark_fault(AccountFault fault) noexcept;
+    AccountExecutionSnapshot execution_snapshot() const noexcept;
     std::size_t drain_callbacks() noexcept;
     bool order_snapshot(
         std::uint64_t client_order_id,
@@ -303,6 +366,8 @@ public:
         std::string_view instrument,
         PositionSnapshot& snapshot) const noexcept;
     bool reconciliation_required() const noexcept;
+
+    void OnFrontDisconnected(int reason) override;
 
     void OnRspOrderInsert(
         CThostFtdcInputOrderField* order,
