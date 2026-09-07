@@ -647,11 +647,15 @@ RiskRejectReason evaluate_risk(
     if (limits.max_slippage_ticks < 0) {
         return RiskRejectReason::PriceProtection;
     }
+    // 先确认报价位于盘口外侧，再计算正数价差；这样盘口接近 int64
+    // 边界时无需直接加减保护 tick，避免有符号整数溢出。
     const bool outside_price_limit = intent.direction == Direction::Buy
-        ? intent.limit_price_ticks
-            > snapshot.ask_price_ticks + limits.max_slippage_ticks
-        : intent.limit_price_ticks
-            < snapshot.bid_price_ticks - limits.max_slippage_ticks;
+        ? intent.limit_price_ticks > snapshot.ask_price_ticks
+            && intent.limit_price_ticks - snapshot.ask_price_ticks
+                > limits.max_slippage_ticks
+        : intent.limit_price_ticks < snapshot.bid_price_ticks
+            && snapshot.bid_price_ticks - intent.limit_price_ticks
+                > limits.max_slippage_ticks;
     if (outside_price_limit) return RiskRejectReason::PriceProtection;
 
     if (intent.offset == Offset::Open) {

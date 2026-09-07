@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 
 namespace {
 
@@ -681,6 +682,18 @@ void test_risk_boundaries_have_stable_reasons(
         ctp::evaluate_risk(close, close_snapshot, limits)
                 == ctp::RiskRejectReason::InsufficientPosition,
         "a closing order beyond the available position must be rejected");
+
+    auto upper_book = healthy;
+    upper_book.bid_price_ticks =
+        std::numeric_limits<std::int64_t>::max() - 2;
+    upper_book.ask_price_ticks =
+        std::numeric_limits<std::int64_t>::max() - 1;
+    auto upper_price = intent;
+    upper_price.limit_price_ticks = std::numeric_limits<std::int64_t>::max();
+    runner.expect(
+        ctp::evaluate_risk(upper_price, upper_book, limits)
+                == ctp::RiskRejectReason::None,
+        "price protection must not overflow near the int64 upper boundary");
 }
 
 void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
@@ -1023,14 +1036,17 @@ void test_open_fill_submits_one_close_and_reaches_zero(
     emit_trade(view->spi(), "1", "open-801", ctp::Direction::Buy, ctp::Offset::Open);
     session.drain_callbacks();
 
+    test_support::AllocationProbe allocation_probe;
     const auto step = session.on_market(valid_market(), healthy_risk_snapshot());
+    allocation_probe.stop();
     runner.expect(
         step.action == ctp::ExecutionAction::ExitSubmitted
             && metrics->order_insert_calls == 2
             && metrics->last_order.Direction == THOST_FTDC_D_Sell
             && metrics->last_order.CombOffsetFlag[0] == THOST_FTDC_OF_Close
             && metrics->last_order.VolumeTotalOriginal == 1
-            && metrics->last_order.LimitPrice == 3'998,
+            && metrics->last_order.LimitPrice == 3'998
+            && allocation_probe.count() == 0,
         "an opening fill must submit exactly one protected closing order");
     session.on_market(valid_market(2), healthy_risk_snapshot());
     runner.expect(
@@ -1049,6 +1065,67 @@ void test_open_fill_submits_one_close_and_reaches_zero(
             && execution.close_orders_submitted == 1
             && execution.active_exit_order_id == 0,
         "the closing fill must reach zero and release lifecycle state once");
+}
+
+void test_entry_timeout_cancels_once(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy()};
+    const auto entry = session.submit(opening_intent(804), healthy_risk_snapshot());
+    const auto first = session.on_market(valid_market(1), healthy_risk_snapshot());
+    const auto second = session.on_market(valid_market(2), healthy_risk_snapshot());
+    const auto third = session.on_market(valid_market(3), healthy_risk_snapshot());
+    const auto fourth = session.on_market(valid_market(4), healthy_risk_snapshot());
+    runner.expect(
+        entry.code == ctp::SubmitCode::Submitted
+            && first.action == ctp::ExecutionAction::None
+            && second.action == ctp::ExecutionAction::None
+            && third.action == ctp::ExecutionAction::EntryCancelRequested
+            && fourth.action == ctp::ExecutionAction::None
+            && metrics->order_action_calls == 1,
+        "an entry timeout must request cancellation exactly once");
+}
+
+void test_close_fill_wins_cancel_race_without_reprice(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy()};
+    session.submit(opening_intent(805), healthy_risk_snapshot());
+    emit_trade(view->spi(), "1", "open-805", ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    session.on_market(valid_market(1), healthy_risk_snapshot());
+    session.on_market(valid_market(2), healthy_risk_snapshot());
+    session.on_market(valid_market(3), healthy_risk_snapshot());
+
+    emit_trade(view->spi(), "2", "close-805", ctp::Direction::Sell, ctp::Offset::Close);
+    session.drain_callbacks();
+    emit_canceled(view->spi(), "2");
+    session.drain_callbacks();
+    session.on_market(valid_market(4), healthy_risk_snapshot());
+
+    ctp::PositionSnapshot position{};
+    session.position_snapshot("IF2609", position);
+    const auto execution = session.execution_snapshot();
+    runner.expect(
+        metrics->order_insert_calls == 2
+            && metrics->order_action_calls == 1
+            && position.long_quantity == 0
+            && !execution.frozen
+            && execution.close_reprices == 0
+            && execution.active_exit_order_id == 0,
+        "a closing fill that wins the cancel race must suppress reprice");
 }
 
 void test_close_retry_exhaustion_freezes_without_faking_zero(
@@ -1120,5 +1197,7 @@ int main()
     test_session_hot_path_does_not_allocate(runner);
     test_open_fill_submits_one_close_and_reaches_zero(runner);
     test_close_retry_exhaustion_freezes_without_faking_zero(runner);
+    test_entry_timeout_cancels_once(runner);
+    test_close_fill_wins_cancel_race_without_reprice(runner);
     return runner.finish();
 }

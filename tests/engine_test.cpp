@@ -1,8 +1,11 @@
 #include "ctp/engine.hpp"
+#include "ctp/field.hpp"
+#include "ctp/trading.hpp"
 #define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
 
 #include <limits>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -297,6 +300,136 @@ void test_price_normalization_boundaries(test_support::TestRunner& runner)
         "a tick conversion outside int64 range must be rejected");
 }
 
+ctp::RiskLimits isolation_limits()
+{
+    ctp::RiskLimits limits{};
+    ctp::copy_to_field(limits.allowed_instrument, "IF2609");
+    limits.max_market_age_ns = 1'000'000;
+    limits.max_slippage_ticks = 2;
+    limits.margin_per_lot = 100;
+    limits.minimum_available_after_order = 100;
+    limits.max_daily_signals = 10;
+    limits.max_daily_orders = 10;
+    limits.max_daily_cancels = 10;
+    limits.max_active_open_orders = 1;
+    limits.max_net_open_position = 1;
+    return limits;
+}
+
+ctp::RiskSnapshot isolation_snapshot()
+{
+    ctp::RiskSnapshot snapshot{};
+    snapshot.enabled = true;
+    snapshot.authenticated = true;
+    snapshot.logged_in = true;
+    snapshot.reconciled = true;
+    snapshot.trading_window_open = true;
+    snapshot.market_valid = true;
+    snapshot.funds_known = true;
+    snapshot.positions_known = true;
+    snapshot.now_ns = 2'000'000;
+    snapshot.market_receive_ns = 1'500'000;
+    snapshot.bid_price_ticks = 499;
+    snapshot.ask_price_ticks = 501;
+    snapshot.available_funds = 200;
+    return snapshot;
+}
+
+ctp::OrderIntent isolation_intent(std::uint64_t signal_id)
+{
+    ctp::OrderIntent intent{};
+    intent.signal_id = signal_id;
+    ctp::copy_to_field(intent.instrument, "IF2609");
+    intent.direction = ctp::Direction::Buy;
+    intent.offset = ctp::Offset::Open;
+    intent.quantity = 1;
+    intent.limit_price_ticks = 502;
+    return intent;
+}
+
+void test_four_account_fault_matrix(test_support::TestRunner& runner)
+{
+    constexpr std::array expected_faults{
+        ctp::AccountFault::Disconnected,
+        ctp::AccountFault::MarketQueueOverflow,
+        ctp::AccountFault::CallbackQueueOverflow,
+        ctp::AccountFault::UnknownCallback,
+    };
+
+    for (std::size_t target = 0; target < expected_faults.size(); ++target) {
+        auto accounts = make_accounts(4);
+        std::array<std::unique_ptr<ctp::AccountTradingSession>, 4> sessions;
+        std::array<test_support::FakeTraderApi*, 4> api_views{};
+        for (std::size_t account = 0; account < sessions.size(); ++account) {
+            auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+            auto api = std::make_unique<test_support::FakeTraderApi>(metrics);
+            api_views[account] = api.get();
+            sessions[account] = std::make_unique<ctp::AccountTradingSession>(
+                accounts[account], isolation_limits(), std::move(api),
+                8, 8, 8, 1);
+        }
+
+        if (target == 0) {
+            api_views[target]->spi()->OnFrontDisconnected(0x1001);
+            sessions[target]->drain_callbacks();
+        } else if (target == 1) {
+            ctp::MarketIngress ingress{accounts, 0.2};
+            ingress.start();
+            for (std::size_t sequence = 0;
+                 sequence <= ctp::kMarketQueueCapacity;
+                 ++sequence) {
+                auto tick = make_tick(static_cast<int>(sequence % 100));
+                ingress.ingest(&tick, static_cast<std::int64_t>(sequence));
+                for (std::size_t account = 0; account < sessions.size(); ++account) {
+                    if (account == target) continue;
+                    ctp::MarketEvent ignored{};
+                    ingress.try_pop(account, ignored);
+                }
+            }
+            if (ingress.snapshot(target).overflowed) {
+                sessions[target]->mark_fault(
+                    ctp::AccountFault::MarketQueueOverflow);
+            }
+        } else if (target == 2) {
+            CThostFtdcOrderField callback{};
+            ctp::copy_to_field(callback.OrderRef, "999");
+            callback.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+            api_views[target]->spi()->OnRtnOrder(&callback);
+            api_views[target]->spi()->OnRtnOrder(&callback);
+            sessions[target]->drain_callbacks();
+        } else {
+            CThostFtdcOrderField callback{};
+            ctp::copy_to_field(callback.OrderRef, "999");
+            callback.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+            api_views[target]->spi()->OnRtnOrder(&callback);
+            sessions[target]->drain_callbacks();
+        }
+
+        for (std::size_t account = 0; account < sessions.size(); ++account) {
+            const auto state = sessions[account]->execution_snapshot();
+            const auto submitted = sessions[account]->submit(
+                isolation_intent(1'000 + target * 10 + account),
+                isolation_snapshot());
+            if (account == target) {
+                runner.expect(
+                    state.frozen && state.reconciliation_required
+                        && state.fault == expected_faults[target]
+                        && state.alert_count == 1
+                        && submitted.code == ctp::SubmitCode::RiskRejected
+                        && submitted.risk_reason
+                            == ctp::RiskRejectReason::AccountFrozen,
+                    "the selected account alone must expose its stable fault");
+            } else {
+                runner.expect(
+                    !state.frozen && !state.reconciliation_required
+                        && state.fault == ctp::AccountFault::None
+                        && submitted.code == ctp::SubmitCode::Submitted,
+                    "unaffected accounts must retain independent order flow");
+            }
+        }
+    }
+}
+
 }
 
 int main()
@@ -308,5 +441,6 @@ int main()
     test_slow_account_does_not_block_other_accounts(runner);
     test_lifecycle_invalid_data_and_hot_path_allocation(runner);
     test_price_normalization_boundaries(runner);
+    test_four_account_fault_matrix(runner);
     return runner.finish();
 }

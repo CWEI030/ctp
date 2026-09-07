@@ -136,6 +136,7 @@ struct OrderIntent {
     std::uint32_t attempt{0};
 };
 
+// 自动平仓按账户收到的有效行情次数推进，避免依赖墙上时钟造成回放差异。
 struct AutoClosePolicy {
     bool enabled{false};
     std::uint32_t entry_timeout_market_events{0};
@@ -253,6 +254,7 @@ struct CancelResult {
     int api_return_code{0};
 };
 
+// 故障只写入所属账户；首次故障保持稳定，等待后续恢复流程核对状态。
 enum class AccountFault : std::uint8_t {
     None,
     Configuration,

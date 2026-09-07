@@ -132,6 +132,8 @@ if(BUILD_TESTING)
     add_test(NAME market COMMAND ctp_market_tests)
 
     add_executable(ctp_engine_tests tests/engine_test.cpp)
+    target_compile_definitions(ctp_engine_tests PRIVATE
+        CTP_TEST_WITH_TRADER_FAKE)
     target_include_directories(ctp_engine_tests PRIVATE tests)
     target_link_libraries(ctp_engine_tests PRIVATE ctp_engine)
     target_compile_options(ctp_engine_tests PRIVATE
