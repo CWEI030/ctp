@@ -16,9 +16,11 @@
 只撤一次，平仓超时按有限次数撤单重报，耗尽后冻结所属账户并保留真实持仓等待核对。断线、行情
 队列溢出、回报队列溢出和异常回报均具有账户级稳定故障原因，四账户故障矩阵证明其他账户仍可报单。
 
-上述交易与策略能力目前只由回放数据和替身 CTP 接口完成离线闭环。`engine --mode live` 仍只校验
-配置后明确退出，没有装配行情、策略和账户交易会话，也不会向 SimNow 报单；自动平仓已有离线
-状态链路，但断线重登、查询核对、重启恢复和性能验收仍未实现。
+上述交易与策略能力目前只由回放数据和替身 CTP 接口完成离线闭环。断线后的认证、登录、订单、
+成交、持仓和资金查询恢复，以及完整且零丢弃日志支持的重启身份恢复已有离线实现。性能工具可复用
+同一回放驱动策略、风控、报单和回报状态链，保存原始延迟、队列、CPU、业务计数、环境清单、报告
+和校验和。`engine --mode live` 仍只校验配置后明确退出，不会向 SimNow 报单；离线基准数字也不代表
+真实 CTP 网络性能。
 CTP 官方 SDK 和账号凭据都不应提交到 Git。
 
 ## 1. 准备环境
@@ -51,7 +53,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-成功时会生成 `build/ctp_client`，CTest 应报告 7 个测试程序全部通过。这里测试的是配置、
+成功时会生成 `build/ctp_client`，CTest 应报告 8 个测试程序全部通过。这里测试的是配置、
 离线行情分发、行情浮点价格到整数 tick 的边界转换、确定性策略与回放、订单/成交/持仓状态、
 风控、替身接口报撤单、自动平仓、有限撤单重报、账户级故障隔离和回调接入，以及旧行情与交易
 客户端状态、超时及资源清理，不需要 SimNow 账号，也不会连接 SimNow。
@@ -64,6 +66,10 @@ ctest --test-dir build --output-on-failure
 ctp_client market  [--profile PROFILE] --instrument INSTRUMENT --ticks COUNT
 ctp_client account [--profile PROFILE]
 ctp_client engine --mode live [--config CONFIG]
+ctp_client benchmark --config CONFIG --input REPLAY.csv --output RESULT_DIR \
+  [--accounts COUNT] [--rate EVENTS_PER_SECOND] \
+  [--warmup-seconds SECONDS] [--duration-seconds SECONDS] \
+  [--burst-rate EVENTS_PER_SECOND --burst-seconds SECONDS]
 ```
 
 - `PROFILE` 默认是 `simnow-7x24`；
@@ -99,6 +105,17 @@ export CTP_ACCOUNT_account2_TRADER_FRONT='tcp://127.0.0.1:40001'
 ```bash
 scripts/audit.sh secrets
 ```
+
+应用自有热路径禁用项审计和短性能工具验收分别执行：
+
+```bash
+scripts/audit.sh hot-path
+scripts/acceptance.sh benchmark smoke
+```
+
+短测会运行 1、2、4 账户结构矩阵并把结果写入忽略提交的 `runtime/performance/`。正式矩阵使用
+`scripts/acceptance.sh benchmark full`，包含预热、每档至少 15 分钟、突发和三次重复，运行时间较长。
+两种模式都只使用离线回放与柜台替身，不连接 SimNow。
 
 程序内置的 profile 如下。它们是公共接入参数，不是账号信息：
 
@@ -270,5 +287,7 @@ ldd "$CTP_SDK_ROOT"/trader/thosttraderapi_se.so
 - 多账户 `engine` 已有配置、离线行情分发、订单/成交/持仓、风控和替身接口报撤单闭环，
   并已有确定性策略、自动平仓、有限撤单重报和账户级故障隔离；但这些模块尚未由 `main`
   装配，也未经过真实 SimNow 报撤单、平仓与回报验证；
-- 冻结账户只保留明确故障和待核对状态；断线重登、查询对账、重启恢复及状态持久化尚未实现；
-- 版本化 CSV 回放由测试直接驱动，没有 `replay` 命令；`benchmark` 命令也尚未实现。
+- 断线重登、查询对账、重启恢复和状态持久化已有离线实现，但尚未接入 `main`，也未经过
+  真实 SimNow 断线恢复验证；
+- 没有独立的 `replay` 命令；`benchmark` 命令可离线生成性能证据，但尚未运行正式长时矩阵，
+  其结果不能替代真实 CTP 网络链路验收。
