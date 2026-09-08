@@ -1,10 +1,10 @@
-# CTP SimNow 只读客户端
+# CTP SimNow 多账户交易客户端
 
 这是一个用于学习 CTP API 的 Linux C++17 命令行项目。它可以：
 
 - `market`：登录行情前置，订阅一个合约，收到指定条数后退出；
 - `account`：认证并登录交易前置，查询资金和全部持仓后退出；
-- `engine --mode live`：校验并加载一个或多个账户的本地配置。
+- `engine --mode live`：运行共享行情和彼此隔离的一个或多个账户交易会话。
 
 第二批已经完成离线行情进入层：行情回调会被校验并转换为定长整数事件，再分发到按配置数量
 预分配的账户独立队列。第三批完成每账户独立的订单状态、成交去重和多空持仓纯状态核心；
@@ -16,10 +16,10 @@
 只撤一次，平仓超时按有限次数撤单重报，耗尽后冻结所属账户并保留真实持仓等待核对。断线、行情
 队列溢出、回报队列溢出和异常回报均具有账户级稳定故障原因，四账户故障矩阵证明其他账户仍可报单。
 
-上述交易与策略能力目前只由回放数据和替身 CTP 接口完成离线闭环。断线后的认证、登录、订单、
-成交、持仓和资金查询恢复，以及完整且零丢弃日志支持的重启身份恢复已有离线实现。性能工具可复用
-同一回放驱动策略、风控、报单和回报状态链，保存原始延迟、队列、CPU、业务计数、环境清单、报告
-和校验和。`engine --mode live` 仍只校验配置后明确退出，不会向 SimNow 报单；离线基准数字也不代表
+上述交易与策略能力已经装入 `engine --mode live`：一条共享行情连接给各账户独立队列分发行情，
+每个账户独立认证、登录、查询恢复、运行策略和风控，并记录异步轨迹。默认不允许报单；只有同时
+提供 `--allow-orders`、启用策略并关闭熔断开关，订单才可能发往交易前置。现有在线运行代码已由
+柜台替身测试，尚未取得四个真实 SimNow 账户同时开平仓和最终零持仓证据。离线基准数字也不代表
 真实 CTP 网络性能。
 CTP 官方 SDK 和账号凭据都不应提交到 Git。
 
@@ -65,7 +65,7 @@ ctest --test-dir build --output-on-failure
 ```text
 ctp_client market  [--profile PROFILE] --instrument INSTRUMENT --ticks COUNT
 ctp_client account [--profile PROFILE]
-ctp_client engine --mode live [--config CONFIG]
+ctp_client engine --mode live [--config CONFIG] [--check] [--allow-orders]
 ctp_client benchmark --config CONFIG --input REPLAY.csv --output RESULT_DIR \
   [--accounts COUNT] [--rate EVENTS_PER_SECOND] \
   [--warmup-seconds SECONDS] [--duration-seconds SECONDS] \
@@ -116,6 +116,29 @@ scripts/acceptance.sh benchmark smoke
 短测会运行 1、2、4 账户结构矩阵并把结果写入忽略提交的 `runtime/performance/`。正式矩阵使用
 `scripts/acceptance.sh benchmark full`，包含预热、每档至少 15 分钟、突发和三次重复，运行时间较长。
 两种模式都只使用离线回放与柜台替身，不连接 SimNow。
+
+### 在线引擎安全门禁
+
+默认预检只解析最终生效配置，不创建网络连接，也不报单：
+
+```bash
+scripts/acceptance.sh simnow preflight
+```
+
+预检要求至少四个启用账户，并且具有四个不同的用户代码；未替换的 `<...>` 占位值、缺失字段、
+危险文件权限、未启用策略或仍开启熔断都会在联网前拒绝。当前只有一个真实账号时，此门禁按设计
+返回阻断，不能用重复账号冒充四账户验收。
+
+真实在线命令具有报单风险，只能在四账户预检通过后显式确认：
+
+```bash
+export CTP_SIMNOW_CONFIRM=I_UNDERSTAND_SIMNOW_ORDERS
+scripts/acceptance.sh simnow online
+unset CTP_SIMNOW_CONFIRM
+```
+
+可用 `CTP_SIMNOW_CONFIG` 指定本机配置路径。在线引擎持续运行到按下 Ctrl+C；结束摘要给出就绪、
+失败、策略报单、最终已知空仓和持仓未知账户数。摘要和本地轨迹用于验收，但不能替代柜台查询核对。
 
 程序内置的 profile 如下。它们是公共接入参数，不是账号信息：
 
@@ -213,7 +236,7 @@ echo "exit_code=$?"
 [ok] account queries completed: positions=<数量>
 ```
 
-这个命令不会发送结算单确认、报单或撤单请求。第四批新增的报撤单核心尚未接入命令入口。
+这个兼容命令不会发送结算单确认、报单或撤单请求；报撤单只存在于带显式安全门禁的在线引擎。
 
 ## 7. SimNow 联网前提
 
@@ -235,7 +258,7 @@ HTTPS 打开，只证明网站可访问，不代表服务器能够连接 CTP 的
 | `6` | 行情订阅、资金查询或持仓查询失败 |
 | `130` | 用户按 Ctrl+C，资源清理后退出 |
 
-`0 tests failed out of 7` 只表示七组离线自动化测试通过，不表示真实账号已经登录成功。
+`0 tests failed out of 8` 只表示八组离线自动化测试通过，不表示真实账号已经登录成功。
 
 ## 9. 常见问题
 
@@ -280,14 +303,10 @@ ldd "$CTP_SDK_ROOT"/trader/thosttraderapi_se.so
 
 - 仅支持 Linux x86-64 和仓库外的 CTP Linux SDK；
 - 行情模式一次只订阅一个合约，只运行到指定 `ticks`；
-- 所有联网操作固定等待 15 秒；
-- 不自动重连，不持续运行，不保存行情；
+- 旧 `market`、`account` 命令固定等待 15 秒；在线引擎持续运行到 Ctrl+C；
 - 账户模式只查询资金和全部持仓；
-- 不处理结算单确认；命令入口不支持报单、撤单或转账；
-- 多账户 `engine` 已有配置、离线行情分发、订单/成交/持仓、风控和替身接口报撤单闭环，
-  并已有确定性策略、自动平仓、有限撤单重报和账户级故障隔离；但这些模块尚未由 `main`
-  装配，也未经过真实 SimNow 报撤单、平仓与回报验证；
-- 断线重登、查询对账、重启恢复和状态持久化已有离线实现，但尚未接入 `main`，也未经过
-  真实 SimNow 断线恢复验证；
+- 不处理结算单确认或转账；在线引擎虽已装配报撤单、自动平仓、逐账户恢复与轨迹，但尚未经过
+  四个真实 SimNow 账户同时验证；
+- 本机当前只有一个账号，不能完成四账户登录、故障隔离、开平仓和最终零持仓验收；
 - 没有独立的 `replay` 命令；`benchmark` 命令可离线生成性能证据，但尚未运行正式长时矩阵，
   其结果不能替代真实 CTP 网络链路验收。
