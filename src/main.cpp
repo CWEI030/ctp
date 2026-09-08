@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iostream>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -26,6 +27,24 @@ int main(int argc, char* argv[])
     const auto& config = *result.config;
     if (config.mode() == ctp::Mode::Benchmark) {
         return ctp::run_benchmark(config, std::cout, std::cerr);
+    }
+    if (config.mode() == ctp::Mode::Engine && config.live().check_only) {
+        const auto invalid = ctp::validate_live_engine_config(config);
+        if (!invalid.empty()) {
+            std::cerr << "[error] live engine configuration: " << invalid << '\n';
+            return 2;
+        }
+        std::unordered_set<std::string_view> distinct_users;
+        for (const auto& account : config.accounts()) {
+            distinct_users.insert(account.user_id());
+        }
+        std::cout << "[ok] live configuration valid: accounts="
+                  << config.accounts().size()
+                  << ", distinct_users=" << distinct_users.size()
+                  << ", orders="
+                  << (config.live().allow_orders ? "enabled" : "disabled")
+                  << '\n';
+        return 0;
     }
     ctp::SigintHandler sigint;
     if (!sigint.installed()) {

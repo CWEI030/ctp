@@ -504,6 +504,16 @@ public:
         return submitted_.load(std::memory_order_relaxed);
     }
 
+    bool final_position_known() const noexcept
+    {
+        return final_position_known_;
+    }
+
+    bool final_position_flat() const noexcept
+    {
+        return final_long_position_ == 0 && final_short_position_ == 0;
+    }
+
 private:
     static StrategyConfig make_strategy(const LiveConfig& live)
     {
@@ -628,6 +638,16 @@ private:
             if (drained == 0) std::this_thread::yield();
         }
         session_->drain_callbacks();
+        const auto recovery = session_->recovery_snapshot();
+        PositionSnapshot position{};
+        const bool has_position = session_->position_snapshot(
+            live_.instrument, position);
+        final_position_known_ = recovery.phase == RecoveryPhase::Ready
+            && (!has_position || position.known);
+        if (has_position) {
+            final_long_position_ = position.long_quantity;
+            final_short_position_ = position.short_quantity;
+        }
         session_.reset();
         if (journal_) journal_->stop();
     }
@@ -644,8 +664,17 @@ private:
     std::atomic<std::uint64_t> submitted_{0};
     std::int64_t rate_window_start_ns_{0};
     std::uint32_t orders_in_window_{0};
+    std::int32_t final_long_position_{0};
+    std::int32_t final_short_position_{0};
+    bool final_position_known_{false};
     bool initialized_{true};
 };
+
+bool contains_placeholder(std::string_view value)
+{
+    return value.find('<') != std::string_view::npos
+        || value.find('>') != std::string_view::npos;
+}
 
 std::string validate_live_config(const RuntimeConfig& config)
 {
@@ -654,10 +683,22 @@ std::string validate_live_config(const RuntimeConfig& config)
     if (!has_tcp_front(live.market_front)) {
         return "market_front is missing or invalid";
     }
+    if (contains_placeholder(live.market_front)) {
+        return "market_front still contains a placeholder";
+    }
     if (live.instrument.empty()) return "instrument is missing";
     if (!std::isfinite(live.minimum_price_increment)
         || live.minimum_price_increment <= 0.0) {
         return "minimum_price_increment is missing or invalid";
+    }
+    for (const auto& account : config.accounts()) {
+        if (contains_placeholder(account.user_id())
+            || contains_placeholder(account.password())
+            || contains_placeholder(account.app_id())
+            || contains_placeholder(account.auth_code())
+            || contains_placeholder(account.trader_front())) {
+            return "an enabled account still contains a placeholder";
+        }
     }
     if (!live.allow_orders) return {};
     if (!live.strategy_enabled) return "--allow-orders requires strategy enabled=true";
@@ -677,6 +718,11 @@ std::string validate_live_config(const RuntimeConfig& config)
 
 }
 
+std::string validate_live_engine_config(const RuntimeConfig& config)
+{
+    return validate_live_config(config);
+}
+
 int run_live_engine(
     const RuntimeConfig& config,
     std::ostream& output,
@@ -684,7 +730,7 @@ int run_live_engine(
     const std::function<bool()>& stop_requested,
     LiveEngineDependencies dependencies)
 {
-    const auto invalid = validate_live_config(config);
+    const auto invalid = validate_live_engine_config(config);
     if (!invalid.empty()) {
         error << "[error] live engine configuration: " << invalid << '\n';
         return 2;
@@ -793,14 +839,23 @@ int run_live_engine(
 
     std::size_t ready = 0;
     std::size_t failed = 0;
+    std::size_t flat = 0;
+    std::size_t position_unknown = 0;
     std::uint64_t submitted = 0;
     for (const auto& worker : workers) {
         if (worker->ready()) ++ready;
         if (worker->failed()) ++failed;
+        if (!worker->final_position_known()) {
+            ++position_unknown;
+        } else if (worker->final_position_flat()) {
+            ++flat;
+        }
         submitted += worker->submitted();
     }
     output << "[info] live engine stopped; ready=" << ready
-           << ", failed=" << failed << ", submitted=" << submitted << '\n';
+           << ", failed=" << failed << ", submitted=" << submitted
+           << ", flat=" << flat
+           << ", position_unknown=" << position_unknown << '\n';
     return 0;
 }
 

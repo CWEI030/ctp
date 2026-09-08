@@ -186,6 +186,8 @@ struct LiveEngineDependencies {
     std::string trace_root{"runtime/traces"};
 };
 
+std::string validate_live_engine_config(const RuntimeConfig& config);
+
 // 返回 0 表示收到停止请求并完成清理；配置或运行故障返回非零。
 int run_live_engine(
     const RuntimeConfig& config,

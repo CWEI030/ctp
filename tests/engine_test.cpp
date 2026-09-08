@@ -771,6 +771,24 @@ void test_live_runner_refuses_unsafe_latest_trace(
     std::filesystem::remove_all(trace_root);
 }
 
+void test_live_validation_rejects_unresolved_placeholders(
+    test_support::TestRunner& runner)
+{
+    auto live = make_live_config(1).live();
+    live.market_front = "tcp://<MARKET_HOST>:<PORT>";
+    ctp::RuntimeConfig config{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        make_accounts(1),
+        {},
+        std::move(live)};
+    runner.expect(
+        ctp::validate_live_engine_config(config).find("placeholder")
+            != std::string::npos,
+        "live validation must reject unresolved configuration placeholders");
+}
+
 }
 
 int main()
@@ -786,5 +804,6 @@ int main()
     test_live_runner_isolates_one_failed_account(runner);
     test_live_runner_restores_latest_identity_before_market(runner);
     test_live_runner_refuses_unsafe_latest_trace(runner);
+    test_live_validation_rejects_unresolved_placeholders(runner);
     return runner.finish();
 }

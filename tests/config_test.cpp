@@ -337,6 +337,14 @@ void test_engine_parses_live_runtime_and_explicit_order_gate(TestRunner& runner)
     runner.expect(
         observed.config.has_value() && !observed.config->live().allow_orders,
         "orders must remain disabled unless --allow-orders is explicit");
+
+    const auto checked = parse(
+        {"engine", "--mode", "live", "--config", file.path(), "--check"},
+        {});
+    runner.expect(
+        checked.config.has_value() && checked.config->live().check_only
+            && !checked.config->live().allow_orders,
+        "check mode must be retained without implicitly enabling orders");
 }
 
 void test_benchmark_configuration(TestRunner& runner)

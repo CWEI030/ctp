@@ -88,20 +88,22 @@ ConfigResult parse_engine_config(
 {
     std::string engine_mode;
     std::string config_path;
+    bool check_only = false;
     bool allow_orders = false;
     std::unordered_set<std::string_view> seen_options;
 
     for (std::size_t index = 1; index < arguments.size(); ++index) {
         const auto option = arguments[index];
-        if (option != "--mode" && option != "--config"
+        if (option != "--mode" && option != "--config" && option != "--check"
             && option != "--allow-orders") {
             return failure("unknown engine command-line option");
         }
         if (!seen_options.insert(option).second) {
             return failure("duplicate engine command-line option");
         }
-        if (option == "--allow-orders") {
-            allow_orders = true;
+        if (option == "--check" || option == "--allow-orders") {
+            if (option == "--check") check_only = true;
+            else allow_orders = true;
             continue;
         }
         if (index + 1 >= arguments.size()) {
@@ -222,6 +224,7 @@ ConfigResult parse_engine_config(
 
     LiveConfig live{};
     live.config_path = config_path;
+    live.check_only = check_only;
     live.allow_orders = allow_orders;
     const auto reject_unknown = [](const auto& fields, const auto& allowed) {
         for (const auto& [name, ignored] : fields) {

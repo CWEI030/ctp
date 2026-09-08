@@ -38,6 +38,7 @@ struct LiveConfig {
     std::string exchange_id;
     std::string instrument;
     double minimum_price_increment{0.0};
+    bool check_only{false};
     bool allow_orders{false};
     bool strategy_enabled{false};
     std::int64_t trigger_price_ticks{0};
