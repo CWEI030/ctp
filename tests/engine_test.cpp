@@ -1,12 +1,15 @@
 #include "ctp/engine.hpp"
 #include "ctp/field.hpp"
 #include "ctp/market_client.hpp"
+#include "ctp/telemetry.hpp"
 #include "ctp/trading.hpp"
 #define CTP_TEST_DEFINE_ALLOCATION_OPERATORS
 #include "test_support.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -649,6 +652,125 @@ void test_live_runner_isolates_one_failed_account(
         "the shared market API must be released exactly once");
 }
 
+void test_live_runner_restores_latest_identity_before_market(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path trace_root{
+        "/tmp/ctp_batch009_live_restart"};
+    std::filesystem::remove_all(trace_root);
+    std::filesystem::create_directories(trace_root / "100");
+    {
+        ctp::AsyncTraceJournal journal{
+            trace_root / "100" / "account1.csv", "account1"};
+        runner.expect(journal.start(), "restart fixture journal must start");
+        ctp::TraceEvent submitted{};
+        submitted.trace_id = {100, 2};
+        submitted.sequence = 1;
+        submitted.stage = ctp::TraceStage::OrderSubmitted;
+        submitted.client_order_id = 9;
+        submitted.order_ref = 21;
+        submitted.limit_price_ticks = 4'002;
+        submitted.quantity = 1;
+        submitted.direction = static_cast<std::uint8_t>(ctp::Direction::Buy);
+        submitted.offset = static_cast<std::uint8_t>(ctp::Offset::Open);
+        submitted.purpose = static_cast<std::uint8_t>(ctp::OrderPurpose::Entry);
+        ctp::copy_to_field(submitted.instrument, "IF2609");
+        runner.expect(
+            journal.try_record(submitted),
+            "restart fixture must retain the unresolved order");
+        journal.stop();
+    }
+
+    auto config = make_live_config(1);
+    auto market = std::make_shared<FakeLiveMarketState>();
+    auto trader = std::make_shared<test_support::FakeTraderMetrics>();
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    dependencies.create_trader = [trader](const std::string&) {
+        auto api = make_recovering_trader(trader, false);
+        api->on_order_query = [trader](auto& self) {
+            CThostFtdcOrderField order{};
+            ctp::copy_to_field(order.OrderRef, "21");
+            order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+            order.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+            self.spi()->OnRspQryOrder(
+                &order, nullptr, trader->order_query_request_id, true);
+        };
+        return api;
+    };
+
+    std::atomic<bool> stop{false};
+    std::thread feeder([market, &stop] {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds{2};
+        while (!market->subscribed.load(std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        auto below = make_tick(0);
+        below.LastPrice = 799.8;
+        below.BidPrice1 = 799.6;
+        below.AskPrice1 = 800.0;
+        market->spi.load(std::memory_order_acquire)
+            ->OnRtnDepthMarketData(&below);
+        auto crossing = make_tick(1);
+        crossing.LastPrice = 800.0;
+        crossing.BidPrice1 = 799.8;
+        crossing.AskPrice1 = 800.2;
+        market->spi.load(std::memory_order_acquire)
+            ->OnRtnDepthMarketData(&crossing);
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config,
+        output,
+        error,
+        [&stop] { return stop.load(std::memory_order_acquire); },
+        std::move(dependencies));
+    feeder.join();
+
+    runner.expect(
+        exit_code == 0 && trader->order_query_calls == 1
+            && trader->account_calls == 1 && trader->order_insert_calls == 0
+            && output.str().find("ready=1") != std::string::npos,
+        "live restart must reconcile the old order and suppress duplicate insert");
+    std::filesystem::remove_all(trace_root);
+}
+
+void test_live_runner_refuses_unsafe_latest_trace(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path trace_root{
+        "/tmp/ctp_batch009_unsafe_restart"};
+    std::filesystem::remove_all(trace_root);
+    std::filesystem::create_directories(trace_root / "101");
+    {
+        std::ofstream damaged{trace_root / "101" / "account1.csv"};
+        damaged << "truncated trace";
+    }
+    auto config = make_live_config(1);
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, [] { return true; }, std::move(dependencies));
+    runner.expect(
+        exit_code == 3
+            && error.str().find("latest trace is not safe for restart")
+                != std::string::npos,
+        "order-enabled startup must reject a damaged latest account trace");
+    std::filesystem::remove_all(trace_root);
+}
+
 }
 
 int main()
@@ -662,5 +784,7 @@ int main()
     test_price_normalization_boundaries(runner);
     test_four_account_fault_matrix(runner);
     test_live_runner_isolates_one_failed_account(runner);
+    test_live_runner_restores_latest_identity_before_market(runner);
+    test_live_runner_refuses_unsafe_latest_trace(runner);
     return runner.finish();
 }

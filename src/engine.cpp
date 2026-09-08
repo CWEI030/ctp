@@ -8,6 +8,7 @@
 #include "ctp/trading.hpp"
 
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -18,6 +19,48 @@
 
 namespace ctp {
 namespace {
+
+struct RestartLoad {
+    bool found{false};
+    RestartImage image;
+};
+
+RestartLoad load_latest_restart(
+    const std::filesystem::path& trace_root,
+    std::string_view account_alias)
+{
+    RestartLoad result{};
+    std::filesystem::path latest_path;
+    std::uint64_t latest_run_id = 0;
+    std::error_code iterator_error;
+    std::filesystem::directory_iterator entries{trace_root, iterator_error};
+    if (iterator_error) return result;
+
+    for (const auto& entry : entries) {
+        std::error_code type_error;
+        if (!entry.is_directory(type_error) || type_error) continue;
+        const auto name = entry.path().filename().string();
+        std::uint64_t run_id = 0;
+        const auto parsed = std::from_chars(
+            name.data(), name.data() + name.size(), run_id);
+        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) {
+            continue;
+        }
+        const auto candidate = entry.path()
+            / (std::string{account_alias} + ".csv");
+        if (!std::filesystem::is_regular_file(candidate, type_error)
+            || type_error || (result.found && run_id <= latest_run_id)) {
+            continue;
+        }
+        result.found = true;
+        latest_run_id = run_id;
+        latest_path = candidate;
+    }
+    if (result.found) {
+        result.image = build_restart_image(read_trace_journal(latest_path));
+    }
+    return result;
+}
 
 bool has_tcp_front(std::string_view value) noexcept
 {
@@ -392,7 +435,8 @@ public:
         MarketIngress& ingress,
         std::unique_ptr<TraderApi> api,
         const std::filesystem::path& trace_directory,
-        std::uint64_t run_id)
+        std::uint64_t run_id,
+        const RestartImage& restart_image)
         : live_(config.live()),
           account_index_(account_index),
           ingress_(ingress),
@@ -422,6 +466,10 @@ public:
             journal_.get(),
             run_id,
             config.live().minimum_price_increment);
+        if (restart_image.valid
+            && !session_->restore_restart_image(restart_image)) {
+            initialized_ = false;
+        }
     }
 
     ~LiveAccountWorker()
@@ -654,8 +702,26 @@ int run_live_engine(
         };
     }
 
+    std::vector<RestartLoad> restarts;
+    restarts.reserve(config.accounts().size());
+    if (!dependencies.trace_root.empty()) {
+        for (const auto& account : config.accounts()) {
+            auto restart = load_latest_restart(
+                dependencies.trace_root, account.alias());
+            if (restart.found && !restart.image.valid
+                && config.live().allow_orders) {
+                error << "[error] latest trace is not safe for restart: account="
+                      << account.alias() << '\n';
+                return 3;
+            }
+            restarts.push_back(std::move(restart));
+        }
+    } else {
+        restarts.resize(config.accounts().size());
+    }
+
     const auto run_id = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
     std::filesystem::path trace_directory;
     if (!dependencies.trace_root.empty()) {
@@ -683,7 +749,13 @@ int run_live_engine(
             return 3;
         }
         workers.push_back(std::make_unique<LiveAccountWorker>(
-            config, index, ingress, std::move(api), trace_directory, run_id));
+            config,
+            index,
+            ingress,
+            std::move(api),
+            trace_directory,
+            run_id,
+            restarts[index].image));
         if (!workers.back()->initialized()) {
             error << "[error] cannot start trace journal for account index "
                   << index << '\n';
