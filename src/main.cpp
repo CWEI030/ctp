@@ -43,6 +43,8 @@ int main(int argc, char* argv[])
                   << ", distinct_users=" << distinct_users.size()
                   << ", orders="
                   << (config.live().allow_orders ? "enabled" : "disabled")
+                  << ", acceptance="
+                  << (config.live().acceptance ? "enabled" : "disabled")
                   << '\n';
         return 0;
     }

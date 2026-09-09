@@ -169,6 +169,21 @@ ctp::RuntimeConfig make_live_config(std::size_t account_count)
     return make_live_config(make_accounts(account_count));
 }
 
+ctp::RuntimeConfig make_acceptance_config(
+    std::vector<ctp::AccountConfig> accounts = make_accounts(4))
+{
+    auto base = make_live_config(std::move(accounts));
+    auto live = base.live();
+    live.acceptance = true;
+    return {
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        base.accounts(),
+        {},
+        std::move(live)};
+}
+
 std::unique_ptr<test_support::FakeTraderApi> make_recovering_trader(
     const std::shared_ptr<test_support::FakeTraderMetrics>& metrics,
     bool reject_authentication)
@@ -209,6 +224,108 @@ std::unique_ptr<test_support::FakeTraderApi> make_recovering_trader(
             &account, nullptr, metrics->account_request_id, true);
     };
     return api;
+}
+
+std::unique_ptr<test_support::FakeTraderApi> make_filling_trader(
+    const std::shared_ptr<test_support::FakeTraderMetrics>& metrics,
+    std::size_t account_index,
+    bool reject_authentication = false,
+    bool final_position_nonzero = false)
+{
+    auto api = make_recovering_trader(metrics, reject_authentication);
+    if (reject_authentication) return api;
+    if (final_position_nonzero) {
+        api->on_position = [metrics](auto& self) {
+            if (metrics->position_calls < 2) {
+                self.spi()->OnRspQryInvestorPosition(
+                    nullptr, nullptr, metrics->position_request_id, true);
+                return;
+            }
+            CThostFtdcInvestorPositionField position{};
+            ctp::copy_to_field(position.InstrumentID, "IF2609");
+            position.PosiDirection = THOST_FTDC_PD_Long;
+            position.HedgeFlag = THOST_FTDC_HF_Speculation;
+            position.Position = 1;
+            self.spi()->OnRspQryInvestorPosition(
+                &position, nullptr, metrics->position_request_id, true);
+        };
+    }
+    api->on_order_insert = [metrics, account_index](auto& self) {
+        CThostFtdcTradeField trade{};
+        ctp::copy_to_field(trade.OrderRef, metrics->last_order.OrderRef);
+        ctp::copy_to_field(trade.TradingDay, "20260909");
+        ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+        const auto trade_id = std::to_string(account_index + 1) + "-"
+            + std::string{metrics->last_order.OrderRef};
+        ctp::copy_to_field(trade.TradeID, trade_id);
+        ctp::copy_to_field(trade.InstrumentID, metrics->last_order.InstrumentID);
+        trade.Direction = metrics->last_order.Direction;
+        trade.OffsetFlag = metrics->last_order.CombOffsetFlag[0];
+        trade.Volume = metrics->last_order.VolumeTotalOriginal;
+        trade.Price = metrics->last_order.LimitPrice;
+        self.spi()->OnRtnTrade(&trade);
+    };
+    return api;
+}
+
+int run_acceptance_with_fills(
+    const ctp::RuntimeConfig& config,
+    const std::shared_ptr<FakeLiveMarketState>& market,
+    const std::vector<std::shared_ptr<test_support::FakeTraderMetrics>>& traders,
+    bool reject_first,
+    std::ostringstream& output,
+    std::ostringstream& error,
+    bool first_final_position_nonzero = false)
+{
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    std::size_t next_account = 0;
+    dependencies.create_trader = [
+        &traders, &next_account, reject_first, first_final_position_nonzero](
+                                     const std::string&) {
+        const auto index = next_account++;
+        return make_filling_trader(
+            traders[index], index, reject_first && index == 0,
+            first_final_position_nonzero && index == 0);
+    };
+
+    std::atomic<bool> feeder_stop{false};
+    std::thread feeder([market, &feeder_stop] {
+        while (!market->subscribed.load(std::memory_order_acquire)
+               && !feeder_stop.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        int sequence = 0;
+        while (!feeder_stop.load(std::memory_order_acquire)) {
+            auto below = make_tick(sequence++ % 1000);
+            below.LastPrice = 799.8;
+            below.BidPrice1 = 799.6;
+            below.AskPrice1 = 800.0;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&below);
+            auto crossing = make_tick(sequence++ % 1000);
+            crossing.LastPrice = 800.0;
+            crossing.BidPrice1 = 799.8;
+            crossing.AskPrice1 = 800.2;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&crossing);
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds{2};
+    const auto exit_code = ctp::run_live_engine(
+        config,
+        output,
+        error,
+        [&] { return std::chrono::steady_clock::now() >= deadline; },
+        std::move(dependencies));
+    feeder_stop.store(true, std::memory_order_release);
+    feeder.join();
+    return exit_code;
 }
 
 void test_fixed_event_and_queue(test_support::TestRunner& runner)
@@ -1337,6 +1454,185 @@ void test_live_validation_enforces_traceable_signal_capacity(
         "live validation must reject runs larger than the trace capacity proof");
 }
 
+void test_online_acceptance_configuration_is_strict(
+    test_support::TestRunner& runner)
+{
+    auto too_few = make_acceptance_config(make_accounts(3));
+    runner.expect(
+        ctp::validate_live_engine_config(too_few).find("four")
+            != std::string::npos,
+        "online acceptance must require at least four enabled accounts");
+
+    auto duplicate_accounts = make_accounts(4);
+    duplicate_accounts[3] = ctp::AccountConfig{
+        "account4", "9999", "user1", "password4", "app4", "auth4",
+        "tcp://127.0.0.1:41004"};
+    auto duplicate_user = make_acceptance_config(std::move(duplicate_accounts));
+    runner.expect(
+        ctp::validate_live_engine_config(duplicate_user).find("distinct")
+            != std::string::npos,
+        "online acceptance must prove every configured account is distinct");
+
+    auto normal = make_live_config(4);
+    auto no_orders_live = normal.live();
+    no_orders_live.acceptance = true;
+    no_orders_live.allow_orders = false;
+    ctp::RuntimeConfig no_orders{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        normal.accounts(),
+        {},
+        std::move(no_orders_live)};
+    runner.expect(
+        ctp::validate_live_engine_config(no_orders).find("--allow-orders")
+            != std::string::npos,
+        "acceptance must never run without the explicit order gate");
+
+    auto repeated = make_acceptance_config();
+    auto repeated_live = repeated.live();
+    repeated_live.max_signals_per_run = 2;
+    ctp::RuntimeConfig repeated_signals{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        repeated.accounts(),
+        {},
+        std::move(repeated_live)};
+    runner.expect(
+        ctp::validate_live_engine_config(repeated_signals).find(
+            "max_signals_per_run=1") != std::string::npos,
+        "acceptance must constrain each account to one opening signal");
+}
+
+void test_online_acceptance_requires_every_account_lifecycle(
+    test_support::TestRunner& runner)
+{
+    auto config = make_acceptance_config();
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = run_acceptance_with_fills(
+        config, market, traders, false, output, error);
+
+    runner.expect(exit_code == 0, "all account lifecycles must pass acceptance");
+    for (const auto& trader : traders) {
+        runner.expect(
+            trader->order_insert_calls == 2 && trader->position_calls == 2,
+            "each account must independently open, close, and run a final position query");
+    }
+    for (std::size_t index = 0; index < traders.size(); ++index) {
+        runner.expect(
+            output.str().find(
+                "[acceptance] account=account" + std::to_string(index + 1)
+                + ", status=pass") != std::string::npos,
+            "acceptance output must identify each passing account by alias");
+    }
+}
+
+void test_online_acceptance_failure_does_not_stop_healthy_accounts(
+    test_support::TestRunner& runner)
+{
+    auto config = make_acceptance_config();
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = run_acceptance_with_fills(
+        config, market, traders, true, output, error);
+
+    runner.expect(exit_code != 0, "one failed account must fail online acceptance");
+    runner.expect(
+        traders[0]->order_insert_calls == 0,
+        "the failed account must not submit an order");
+    for (std::size_t index = 1; index < traders.size(); ++index) {
+        runner.expect(
+            traders[index]->order_insert_calls == 2
+                && traders[index]->position_calls == 2,
+            "a failed peer must not stop healthy account lifecycles");
+    }
+    runner.expect(
+        output.str().find("[acceptance] account=account1, status=fail")
+                != std::string::npos
+            && output.str().find("[acceptance] account=account4, status=pass")
+                != std::string::npos,
+        "per-account output must make the failed and healthy outcomes auditable");
+}
+
+void test_online_acceptance_rejects_nonzero_final_position(
+    test_support::TestRunner& runner)
+{
+    auto config = make_acceptance_config();
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = run_acceptance_with_fills(
+        config, market, traders, false, output, error, true);
+
+    runner.expect(
+        exit_code != 0,
+        "a nonzero final broker position must fail online acceptance");
+    runner.expect(
+        output.str().find(
+            "[acceptance] account=account1, status=fail")
+                != std::string::npos
+            && output.str().find("final_long=1, final_short=0")
+                != std::string::npos,
+        "the failing account must expose its reconciled final position");
+    runner.expect(
+        output.str().find("[acceptance] account=account4, status=pass")
+            != std::string::npos,
+        "one non-flat account must not prevent healthy accounts from finishing");
+}
+
+void test_online_acceptance_interruption_is_incomplete(
+    test_support::TestRunner& runner)
+{
+    auto config = make_acceptance_config();
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    std::size_t next_account = 0;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+    dependencies.create_trader = [&traders, &next_account](const std::string&) {
+        return make_recovering_trader(traders[next_account++], false);
+    };
+    std::ostringstream output;
+    std::ostringstream error;
+
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, [] { return true; }, std::move(dependencies));
+
+    runner.expect(
+        exit_code != 0,
+        "stopping before all account lifecycles finish must fail acceptance");
+    runner.expect(
+        output.str().find("[acceptance] result=fail") != std::string::npos
+            && output.str().find("incomplete=4") != std::string::npos,
+        "an interrupted run must report every unfinished account");
+}
+
 }
 
 int main()
@@ -1363,5 +1659,10 @@ int main()
     test_unsafe_restart_freezes_only_its_account(runner);
     test_live_validation_rejects_unresolved_placeholders(runner);
     test_live_validation_enforces_traceable_signal_capacity(runner);
+    test_online_acceptance_configuration_is_strict(runner);
+    test_online_acceptance_requires_every_account_lifecycle(runner);
+    test_online_acceptance_failure_does_not_stop_healthy_accounts(runner);
+    test_online_acceptance_rejects_nonzero_final_position(runner);
+    test_online_acceptance_interruption_is_incomplete(runner);
     return runner.finish();
 }

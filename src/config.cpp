@@ -134,20 +134,23 @@ ConfigResult parse_engine_config(
     std::string config_path;
     bool check_only = false;
     bool allow_orders = false;
+    bool acceptance = false;
     std::unordered_set<std::string_view> seen_options;
 
     for (std::size_t index = 1; index < arguments.size(); ++index) {
         const auto option = arguments[index];
         if (option != "--mode" && option != "--config" && option != "--check"
-            && option != "--allow-orders") {
+            && option != "--allow-orders" && option != "--acceptance") {
             return failure("unknown engine command-line option");
         }
         if (!seen_options.insert(option).second) {
             return failure("duplicate engine command-line option");
         }
-        if (option == "--check" || option == "--allow-orders") {
+        if (option == "--check" || option == "--allow-orders"
+            || option == "--acceptance") {
             if (option == "--check") check_only = true;
-            else allow_orders = true;
+            else if (option == "--allow-orders") allow_orders = true;
+            else acceptance = true;
             continue;
         }
         if (index + 1 >= arguments.size()) {
@@ -538,6 +541,7 @@ ConfigResult parse_engine_config(
         return failure("at least one enabled account is required");
     }
 
+    live.acceptance = acceptance;
     RuntimeConfig config{
         Mode::Engine,
         {},

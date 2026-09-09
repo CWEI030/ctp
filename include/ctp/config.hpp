@@ -57,6 +57,7 @@ struct LiveConfig {
     double minimum_price_increment{0.0};
     bool check_only{false};
     bool allow_orders{false};
+    bool acceptance{false};
     bool strategy_enabled{false};
     std::int64_t trigger_price_ticks{0};
     std::int64_t entry_protection_ticks{0};

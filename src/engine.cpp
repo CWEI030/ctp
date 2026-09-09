@@ -15,6 +15,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 namespace ctp {
@@ -430,6 +431,12 @@ private:
 
 class LiveAccountWorker final {
 public:
+    enum class AcceptanceStatus : std::uint8_t {
+        Pending,
+        Pass,
+        Fail,
+    };
+
     LiveAccountWorker(
         const RuntimeConfig& config,
         std::size_t account_index,
@@ -440,6 +447,7 @@ public:
         const RestartImage& restart_image,
         bool start_blocked = false)
         : live_(config.live()),
+          account_alias_(config.accounts()[account_index].alias()),
           account_index_(account_index),
           ingress_(ingress),
           strategy_(make_strategy(config.live()))
@@ -448,6 +456,8 @@ public:
         if (start_blocked) {
             initialized_ = false;
             failed_.store(true, std::memory_order_release);
+            acceptance_status_.store(
+                AcceptanceStatus::Fail, std::memory_order_release);
             return;
         }
         if (!trace_directory.empty()) {
@@ -459,6 +469,8 @@ public:
                 journal_.reset();
                 initialized_ = false;
                 failed_.store(true, std::memory_order_release);
+                acceptance_status_.store(
+                    AcceptanceStatus::Fail, std::memory_order_release);
                 return;
             }
         }
@@ -483,6 +495,8 @@ public:
             journal_.reset();
             initialized_ = false;
             failed_.store(true, std::memory_order_release);
+            acceptance_status_.store(
+                AcceptanceStatus::Fail, std::memory_order_release);
         }
     }
 
@@ -518,6 +532,30 @@ public:
         return submitted_.load(std::memory_order_relaxed);
     }
 
+    AcceptanceStatus acceptance_status() const noexcept
+    {
+        return acceptance_status_.load(std::memory_order_acquire);
+    }
+
+    AccountAcceptanceSnapshot acceptance_snapshot() const noexcept
+    {
+        return {
+            acceptance_entry_submitted_.load(std::memory_order_acquire),
+            acceptance_entry_filled_.load(std::memory_order_acquire),
+            acceptance_exit_submitted_.load(std::memory_order_acquire),
+            acceptance_exit_filled_.load(std::memory_order_acquire),
+            acceptance_lifecycle_failed_.load(std::memory_order_acquire),
+        };
+    }
+
+    bool acceptance_final_query_complete() const noexcept
+    {
+        return acceptance_final_query_complete_.load(
+            std::memory_order_acquire);
+    }
+
+    const std::string& account_alias() const noexcept { return account_alias_; }
+
     bool final_position_known() const noexcept
     {
         return final_position_known_;
@@ -528,7 +566,82 @@ public:
         return final_long_position_ == 0 && final_short_position_ == 0;
     }
 
+    std::int32_t final_long_position() const noexcept
+    {
+        return final_long_position_;
+    }
+
+    std::int32_t final_short_position() const noexcept
+    {
+        return final_short_position_;
+    }
+
 private:
+    void update_acceptance(const RecoverySnapshot& recovery) noexcept
+    {
+        if (!live_.acceptance || !session_) return;
+        const auto observed = session_->acceptance_snapshot();
+        acceptance_entry_submitted_.store(
+            observed.entry_orders_submitted, std::memory_order_release);
+        acceptance_entry_filled_.store(
+            observed.entry_filled_quantity, std::memory_order_release);
+        acceptance_exit_submitted_.store(
+            observed.exit_orders_submitted, std::memory_order_release);
+        acceptance_exit_filled_.store(
+            observed.exit_filled_quantity, std::memory_order_release);
+        acceptance_lifecycle_failed_.store(
+            observed.lifecycle_failed, std::memory_order_release);
+
+        const auto execution = session_->execution_snapshot();
+        if (recovery.phase == RecoveryPhase::Frozen
+            || (recovery.phase == RecoveryPhase::Ready && execution.frozen)
+            || observed.lifecycle_failed
+            || observed.entry_orders_submitted > 1
+            || observed.entry_filled_quantity > 1
+            || observed.exit_filled_quantity > 1) {
+            acceptance_status_.store(
+                AcceptanceStatus::Fail, std::memory_order_release);
+            return;
+        }
+        if (acceptance_status() != AcceptanceStatus::Pending) return;
+        if (!acceptance_final_query_started_) {
+            if (observed.entry_orders_submitted != 1
+                || observed.entry_filled_quantity != 1
+                || observed.exit_orders_submitted == 0
+                || observed.exit_filled_quantity != 1
+                || recovery.phase != RecoveryPhase::Ready) {
+                return;
+            }
+            PositionSnapshot position{};
+            const bool has_position = session_->position_snapshot(
+                live_.instrument, position);
+            if (has_position
+                && (!position.known || position.long_quantity != 0
+                    || position.short_quantity != 0)) {
+                acceptance_status_.store(
+                    AcceptanceStatus::Fail, std::memory_order_release);
+                return;
+            }
+            // 成交回报只证明运行中状态；验收终态必须再走一遍既有柜台查询链。
+            acceptance_final_query_started_ =
+                session_->request_reconciliation();
+            return;
+        }
+        if (recovery.phase != RecoveryPhase::Ready) return;
+
+        PositionSnapshot position{};
+        const bool has_position = session_->position_snapshot(
+            live_.instrument, position);
+        final_position_known_ = !has_position || position.known;
+        final_long_position_ = has_position ? position.long_quantity : 0;
+        final_short_position_ = has_position ? position.short_quantity : 0;
+        acceptance_final_query_complete_.store(true, std::memory_order_release);
+        acceptance_status_.store(
+            final_position_known_ && final_position_flat()
+                ? AcceptanceStatus::Pass : AcceptanceStatus::Fail,
+            std::memory_order_release);
+    }
+
     static StrategyConfig make_strategy(const LiveConfig& live)
     {
         StrategyConfig config{};
@@ -633,9 +746,14 @@ private:
             if (recovery.phase == RecoveryPhase::Frozen) {
                 failed_.store(true, std::memory_order_release);
             }
+            update_acceptance(recovery);
             if (ingress_.snapshot(account_index_).overflowed) {
                 session_->mark_fault(AccountFault::MarketQueueOverflow);
                 failed_.store(true, std::memory_order_release);
+                if (live_.acceptance) {
+                    acceptance_status_.store(
+                        AcceptanceStatus::Fail, std::memory_order_release);
+                }
             }
 
             MarketEvent market{};
@@ -662,12 +780,16 @@ private:
                 if (result.code == SubmitCode::Submitted) {
                     ++orders_in_window_;
                     submitted_.fetch_add(1, std::memory_order_relaxed);
+                } else if (live_.acceptance) {
+                    acceptance_status_.store(
+                        AcceptanceStatus::Fail, std::memory_order_release);
                 }
             }
             if (drained == 0) std::this_thread::yield();
         }
         session_->drain_callbacks();
         const auto recovery = session_->recovery_snapshot();
+        update_acceptance(recovery);
         PositionSnapshot position{};
         const bool has_position = session_->position_snapshot(
             live_.instrument, position);
@@ -683,6 +805,7 @@ private:
     }
 
     const LiveConfig& live_;
+    std::string account_alias_;
     std::size_t account_index_{0};
     MarketIngress& ingress_;
     ThresholdStrategy strategy_;
@@ -692,6 +815,15 @@ private:
     std::atomic<bool> ready_{false};
     std::atomic<bool> failed_{false};
     std::atomic<std::uint64_t> submitted_{0};
+    std::atomic<AcceptanceStatus> acceptance_status_{
+        AcceptanceStatus::Pending};
+    std::atomic<std::uint32_t> acceptance_entry_submitted_{0};
+    std::atomic<std::uint32_t> acceptance_entry_filled_{0};
+    std::atomic<std::uint32_t> acceptance_exit_submitted_{0};
+    std::atomic<std::uint32_t> acceptance_exit_filled_{0};
+    std::atomic<bool> acceptance_lifecycle_failed_{false};
+    std::atomic<bool> acceptance_final_query_complete_{false};
+    bool acceptance_final_query_started_{false};
     std::int64_t rate_window_start_ns_{0};
     std::uint32_t orders_in_window_{0};
     std::int32_t final_long_position_{0};
@@ -728,6 +860,24 @@ std::string validate_live_config(const RuntimeConfig& config)
             || contains_placeholder(account.auth_code())
             || contains_placeholder(account.trader_front())) {
             return "an enabled account still contains a placeholder";
+        }
+    }
+    if (live.acceptance) {
+        if (!live.allow_orders) {
+            return "--acceptance requires --allow-orders";
+        }
+        if (config.accounts().size() < 4) {
+            return "four-account acceptance requires at least four enabled accounts";
+        }
+        std::unordered_set<std::string_view> users;
+        for (const auto& account : config.accounts()) {
+            users.insert(account.user_id());
+        }
+        if (users.size() != config.accounts().size()) {
+            return "acceptance requires distinct user IDs for every account";
+        }
+        if (live.max_signals_per_run != 1) {
+            return "acceptance requires max_signals_per_run=1";
         }
     }
     if (!live.allow_orders) return {};
@@ -933,7 +1083,8 @@ int run_live_engine(
            << " independent account worker(s); orders="
            << (config.live().allow_orders ? "enabled" : "disabled") << '\n';
 
-    while (!stop_requested()) {
+    bool stopped_before_acceptance = false;
+    while (true) {
         if (market->state() == LiveMarketState::Running) {
             if (!market_was_running) {
                 // 成功运行后开启新一轮故障转移预算，供后续重连失败使用。
@@ -948,6 +1099,18 @@ int run_live_engine(
                 error << "[error] all market account credentials failed\n";
                 return 3;
             }
+        }
+        if (config.live().acceptance) {
+            const bool all_terminal = std::all_of(
+                workers.begin(), workers.end(), [](const auto& worker) {
+                    return worker->acceptance_status()
+                        != LiveAccountWorker::AcceptanceStatus::Pending;
+                });
+            if (all_terminal) break;
+        }
+        if (stop_requested()) {
+            stopped_before_acceptance = config.live().acceptance;
+            break;
         }
         std::this_thread::yield();
     }
@@ -969,11 +1132,56 @@ int run_live_engine(
             ++flat;
         }
         submitted += worker->submitted();
+        if (config.live().acceptance) {
+            const auto status = worker->acceptance_status();
+            const auto observed = worker->acceptance_snapshot();
+            const char* status_text = status
+                    == LiveAccountWorker::AcceptanceStatus::Pass
+                ? "pass"
+                : status == LiveAccountWorker::AcceptanceStatus::Fail
+                    ? "fail" : "incomplete";
+            output << "[acceptance] account=" << worker->account_alias()
+                   << ", status=" << status_text
+                   << ", entry_submitted=" << observed.entry_orders_submitted
+                   << ", entry_filled=" << observed.entry_filled_quantity
+                   << ", exit_submitted=" << observed.exit_orders_submitted
+                   << ", exit_filled=" << observed.exit_filled_quantity
+                   << ", lifecycle_failed="
+                   << (observed.lifecycle_failed ? 1 : 0)
+                   << ", final_query="
+                   << (worker->acceptance_final_query_complete()
+                           ? "complete" : "incomplete")
+                   << ", final_position_known="
+                   << (worker->final_position_known() ? 1 : 0)
+                   << ", final_long=" << worker->final_long_position()
+                   << ", final_short=" << worker->final_short_position()
+                   << '\n';
+        }
     }
     output << "[info] live engine stopped; ready=" << ready
            << ", failed=" << failed << ", submitted=" << submitted
            << ", flat=" << flat
            << ", position_unknown=" << position_unknown << '\n';
+    if (config.live().acceptance) {
+        std::size_t passed = 0;
+        std::size_t acceptance_failed = 0;
+        std::size_t incomplete = 0;
+        for (const auto& worker : workers) {
+            const auto status = worker->acceptance_status();
+            if (status == LiveAccountWorker::AcceptanceStatus::Pass) ++passed;
+            else if (status == LiveAccountWorker::AcceptanceStatus::Fail) {
+                ++acceptance_failed;
+            } else {
+                ++incomplete;
+            }
+        }
+        output << "[acceptance] result="
+               << (passed == workers.size() ? "pass" : "fail")
+               << ", passed=" << passed
+               << ", failed=" << acceptance_failed
+               << ", incomplete=" << incomplete << '\n';
+        return stopped_before_acceptance || passed != workers.size() ? 1 : 0;
+    }
     return 0;
 }
 

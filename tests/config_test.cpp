@@ -356,6 +356,19 @@ void test_engine_parses_live_runtime_and_explicit_order_gate(TestRunner& runner)
         "check mode must be retained without implicitly enabling orders");
 }
 
+void test_engine_parses_explicit_online_acceptance_gate(TestRunner& runner)
+{
+    TemporaryAccountFile file{make_live_ini(4)};
+    const auto result = parse(
+        {"engine", "--mode", "live", "--config", file.path(),
+         "--allow-orders", "--acceptance"},
+        {});
+
+    runner.expect(
+        result.config.has_value() && result.config->live().acceptance,
+        "online acceptance must require and retain an explicit command-line gate");
+}
+
 void test_live_orders_require_margin_and_valid_trading_windows(TestRunner& runner)
 {
     auto missing_margin = make_live_ini(1);
@@ -722,6 +735,7 @@ int main()
     test_valid_account(runner);
     test_engine_accepts_variable_account_count(runner);
     test_engine_parses_live_runtime_and_explicit_order_gate(runner);
+    test_engine_parses_explicit_online_acceptance_gate(runner);
     test_live_orders_require_margin_and_valid_trading_windows(runner);
     test_benchmark_configuration(runner);
     test_engine_uses_default_account_config_path(runner);

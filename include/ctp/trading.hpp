@@ -346,6 +346,14 @@ struct AccountExecutionSnapshot {
     std::uint64_t active_exit_order_id{0};
 };
 
+struct AccountAcceptanceSnapshot {
+    std::uint32_t entry_orders_submitted{0};
+    std::uint32_t entry_filled_quantity{0};
+    std::uint32_t exit_orders_submitted{0};
+    std::uint32_t exit_filled_quantity{0};
+    bool lifecycle_failed{false};
+};
+
 // 一个实例只属于一个账户，并由该账户执行线程串行修改。
 class AccountTradingState {
 public:
@@ -431,6 +439,8 @@ public:
         const RiskSnapshot& snapshot) noexcept;
     void mark_fault(AccountFault fault) noexcept;
     AccountExecutionSnapshot execution_snapshot() const noexcept;
+    AccountAcceptanceSnapshot acceptance_snapshot() const noexcept;
+    bool request_reconciliation() noexcept;
     std::size_t drain_callbacks() noexcept;
     bool order_snapshot(
         std::uint64_t client_order_id,

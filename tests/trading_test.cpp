@@ -991,8 +991,9 @@ void test_local_and_exchange_rejections_are_distinct(
     exchange_reject.order_snapshot(submitted.client_order_id, exchange_order);
     runner.expect(
         submitted.code == ctp::SubmitCode::Submitted
-            && exchange_order.state == ctp::OrderState::Rejected,
-        "a zero API return followed by an error callback is an exchange rejection");
+            && exchange_order.state == ctp::OrderState::Rejected
+            && exchange_reject.acceptance_snapshot().lifecycle_failed,
+        "an exchange rejection must also fail the current acceptance lifecycle");
 }
 
 void test_callback_queue_overflow_is_explicit(

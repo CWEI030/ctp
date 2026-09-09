@@ -306,7 +306,7 @@ run_simnow() {
     local check_output
     if ! check_output="$(
         ./build/ctp_client engine --mode live --config "$config_path" \
-            --check --allow-orders
+            --check --allow-orders --acceptance
     )"; then
         echo "[blocked] SimNow configuration preflight failed" >&2
         return 3
@@ -331,7 +331,7 @@ run_simnow() {
     fi
 
     ./build/ctp_client engine --mode live --config "$config_path" \
-        --allow-orders
+        --allow-orders --acceptance
 }
 
 case "$1" in

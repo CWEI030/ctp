@@ -923,6 +923,7 @@ struct AccountTradingSession::Impl {
     std::uint32_t alert_count{0};
     std::uint32_t close_orders_submitted{0};
     std::uint32_t close_reprices{0};
+    AccountAcceptanceSnapshot acceptance{};
     AutoClosePolicy policy{};
     ExitState exit{};
     RecoverySnapshot recovery{};
@@ -1561,6 +1562,11 @@ SubmitResult AccountTradingSession::submit(
         free_record->active_open = true;
     }
     free_record->result.code = SubmitCode::Submitted;
+    if (intent.offset == Offset::Open) {
+        ++impl_->acceptance.entry_orders_submitted;
+    } else {
+        ++impl_->acceptance.exit_orders_submitted;
+    }
     impl_->trace(TraceStage::OrderSubmitted, free_record);
     return free_record->result;
 }
@@ -2076,6 +2082,13 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             event.trade.client_order_id = record->result.client_order_id;
             result = impl_->state.apply_trade(event.trade);
             if (result.code == ApplyCode::Applied) {
+                if (record->intent.offset == Offset::Open) {
+                    impl_->acceptance.entry_filled_quantity +=
+                        static_cast<std::uint32_t>(event.trade.quantity);
+                } else {
+                    impl_->acceptance.exit_filled_quantity +=
+                        static_cast<std::uint32_t>(event.trade.quantity);
+                }
                 impl_->trace(
                     TraceStage::Trade, record, 0, event.trade.quantity);
             }
@@ -2088,6 +2101,12 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 {record->result.client_order_id,
                  type,
                  event.cumulative_filled});
+            if (result.code == ApplyCode::Applied
+                && (type == OrderReportType::Rejected
+                    || (record->intent.offset == Offset::Open
+                        && type == OrderReportType::Canceled))) {
+                impl_->acceptance.lifecycle_failed = true;
+            }
             impl_->trace_order_report(
                 *record, type, result, event.cumulative_filled);
         }
@@ -2200,6 +2219,25 @@ AccountExecutionSnapshot AccountTradingSession::execution_snapshot() const noexc
         impl_->exit.pending_quantity,
         impl_->exit.active_client_order_id,
     };
+}
+
+AccountAcceptanceSnapshot
+AccountTradingSession::acceptance_snapshot() const noexcept
+{
+    return impl_->acceptance;
+}
+
+bool AccountTradingSession::request_reconciliation() noexcept
+{
+    if (impl_->recovery.phase != RecoveryPhase::Ready
+        || reconciliation_required()) {
+        return false;
+    }
+    if (impl_->begin_query_reconciliation() != 0) {
+        impl_->recovery_failure(RecoveryFailure::RequestRejected);
+        return false;
+    }
+    return true;
 }
 
 void AccountTradingSession::OnFrontDisconnected(int)

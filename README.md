@@ -161,7 +161,7 @@ export CTP_ACCOUNT_account1_PASSWORD='<temporary-password>'
   --config config/accounts.local.ini --check
 ```
 
-四账户验收预检会额外要求至少四个启用账户和四个不同的用户代码：
+四账户验收预检会额外要求至少四个启用账户、每个启用账户使用不同的用户代码、显式报单开关以及单次只产生一个信号：
 
 ```bash
 scripts/acceptance.sh simnow preflight
@@ -182,7 +182,9 @@ scripts/acceptance.sh simnow online
 unset CTP_SIMNOW_CONFIRM
 ```
 
-可通过 `CTP_SIMNOW_CONFIG` 指定其他本地配置路径。引擎持续运行到 Ctrl+C，轨迹写入 `runtime/traces/<run_id>/<账户别名>.csv`，CTP 流文件写入 `runtime/flow/<账户别名>/`。`runtime/` 整体被 Git 忽略。
+可通过 `CTP_SIMNOW_CONFIG` 指定其他本地配置路径。在线脚本启用专用 `--acceptance` 模式：每个配置中的启用账户都必须分别完成一次开仓报单、开仓成交、自动平仓报单、平仓成交，以及订单、成交、持仓和资金的最终柜台核对；最终持仓必须已知且多空均为零。任一账户失败、阶段缺失、重复开仓或在完成前按 Ctrl+C，进程都返回非零；故障账户不会阻止其他账户继续完成自己的链路。每个账户及总结果均输出可机器解析的 `[acceptance]` 行，不包含凭据。
+
+轨迹写入 `runtime/traces/<run_id>/<账户别名>.csv`，CTP 流文件写入 `runtime/flow/<账户别名>/`。`runtime/` 整体被 Git 忽略。普通 `engine --mode live` 不启用严格验收，仍持续运行到 Ctrl+C。
 
 前置地址和服务时间可能变化。联网前应以 [SimNow 官方产品与服务页面](https://www.simnow.com.cn/product.action)公布的信息为准。
 
