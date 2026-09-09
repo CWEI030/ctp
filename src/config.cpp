@@ -82,6 +82,50 @@ bool is_safe_account_alias(std::string_view value)
     return true;
 }
 
+bool parse_clock_ms(std::string_view text, std::int32_t& result) noexcept
+{
+    if (text.size() != 8 || text[2] != ':' || text[5] != ':') return false;
+    const auto digit = [](char value) { return value >= '0' && value <= '9'; };
+    if (!digit(text[0]) || !digit(text[1]) || !digit(text[3])
+        || !digit(text[4]) || !digit(text[6]) || !digit(text[7])) {
+        return false;
+    }
+    const int hour = (text[0] - '0') * 10 + text[1] - '0';
+    const int minute = (text[3] - '0') * 10 + text[4] - '0';
+    const int second = (text[6] - '0') * 10 + text[7] - '0';
+    if (hour > 23 || minute > 59 || second > 59) return false;
+    result = (hour * 3'600 + minute * 60 + second) * 1'000;
+    return true;
+}
+
+bool parse_trading_windows(
+    std::string_view text,
+    std::vector<TradingWindow>& windows)
+{
+    if (text.empty()) return false;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const auto comma = text.find(',', begin);
+        const auto item = text.substr(
+            begin,
+            comma == std::string_view::npos ? text.size() - begin : comma - begin);
+        const auto separator = item.find('-');
+        TradingWindow window{};
+        if (separator == std::string_view::npos
+            || item.find('-', separator + 1) != std::string_view::npos
+            || !parse_clock_ms(item.substr(0, separator), window.start_ms)
+            || !parse_clock_ms(item.substr(separator + 1), window.end_ms)
+            || window.start_ms == window.end_ms) {
+            return false;
+        }
+        windows.push_back(window);
+        if (comma == std::string_view::npos) return true;
+        begin = comma + 1;
+        if (begin == text.size()) return false;
+    }
+    return false;
+}
+
 ConfigResult parse_engine_config(
     const std::vector<std::string_view>& arguments,
     const EnvironmentReader& read_environment)
@@ -244,7 +288,8 @@ ConfigResult parse_engine_config(
         "max_order_volume", "max_net_position", "max_active_open_orders",
         "max_orders_per_day", "max_cancels_per_day",
         "max_order_rate_per_second", "max_price_deviation_ticks",
-        "min_available_funds", "market_stale_after_ms", "kill_switch"};
+        "margin_per_lot", "min_available_funds", "trading_windows",
+        "market_stale_after_ms", "kill_switch"};
     std::string unknown = reject_unknown(engine_fields, allowed_engine);
     if (unknown.empty()) {
         unknown = reject_unknown(strategy_fields, allowed_strategy);
@@ -388,6 +433,22 @@ ConfigResult parse_engine_config(
         }
         live.minimum_available_funds =
             static_cast<std::int64_t>(std::llround(amount * 100.0));
+    }
+    if (const auto text = value(risk_fields, "margin_per_lot"); !text.empty()) {
+        double amount = 0.0;
+        if (!parse_double(text, amount) || amount <= 0.0
+            || amount * 100.0 > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+            return failure("margin_per_lot must be a positive amount");
+        }
+        live.margin_per_lot =
+            static_cast<std::int64_t>(std::llround(amount * 100.0));
+        if (live.margin_per_lot <= 0) {
+            return failure("margin_per_lot must be at least 0.01");
+        }
+    }
+    if (const auto text = value(risk_fields, "trading_windows"); !text.empty()
+        && !parse_trading_windows(text, live.trading_windows)) {
+        return failure("trading_windows must contain valid HH:MM:SS-HH:MM:SS ranges");
     }
     if (const auto text = value(risk_fields, "kill_switch");
         !text.empty() && !parse_bool(text, live.kill_switch)) {

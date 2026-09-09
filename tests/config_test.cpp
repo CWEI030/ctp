@@ -159,7 +159,9 @@ std::string make_live_ini(std::size_t enabled_accounts)
         "max_cancels_per_day=4\n"
         "max_order_rate_per_second=1\n"
         "max_price_deviation_ticks=2\n"
+        "margin_per_lot=150000.25\n"
         "min_available_funds=10000.50\n"
+        "trading_windows=09:30:00-11:30:00,21:00:00-02:30:00\n"
         "market_stale_after_ms=1000\n"
         "kill_switch=false\n\n"
         + make_accounts_ini(enabled_accounts);
@@ -328,7 +330,14 @@ void test_engine_parses_live_runtime_and_explicit_order_gate(TestRunner& runner)
             && live.minimum_price_increment == 0.2
             && live.strategy_enabled
             && live.trigger_price_ticks == 4000
+            && live.margin_per_lot == 15'000'025
             && live.minimum_available_funds == 1'000'050
+            && live.trading_windows.size() == 2
+            && live.trading_windows[0].contains(9 * 3'600'000 + 30 * 60'000)
+            && !live.trading_windows[0].contains(11 * 3'600'000 + 30 * 60'000)
+            && live.trading_windows[1].contains(23 * 3'600'000)
+            && live.trading_windows[1].contains(2 * 3'600'000)
+            && !live.trading_windows[1].contains(3 * 3'600'000)
             && !live.kill_switch,
         "live sections and the command-line order gate must be retained");
 
@@ -345,6 +354,35 @@ void test_engine_parses_live_runtime_and_explicit_order_gate(TestRunner& runner)
         checked.config.has_value() && checked.config->live().check_only
             && !checked.config->live().allow_orders,
         "check mode must be retained without implicitly enabling orders");
+}
+
+void test_live_orders_require_margin_and_valid_trading_windows(TestRunner& runner)
+{
+    auto missing_margin = make_live_ini(1);
+    missing_margin = replace_account_field(
+        std::move(missing_margin), "margin_per_lot", "0");
+    TemporaryAccountFile missing_margin_file{missing_margin};
+    expect_error_contains(
+        runner,
+        parse(
+            {"engine", "--mode", "live", "--config",
+             missing_margin_file.path(), "--allow-orders"},
+            {}),
+        "margin_per_lot");
+
+    auto invalid_windows = make_live_ini(1);
+    invalid_windows = replace_account_field(
+        std::move(invalid_windows),
+        "trading_windows",
+        "09:30:00-09:30:00");
+    TemporaryAccountFile invalid_windows_file{invalid_windows};
+    expect_error_contains(
+        runner,
+        parse(
+            {"engine", "--mode", "live", "--config",
+             invalid_windows_file.path(), "--allow-orders"},
+            {}),
+        "trading_windows");
 }
 
 void test_benchmark_configuration(TestRunner& runner)
@@ -684,6 +722,7 @@ int main()
     test_valid_account(runner);
     test_engine_accepts_variable_account_count(runner);
     test_engine_parses_live_runtime_and_explicit_order_gate(runner);
+    test_live_orders_require_margin_and_valid_trading_windows(runner);
     test_benchmark_configuration(runner);
     test_engine_uses_default_account_config_path(runner);
     test_engine_rejects_zero_enabled_accounts(runner);

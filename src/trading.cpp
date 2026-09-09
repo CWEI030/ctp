@@ -910,6 +910,12 @@ struct AccountTradingSession::Impl {
     int expected_recovery_request_id{0};
     int next_action_ref{1};
     std::uint32_t daily_cancels{0};
+    std::array<char, kTradingDayCapacity> trading_day{};
+    std::array<char, kTradingDayCapacity> restored_trading_day{};
+    std::uint32_t restored_daily_signals{0};
+    std::uint32_t restored_daily_orders{0};
+    std::uint32_t restored_daily_cancels{0};
+    bool restored_daily_limits_pending{false};
     bool reconciliation{false};
     bool frozen{false};
     AccountFault fault{AccountFault::None};
@@ -1191,11 +1197,18 @@ AccountTradingSession::~AccountTradingSession()
     }
 }
 
-void AccountTradingSession::activate(
+bool AccountTradingSession::activate(
     int front_id,
     int session_id,
-    std::string_view max_order_ref) noexcept
+    std::string_view max_order_ref,
+    std::string_view trading_day) noexcept
 {
+    const bool valid_day = trading_day.size() == 8
+        && std::all_of(trading_day.begin(), trading_day.end(), [](char value) {
+               return value >= '0' && value <= '9';
+           });
+    if (!valid_day) return false;
+
     impl_->front_id = front_id;
     impl_->session_id = session_id;
     std::uint64_t parsed = 0;
@@ -1206,6 +1219,25 @@ void AccountTradingSession::activate(
         && parsed < std::numeric_limits<std::uint64_t>::max()) {
         impl_->next_order_ref = std::max(impl_->next_order_ref, parsed + 1);
     }
+    const auto previous_day = field_view(impl_->trading_day);
+    if (impl_->restored_daily_limits_pending) {
+        if (field_view(impl_->restored_trading_day) == trading_day) {
+            impl_->daily_signals = impl_->restored_daily_signals;
+            impl_->daily_orders = impl_->restored_daily_orders;
+            impl_->daily_cancels = impl_->restored_daily_cancels;
+        } else {
+            impl_->daily_signals = 0;
+            impl_->daily_orders = 0;
+            impl_->daily_cancels = 0;
+        }
+        impl_->restored_daily_limits_pending = false;
+    } else if (!previous_day.empty() && previous_day != trading_day) {
+        impl_->daily_signals = 0;
+        impl_->daily_orders = 0;
+        impl_->daily_cancels = 0;
+    }
+    copy_to_field(impl_->trading_day, trading_day);
+    return true;
 }
 
 void AccountTradingSession::start()
@@ -1223,9 +1255,17 @@ void AccountTradingSession::start()
 bool AccountTradingSession::restore_restart_image(
     const RestartImage& image) noexcept
 {
-    if (!image.valid || image.account_id != impl_->account_id
+    const bool valid_day = image.trading_day.size() == 8
+        && std::all_of(
+            image.trading_day.begin(),
+            image.trading_day.end(),
+            [](char value) { return value >= '0' && value <= '9'; });
+    if (!image.valid || image.account_id != impl_->account_id || !valid_day
         || impl_->recovery.phase != RecoveryPhase::Idle
-        || image.uncertain_orders.size() > impl_->signals.size()) {
+        || image.uncertain_orders.size() > impl_->signals.size()
+        || image.daily_signals > impl_->limits.max_daily_signals
+        || image.daily_orders > impl_->limits.max_daily_orders
+        || image.daily_cancels > impl_->limits.max_daily_cancels) {
         return false;
     }
     for (const auto& restored : image.uncertain_orders) {
@@ -1281,9 +1321,35 @@ bool AccountTradingSession::restore_restart_image(
         impl_->next_client_order_id, image.next_client_order_id);
     impl_->next_order_ref = std::max(
         impl_->next_order_ref, image.next_order_ref);
+    copy_to_field(impl_->restored_trading_day, image.trading_day);
+    impl_->restored_daily_signals = image.daily_signals;
+    impl_->restored_daily_orders = image.daily_orders;
+    impl_->restored_daily_cancels = image.daily_cancels;
+    impl_->restored_daily_limits_pending = true;
     impl_->frozen = true;
     impl_->reconciliation = true;
     return true;
+}
+
+bool AccountTradingSession::checkpoint_restart_state() noexcept
+{
+    if (impl_->trace_sink == nullptr || field_view(impl_->trading_day).empty()) {
+        return false;
+    }
+    TraceEvent event{};
+    event.trace_id.run_id = impl_->run_id;
+    event.sequence = ++impl_->trace_sequence;
+    event.stage = TraceStage::RestartCheckpoint;
+    event.trading_day = impl_->trading_day;
+    event.daily_signals = impl_->daily_signals;
+    event.daily_orders = impl_->daily_orders;
+    event.daily_cancels = impl_->daily_cancels;
+    return impl_->trace_sink->try_record(event);
+}
+
+DailyLimitSnapshot AccountTradingSession::daily_limit_snapshot() const noexcept
+{
+    return {impl_->daily_signals, impl_->daily_orders, impl_->daily_cancels};
 }
 
 RecoverySnapshot AccountTradingSession::recovery_snapshot() const noexcept
@@ -1731,11 +1797,13 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                        || !event.has_payload) {
                 impl_->recovery_failure(RecoveryFailure::ResponseError);
             } else {
-                activate(
+                if (!activate(
                     event.login.FrontID,
                     event.login.SessionID,
-                    event.login.MaxOrderRef);
-                if (impl_->begin_query_reconciliation() != 0) {
+                    event.login.MaxOrderRef,
+                    event.login.TradingDay)) {
+                    impl_->recovery_failure(RecoveryFailure::ResponseError);
+                } else if (impl_->begin_query_reconciliation() != 0) {
                     impl_->recovery_failure(RecoveryFailure::RequestRejected);
                 }
             }

@@ -437,12 +437,18 @@ public:
         std::unique_ptr<TraderApi> api,
         const std::filesystem::path& trace_directory,
         std::uint64_t run_id,
-        const RestartImage& restart_image)
+        const RestartImage& restart_image,
+        bool restart_blocked = false)
         : live_(config.live()),
           account_index_(account_index),
           ingress_(ingress),
           strategy_(make_strategy(config.live()))
     {
+        // 某账户恢复事实不完整时只冻结该账户，不创建交易连接，也不阻塞同进程内的健康账户。
+        if (restart_blocked) {
+            failed_.store(true, std::memory_order_release);
+            return;
+        }
         if (!trace_directory.empty()) {
             journal_ = std::make_unique<AsyncTraceJournal>(
                 trace_directory
@@ -533,6 +539,7 @@ private:
         copy_to_field(limits.allowed_instrument, live.instrument);
         limits.max_market_age_ns = live.market_stale_after_ns;
         limits.max_slippage_ticks = live.max_price_deviation_ticks;
+        limits.margin_per_lot = live.margin_per_lot;
         limits.minimum_available_after_order = live.minimum_available_funds;
         limits.max_daily_signals = live.max_signals_per_run;
         limits.max_daily_orders = live.max_orders_per_day;
@@ -575,7 +582,12 @@ private:
         risk.logged_in = recovery.phase == RecoveryPhase::Ready;
         risk.reconciled = recovery.phase == RecoveryPhase::Ready;
         risk.frozen = execution.frozen;
-        risk.trading_window_open = true;
+        risk.trading_window_open = std::any_of(
+            live_.trading_windows.begin(),
+            live_.trading_windows.end(),
+            [&market](const TradingWindow& window) {
+                return window.contains(market.exchange_time_ms);
+            });
         risk.global_kill_switch = live_.kill_switch || !live_.allow_orders;
         risk.market_valid = market.status == MarketDataStatus::Valid;
         risk.funds_known = recovery.funds_known;
@@ -595,6 +607,15 @@ private:
 
     void run(std::atomic<bool>& stopping) noexcept
     {
+        if (!session_) {
+            MarketEvent discarded{};
+            while (!stopping.load(std::memory_order_acquire)) {
+                while (ingress_.try_pop(account_index_, discarded)) {
+                }
+                std::this_thread::yield();
+            }
+            return;
+        }
         session_->start();
         while (!stopping.load(std::memory_order_acquire)) {
             session_->drain_callbacks();
@@ -649,6 +670,7 @@ private:
             final_long_position_ = position.long_quantity;
             final_short_position_ = position.short_quantity;
         }
+        session_->checkpoint_restart_state();
         session_.reset();
         if (journal_) journal_->stop();
     }
@@ -711,6 +733,7 @@ std::string validate_live_config(const RuntimeConfig& config)
         || live.max_active_open_orders < 1 || live.max_orders_per_day < 1
         || live.max_cancels_per_day < 1
         || live.max_order_rate_per_second < 1
+        || live.margin_per_lot <= 0 || live.trading_windows.empty()
         || live.market_stale_after_ns <= 0) {
         return "order-enabled strategy and risk limits must be positive";
     }
@@ -751,20 +774,25 @@ int run_live_engine(
 
     std::vector<RestartLoad> restarts;
     restarts.reserve(config.accounts().size());
+    std::size_t unsafe_restart_accounts = 0;
     if (!dependencies.trace_root.empty()) {
         for (const auto& account : config.accounts()) {
             auto restart = load_latest_restart(
                 dependencies.trace_root, account.alias());
             if (restart.found && !restart.image.valid
                 && config.live().allow_orders) {
-                error << "[error] latest trace is not safe for restart: account="
+                error << "[warn] latest trace is not safe for restart: account="
                       << account.alias() << '\n';
-                return 3;
+                ++unsafe_restart_accounts;
             }
             restarts.push_back(std::move(restart));
         }
     } else {
         restarts.resize(config.accounts().size());
+    }
+    if (unsafe_restart_accounts == config.accounts().size()) {
+        error << "[error] no account has a safe restart state\n";
+        return 3;
     }
 
     const auto run_id = static_cast<std::uint64_t>(
@@ -787,6 +815,20 @@ int run_live_engine(
     std::vector<std::unique_ptr<LiveAccountWorker>> workers;
     workers.reserve(config.accounts().size());
     for (std::size_t index = 0; index < config.accounts().size(); ++index) {
+        const bool restart_blocked = restarts[index].found
+            && !restarts[index].image.valid && config.live().allow_orders;
+        if (restart_blocked) {
+            workers.push_back(std::make_unique<LiveAccountWorker>(
+                config,
+                index,
+                ingress,
+                nullptr,
+                trace_directory,
+                run_id,
+                restarts[index].image,
+                true));
+            continue;
+        }
         const auto flow_directory = std::string{"runtime/flow/"}
             + config.accounts()[index].alias() + '/';
         auto api = dependencies.create_trader(flow_directory);
@@ -802,7 +844,8 @@ int run_live_engine(
             std::move(api),
             trace_directory,
             run_id,
-            restarts[index].image));
+            restarts[index].image,
+            false));
         if (!workers.back()->initialized()) {
             error << "[error] cannot start trace journal for account index "
                   << index << '\n';

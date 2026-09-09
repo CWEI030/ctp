@@ -17,8 +17,10 @@
 namespace ctp {
 namespace {
 
-constexpr std::string_view kHeader =
+constexpr std::string_view kHeaderV1 =
     "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code";
+constexpr std::string_view kHeaderV2 =
+    "ctp_trace_v2,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels";
 
 std::string_view stage_name(TraceStage stage) noexcept
 {
@@ -37,6 +39,7 @@ std::string_view stage_name(TraceStage stage) noexcept
     case TraceStage::RecoveryStarted: return "recovery_started";
     case TraceStage::RecoveryReady: return "recovery_ready";
     case TraceStage::RecoveryFrozen: return "recovery_frozen";
+    case TraceStage::RestartCheckpoint: return "restart_checkpoint";
     case TraceStage::CleanStop: return "clean_stop";
     }
     return "invalid";
@@ -51,6 +54,7 @@ bool parse_stage(std::string_view text, TraceStage& stage) noexcept
              TraceStage::OrderReport, TraceStage::Trade, TraceStage::ExitIntent,
              TraceStage::Disconnected, TraceStage::RecoveryStarted,
              TraceStage::RecoveryReady, TraceStage::RecoveryFrozen,
+             TraceStage::RestartCheckpoint,
              TraceStage::CleanStop}) {
         if (stage_name(candidate) == text) {
             stage = candidate;
@@ -69,25 +73,20 @@ bool parse_integer(std::string_view text, Integer& value) noexcept
         && result.ptr == text.data() + text.size();
 }
 
-std::array<std::string_view, 17> split_line(
-    const std::string& line,
-    bool& valid) noexcept
+std::vector<std::string_view> split_line(const std::string& line)
 {
-    std::array<std::string_view, 17> fields{};
+    std::vector<std::string_view> fields;
+    fields.reserve(21);
     std::size_t begin = 0;
-    for (std::size_t index = 0; index < fields.size(); ++index) {
+    while (true) {
         const auto comma = line.find(',', begin);
-        if (index + 1 == fields.size()) {
-            if (comma != std::string::npos) return fields;
-            fields[index] = std::string_view{line}.substr(begin);
-            valid = true;
+        if (comma == std::string::npos) {
+            fields.push_back(std::string_view{line}.substr(begin));
             return fields;
         }
-        if (comma == std::string::npos) return fields;
-        fields[index] = std::string_view{line}.substr(begin, comma - begin);
+        fields.push_back(std::string_view{line}.substr(begin, comma - begin));
         begin = comma + 1;
     }
-    return fields;
 }
 
 std::string_view instrument_view(const TraceEvent& event) noexcept
@@ -96,6 +95,22 @@ std::string_view instrument_view(const TraceEvent& event) noexcept
         event.instrument.begin(), event.instrument.end(), '\0');
     return {event.instrument.data(),
             static_cast<std::size_t>(end - event.instrument.begin())};
+}
+
+std::string_view trading_day_view(const TraceEvent& event) noexcept
+{
+    const auto end = std::find(
+        event.trading_day.begin(), event.trading_day.end(), '\0');
+    return {event.trading_day.data(),
+            static_cast<std::size_t>(end - event.trading_day.begin())};
+}
+
+bool valid_trading_day(std::string_view day) noexcept
+{
+    return day.size() == 8
+        && std::all_of(day.begin(), day.end(), [](char value) {
+               return value >= '0' && value <= '9';
+           });
 }
 
 std::string_view performance_stage_name(PerformanceStage stage) noexcept
@@ -159,7 +174,7 @@ struct AsyncTraceJournal::Impl {
 
     void write(const TraceEvent& event)
     {
-        output << "ctp_trace_v1," << account_id << ','
+        output << "ctp_trace_v2," << account_id << ','
                << event.trace_id.run_id << ',' << event.trace_id.signal_id << ','
                << event.sequence << ',' << event.mono_ns << ','
                << stage_name(event.stage) << ',' << event.client_order_id << ','
@@ -168,7 +183,9 @@ struct AsyncTraceJournal::Impl {
                << static_cast<unsigned>(event.direction) << ','
                << static_cast<unsigned>(event.offset) << ','
                << static_cast<unsigned>(event.purpose) << ','
-               << instrument_view(event) << ',' << event.code << '\n';
+               << instrument_view(event) << ',' << event.code << ','
+               << trading_day_view(event) << ',' << event.daily_signals << ','
+               << event.daily_orders << ',' << event.daily_cancels << '\n';
     }
 
     void run()
@@ -210,7 +227,7 @@ bool AsyncTraceJournal::start()
     if (impl_->running.load(std::memory_order_acquire)) return true;
     impl_->output.open(impl_->path, std::ios::out | std::ios::trunc);
     if (!impl_->output) return false;
-    impl_->output << kHeader << '\n';
+    impl_->output << kHeaderV2 << '\n';
     impl_->running.store(true, std::memory_order_release);
     impl_->writer = std::thread([this] { impl_->run(); });
     return true;
@@ -357,18 +374,20 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
     TraceJournalReadResult result{};
     std::ifstream input{path};
     std::string line;
-    if (!std::getline(input, line) || line != kHeader) return result;
+    if (!std::getline(input, line)) return result;
+    const bool version_two = line == kHeaderV2;
+    if (!version_two && line != kHeaderV1) return result;
 
     std::uint64_t previous_sequence = 0;
     while (std::getline(input, line)) {
-        bool split_valid = false;
-        const auto fields = split_line(line, split_valid);
+        const auto fields = split_line(line);
         TraceEvent event{};
         std::int32_t stage_code = 0;
         unsigned direction = 0;
         unsigned offset = 0;
         unsigned purpose = 0;
-        if (!split_valid || fields[0] != "ctp_trace_v1"
+        if (fields.size() != (version_two ? 21U : 17U)
+            || fields[0] != (version_two ? "ctp_trace_v2" : "ctp_trace_v1")
             || fields[1].empty()
             || !parse_integer(fields[2], event.trace_id.run_id)
             || !parse_integer(fields[3], event.trace_id.signal_id)
@@ -385,6 +404,11 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
             || !parse_integer(fields[14], purpose) || purpose > 1
             || fields[15].size() >= event.instrument.size()
             || !parse_integer(fields[16], stage_code)
+            || (version_two
+                && (fields[17].size() >= event.trading_day.size()
+                    || !parse_integer(fields[18], event.daily_signals)
+                    || !parse_integer(fields[19], event.daily_orders)
+                    || !parse_integer(fields[20], event.daily_cancels)))
             || (previous_sequence != 0 && event.sequence <= previous_sequence)) {
             return {};
         }
@@ -393,6 +417,7 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
         event.offset = static_cast<std::uint8_t>(offset);
         event.purpose = static_cast<std::uint8_t>(purpose);
         copy_to_field(event.instrument, fields[15]);
+        if (version_two) copy_to_field(event.trading_day, fields[17]);
         if (result.account_id.empty()) result.account_id = std::string{fields[1]};
         if (result.account_id != fields[1]) return {};
         previous_sequence = event.sequence;
@@ -411,12 +436,24 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
 RestartImage build_restart_image(const TraceJournalReadResult& journal)
 {
     RestartImage image{};
-    if (!journal.valid || !journal.clean_shutdown || journal.account_id.empty()) {
+    if (!journal.valid || !journal.clean_shutdown || journal.account_id.empty()
+        || journal.events.size() < 2) {
+        return image;
+    }
+    const auto& checkpoint = journal.events[journal.events.size() - 2];
+    const auto checkpoint_day = trading_day_view(checkpoint);
+    if (checkpoint.stage != TraceStage::RestartCheckpoint
+        || journal.events.back().stage != TraceStage::CleanStop
+        || !valid_trading_day(checkpoint_day)) {
         return image;
     }
     image.account_id = journal.account_id;
     image.next_client_order_id = journal.max_client_order_id + 1;
     image.next_order_ref = journal.max_order_ref + 1;
+    image.trading_day = std::string{checkpoint_day};
+    image.daily_signals = checkpoint.daily_signals;
+    image.daily_orders = checkpoint.daily_orders;
+    image.daily_cancels = checkpoint.daily_cancels;
     for (const auto& event : journal.events) {
         if (event.stage == TraceStage::OrderSubmitted) {
             const auto duplicate = std::find_if(

@@ -31,6 +31,23 @@ struct BenchmarkConfig {
     std::uint32_t burst_seconds{0};
 };
 
+struct TradingWindow {
+    std::int32_t start_ms{0};
+    std::int32_t end_ms{0};
+
+    // 交易窗口左闭右开；结束早于开始表示跨越午夜。
+    bool contains(std::int64_t exchange_time_ms) const noexcept
+    {
+        if (exchange_time_ms < 0 || exchange_time_ms >= 24 * 3'600'000LL
+            || start_ms == end_ms) {
+            return false;
+        }
+        return start_ms < end_ms
+            ? exchange_time_ms >= start_ms && exchange_time_ms < end_ms
+            : exchange_time_ms >= start_ms || exchange_time_ms < end_ms;
+    }
+};
+
 struct LiveConfig {
     std::string config_path;
     std::string profile;
@@ -54,8 +71,11 @@ struct LiveConfig {
     std::uint32_t max_cancels_per_day{0};
     std::uint32_t max_order_rate_per_second{0};
     std::int64_t max_price_deviation_ticks{0};
+    // 配置文件使用元/手，进入运行配置后统一换算为分/手。
+    std::int64_t margin_per_lot{0};
     // 配置文件使用元，进入运行配置后统一换算为分。
     std::int64_t minimum_available_funds{0};
+    std::vector<TradingWindow> trading_windows;
     std::int64_t market_stale_after_ns{0};
     bool kill_switch{true};
 };
@@ -64,6 +84,7 @@ inline constexpr std::size_t kBrokerIdCapacity = 11;
 inline constexpr std::size_t kUserIdCapacity = 16;
 inline constexpr std::size_t kPasswordCapacity = 41;
 inline constexpr std::size_t kInstrumentIdCapacity = 81;
+inline constexpr std::size_t kTradingDayCapacity = 9;
 inline constexpr std::size_t kAuthCodeCapacity = 17;
 inline constexpr std::size_t kAppIdCapacity = 33;
 

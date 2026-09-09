@@ -17,7 +17,6 @@ struct MarketEvent;
 class TraceSink;
 struct RestartImage;
 
-inline constexpr std::size_t kTradingDayCapacity = 9;
 inline constexpr std::size_t kExchangeIdCapacity = 9;
 inline constexpr std::size_t kTradeIdCapacity = 21;
 
@@ -192,6 +191,12 @@ struct RiskSnapshot {
     std::uint32_t daily_signals{0};
     std::uint32_t daily_orders{0};
     std::int32_t active_open_orders{0};
+};
+
+struct DailyLimitSnapshot {
+    std::uint32_t signals{0};
+    std::uint32_t orders{0};
+    std::uint32_t cancels{0};
 };
 
 enum class RiskRejectReason : std::uint8_t {
@@ -402,12 +407,15 @@ public:
     AccountTradingSession(const AccountTradingSession&) = delete;
     AccountTradingSession& operator=(const AccountTradingSession&) = delete;
 
-    void activate(
+    bool activate(
         int front_id,
         int session_id,
-        std::string_view max_order_ref) noexcept;
+        std::string_view max_order_ref,
+        std::string_view trading_day) noexcept;
     void start();
     bool restore_restart_image(const RestartImage& image) noexcept;
+    bool checkpoint_restart_state() noexcept;
+    DailyLimitSnapshot daily_limit_snapshot() const noexcept;
     RecoverySnapshot recovery_snapshot() const noexcept;
     void trace_market(const MarketEvent& market) noexcept;
     void trace_signal(

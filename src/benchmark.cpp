@@ -211,7 +211,7 @@ struct BenchmarkAccount {
               capacity,
               64)
     {
-        session.activate(1, 1, "0");
+        session.activate(1, 1, "0", "20260909");
     }
 
     ThresholdStrategy strategy;

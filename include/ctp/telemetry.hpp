@@ -37,6 +37,7 @@ enum class TraceStage : std::uint8_t {
     RecoveryStarted,
     RecoveryReady,
     RecoveryFrozen,
+    RestartCheckpoint,
     CleanStop,
 };
 
@@ -65,6 +66,10 @@ struct TraceEvent {
     std::uint8_t offset{0};
     std::uint8_t purpose{0};
     std::array<char, kInstrumentIdCapacity> instrument{};
+    std::array<char, kTradingDayCapacity> trading_day{};
+    std::uint32_t daily_signals{0};
+    std::uint32_t daily_orders{0};
+    std::uint32_t daily_cancels{0};
 };
 
 static_assert(std::is_trivially_copyable<TraceEvent>::value);
@@ -195,6 +200,10 @@ struct RestartImage {
     std::string account_id;
     std::uint64_t next_client_order_id{1};
     std::uint64_t next_order_ref{1};
+    std::string trading_day;
+    std::uint32_t daily_signals{0};
+    std::uint32_t daily_orders{0};
+    std::uint32_t daily_cancels{0};
     std::vector<RestartOrder> uncertain_orders;
 };
 

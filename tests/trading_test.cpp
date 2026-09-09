@@ -727,7 +727,7 @@ void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
     auto api = std::make_unique<test_support::FakeTraderApi>(metrics);
     ctp::AccountTradingSession session{
         account, risk_limits(), std::move(api), 8, 16, 8, 8, 100, 7};
-    session.activate(3, 9, "12");
+    session.activate(3, 9, "12", "20260909");
 
     const auto first = session.submit(
         opening_intent(77), healthy_risk_snapshot());
@@ -799,7 +799,7 @@ void test_ctp_callbacks_are_drained_on_account_thread(
     auto* fake_view = fake.get();
     ctp::AccountTradingSession session{
         account, limits, std::move(fake), 8, 16, 8, 16, 200, 20};
-    session.activate(3, 9, "20");
+    session.activate(3, 9, "20", "20260909");
     const auto submitted = session.submit(intent, risk);
 
     CThostFtdcOrderField accepted{};
@@ -864,7 +864,7 @@ void test_cancel_fill_race_calls_ctp_once(test_support::TestRunner& runner)
     auto* fake_view = fake.get();
     ctp::AccountTradingSession session{
         account, limits, std::move(fake), 8, 16, 8, 16, 300, 30};
-    session.activate(4, 10, "30");
+    session.activate(4, 10, "30", "20260909");
     const auto submitted = session.submit(intent, risk);
 
     const auto first_cancel = session.cancel(submitted.client_order_id);
@@ -1256,6 +1256,7 @@ void complete_empty_recovery(
     api.spi()->OnRspAuthenticate(nullptr, &ok, 1, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260909");
     login.FrontID = 7;
     login.SessionID = 9;
     ctp::copy_to_field(login.MaxOrderRef, "40");
@@ -1543,6 +1544,7 @@ void test_recovery_persists_available_funds(test_support::TestRunner& runner)
         nullptr, &ok, metrics->authenticate_request_id, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260909");
     view->spi()->OnRspUserLogin(
         &login, &ok, metrics->login_request_id, true);
     session.drain_callbacks();
@@ -1588,6 +1590,7 @@ void test_unknown_recovery_order_never_resubmits(
         nullptr, &ok, metrics->authenticate_request_id, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260909");
     view->spi()->OnRspUserLogin(
         &login, &ok, metrics->login_request_id, true);
     session.drain_callbacks();
@@ -1665,6 +1668,17 @@ void test_restart_restores_identity_without_resubmitting(
     submitted.purpose = static_cast<std::uint8_t>(ctp::OrderPurpose::Entry);
     ctp::copy_to_field(submitted.instrument, "IF2609");
     journal.events.push_back(submitted);
+    ctp::TraceEvent checkpoint{};
+    checkpoint.sequence = 2;
+    checkpoint.stage = ctp::TraceStage::RestartCheckpoint;
+    ctp::copy_to_field(checkpoint.trading_day, "20260907");
+    checkpoint.daily_signals = 1;
+    checkpoint.daily_orders = 1;
+    journal.events.push_back(checkpoint);
+    ctp::TraceEvent clean_stop{};
+    clean_stop.sequence = 3;
+    clean_stop.stage = ctp::TraceStage::CleanStop;
+    journal.events.push_back(clean_stop);
     journal.max_client_order_id = 9;
     journal.max_order_ref = 17;
     const auto image = ctp::build_restart_image(journal);
@@ -1697,6 +1711,7 @@ void test_restart_restores_identity_without_resubmitting(
         nullptr, &ok, metrics->authenticate_request_id, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260907");
     login.FrontID = 7;
     login.SessionID = 9;
     ctp::copy_to_field(login.MaxOrderRef, "40");
@@ -1750,6 +1765,85 @@ void test_restart_restores_identity_without_resubmitting(
         "queried fill and position must resume at close without replaying the open");
 }
 
+void test_restart_daily_limits_are_same_day_and_account_scoped(
+    test_support::TestRunner& runner)
+{
+    {
+        const ctp::AccountConfig account{
+            "invalid-quota", "9999", "user", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        ctp::RestartImage image{};
+        image.valid = true;
+        image.account_id = "invalid-quota";
+        image.trading_day = "20260909";
+        image.daily_orders = 11;
+        runner.expect(
+            !session.restore_restart_image(image),
+            "a checkpoint beyond the configured quota must fail closed");
+    }
+
+    for (std::size_t index = 0; index < 4; ++index) {
+        const std::string alias = "account" + std::to_string(index + 1);
+        const ctp::AccountConfig account{
+            alias, "9999", "user", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        CapturingTraceSink trace;
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32,
+            1, 1, {}, &trace, 91 + index};
+        ctp::RestartImage image{};
+        image.valid = true;
+        image.account_id = alias;
+        image.next_client_order_id = 1;
+        image.next_order_ref = 1;
+        image.trading_day = "20260909";
+        image.daily_orders = index == 0 ? 10 : 0;
+        runner.expect(
+            session.restore_restart_image(image)
+                && session.activate(1, 1, "0", "20260909"),
+            "each account must restore only its own same-day quota snapshot");
+        const auto restored = session.daily_limit_snapshot();
+        runner.expect(
+            index == 0
+                ? restored.orders == 10
+                : restored.orders == 0,
+            "one exhausted account must not refresh quota or affect peers");
+        runner.expect(
+            session.checkpoint_restart_state()
+                && trace.events[trace.size - 1].stage
+                    == ctp::TraceStage::RestartCheckpoint
+                && std::string_view{
+                       trace.events[trace.size - 1].trading_day.data()}
+                    == "20260909",
+            "shutdown checkpoint must retain the account trading day and counters");
+    }
+
+    const ctp::AccountConfig account{
+        "next-day", "9999", "user", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+    ctp::RestartImage image{};
+    image.valid = true;
+    image.account_id = "next-day";
+    image.trading_day = "20260909";
+    image.daily_signals = 10;
+    image.daily_orders = 10;
+    image.daily_cancels = 10;
+    runner.expect(
+        session.restore_restart_image(image)
+            && session.activate(1, 1, "0", "20260910")
+            && session.daily_limit_snapshot().signals == 0
+            && session.daily_limit_snapshot().orders == 0
+            && session.daily_limit_snapshot().cancels == 0,
+        "a confirmed new CTP trading day must reset restored daily quotas");
+}
+
 void test_missing_uncertain_order_stays_frozen(
     test_support::TestRunner& runner)
 {
@@ -1769,6 +1863,7 @@ void test_missing_uncertain_order_stays_frozen(
         nullptr, &ok, metrics->authenticate_request_id, true);
     session.drain_callbacks();
     CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260909");
     view->spi()->OnRspUserLogin(
         &login, &ok, metrics->login_request_id, true);
     session.drain_callbacks();
@@ -1881,6 +1976,7 @@ void test_each_recovery_query_error_stays_frozen(
             nullptr, &ok, metrics->authenticate_request_id, true);
         session.drain_callbacks();
         CThostFtdcRspUserLoginField login{};
+        ctp::copy_to_field(login.TradingDay, "20260909");
         view->spi()->OnRspUserLogin(
             &login, &ok, metrics->login_request_id, true);
         session.drain_callbacks();
@@ -1964,6 +2060,7 @@ int main()
     test_unknown_recovery_order_never_resubmits(runner);
     test_session_emits_one_order_trace_without_allocating(runner);
     test_restart_restores_identity_without_resubmitting(runner);
+    test_restart_daily_limits_are_same_day_and_account_scoped(runner);
     test_missing_uncertain_order_stays_frozen(runner);
     test_one_of_four_recovery_failures_is_isolated(runner);
     test_stale_recovery_response_cannot_advance_phase(runner);

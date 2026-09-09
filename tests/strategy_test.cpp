@@ -470,7 +470,7 @@ void test_replay_intent_reaches_submit(test_support::TestRunner& runner)
     auto api = std::make_unique<test_support::FakeTraderApi>(metrics);
     ctp::AccountTradingSession session{
         account_config(), replay_risk_limits(), std::move(api), 4, 4, 4, 4};
-    session.activate(1, 2, "0");
+    session.activate(1, 2, "0", "20260909");
     const auto submitted = session.submit(
         decision.intent, replay_risk_snapshot(events[1]));
     runner.expect(

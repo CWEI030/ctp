@@ -29,6 +29,16 @@ ctp::TraceEvent trace_event(
     return event;
 }
 
+ctp::TraceEvent restart_checkpoint(std::uint64_t sequence)
+{
+    auto event = trace_event(sequence, ctp::TraceStage::RestartCheckpoint);
+    ctp::copy_to_field(event.trading_day, "20260909");
+    event.daily_signals = 7;
+    event.daily_orders = 5;
+    event.daily_cancels = 3;
+    return event;
+}
+
 void test_trace_queue_is_nonblocking_and_counts_drops(
     test_support::TestRunner& runner)
 {
@@ -65,15 +75,21 @@ void test_async_journal_round_trip_and_clean_marker(
     runner.expect(
         journal.try_record(trace_event(1, ctp::TraceStage::Market))
             && journal.try_record(trace_event(2, ctp::TraceStage::Signal))
-            && journal.try_record(trace_event(3, ctp::TraceStage::OrderSubmitted)),
+            && journal.try_record(trace_event(3, ctp::TraceStage::OrderSubmitted))
+            && journal.try_record(restart_checkpoint(4)),
         "trace events must enter the asynchronous journal");
     journal.stop();
 
     const auto loaded = ctp::read_trace_journal(path);
     runner.expect(
-        loaded.valid && loaded.clean_shutdown && loaded.events.size() == 4
+        loaded.valid && loaded.clean_shutdown && loaded.events.size() == 5
             && loaded.events[0].sequence == 1
-            && loaded.events[2].stage == ctp::TraceStage::OrderSubmitted,
+            && loaded.events[2].stage == ctp::TraceStage::OrderSubmitted
+            && loaded.events[3].stage == ctp::TraceStage::RestartCheckpoint
+            && std::string_view{loaded.events[3].trading_day.data()} == "20260909"
+            && loaded.events[3].daily_signals == 7
+            && loaded.events[3].daily_orders == 5
+            && loaded.events[3].daily_cancels == 3,
         "journal reader must preserve order and detect the clean stop marker");
 
     std::ifstream input{path};
@@ -134,15 +150,42 @@ void test_restart_image_keeps_only_unresolved_orders(
     auto filled = trace_event(2, ctp::TraceStage::OrderReport);
     filled.code = static_cast<std::int32_t>(
         ctp::TraceOrderReportCode::Filled);
-    journal.events = {submitted, filled};
+    journal.events = {
+        submitted,
+        filled,
+        restart_checkpoint(3),
+        trace_event(4, ctp::TraceStage::CleanStop)};
     journal.max_client_order_id = submitted.client_order_id;
     journal.max_order_ref = submitted.order_ref;
     const auto image = ctp::build_restart_image(journal);
     runner.expect(
         image.valid && image.uncertain_orders.empty()
             && image.next_client_order_id == 72
-            && image.next_order_ref == 42,
+            && image.next_order_ref == 42
+            && image.trading_day == "20260909"
+            && image.daily_signals == 7
+            && image.daily_orders == 5
+            && image.daily_cancels == 3,
         "restart image must advance identities but omit terminal orders");
+}
+
+void test_v1_journal_remains_auditable_but_cannot_restore_daily_limits(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{"/tmp/ctp_trace_v1_legacy.csv"};
+    std::filesystem::remove(path);
+    {
+        std::ofstream output{path};
+        output << "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code\n";
+        output << "ctp_trace_v1,account1,17,9001,1,100,signal,71,41,4000,1,0,0,0,0,IF2609,0\n";
+        output << "ctp_trace_v1,account1,0,0,2,0,clean_stop,0,0,0,0,0,0,0,0,,0\n";
+    }
+    const auto loaded = ctp::read_trace_journal(path);
+    const auto image = ctp::build_restart_image(loaded);
+    runner.expect(
+        loaded.valid && loaded.clean_shutdown && !image.valid,
+        "legacy v1 trace must remain readable but cannot refresh daily quotas");
+    std::filesystem::remove(path);
 }
 
 void test_latency_statistics_include_tail_and_jitter(
@@ -277,6 +320,7 @@ int main()
     test_truncated_journal_is_not_a_clean_restart(runner);
     test_dropped_trace_journal_is_not_a_restart_source(runner);
     test_restart_image_keeps_only_unresolved_orders(runner);
+    test_v1_journal_remains_auditable_but_cannot_restore_daily_limits(runner);
     test_latency_statistics_include_tail_and_jitter(runner);
     test_performance_queue_is_fixed_and_counts_drops(runner);
     test_performance_recorder_writes_raw_samples(runner);
