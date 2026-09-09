@@ -463,10 +463,10 @@ public:
             config.accounts()[account_index],
             make_risk_limits(config.live()),
             std::move(api),
-            256,
-            1024,
-            64,
-            1024,
+            kLiveOrderCapacity,
+            kLiveTradeCapacity,
+            kLiveSignalCapacity,
+            kLiveCallbackCapacity,
             1,
             1,
             make_close_policy(config.live()),
@@ -642,7 +642,7 @@ private:
                 if (!live_.strategy_enabled || !live_.allow_orders) continue;
                 const auto decision = strategy_.on_market(market, risk.now_ns);
                 if (!decision.has_intent) continue;
-                session_->trace_signal(decision.intent, risk.now_ns);
+                session_->trace_signal(market, decision.intent, risk.now_ns);
                 if (orders_in_window_ >= live_.max_order_rate_per_second
                     && risk.now_ns - rate_window_start_ns_ < 1'000'000'000) {
                     continue;
@@ -727,6 +727,7 @@ std::string validate_live_config(const RuntimeConfig& config)
     if (!live.strategy_enabled) return "--allow-orders requires strategy enabled=true";
     if (live.kill_switch) return "--allow-orders requires risk kill_switch=false";
     if (live.trigger_price_ticks <= 0 || live.max_signals_per_run == 0
+        || live.max_signals_per_run > kLiveSignalCapacity
         || live.cancel_after_market_ticks == 0
         || live.close_reprice_after_market_ticks == 0
         || live.max_order_volume < 1 || live.max_net_position < 1

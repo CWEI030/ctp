@@ -419,6 +419,7 @@ public:
     RecoverySnapshot recovery_snapshot() const noexcept;
     void trace_market(const MarketEvent& market) noexcept;
     void trace_signal(
+        const MarketEvent& market,
         const OrderIntent& intent,
         std::int64_t decision_mono_ns) noexcept;
     SubmitResult submit(

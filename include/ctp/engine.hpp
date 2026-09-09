@@ -21,6 +21,10 @@ class MarketApi;
 class TraderApi;
 
 inline constexpr std::size_t kMarketQueueCapacity = 1024;
+inline constexpr std::size_t kLiveOrderCapacity = 256;
+inline constexpr std::size_t kLiveTradeCapacity = 1024;
+inline constexpr std::size_t kLiveSignalCapacity = 64;
+inline constexpr std::size_t kLiveCallbackCapacity = 1024;
 
 enum class MarketDataStatus : std::uint8_t {
     Valid,

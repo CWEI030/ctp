@@ -747,6 +747,7 @@ struct SignalRecord {
     bool occupied{false};
     bool active_open{false};
     bool cancel_requested{false};
+    std::uint8_t traced_order_reports{0};
     std::uint32_t market_events_waited{0};
     OrderIntent intent{};
     SubmitResult result{};
@@ -956,6 +957,25 @@ struct AccountTradingSession::Impl {
             event.instrument = record->intent.instrument;
         }
         trace_sink->try_record(event);
+    }
+
+    void trace_order_report(
+        SignalRecord& record,
+        OrderReportType type,
+        const ApplyResult& result,
+        std::int32_t cumulative_filled) noexcept
+    {
+        if (result.code != ApplyCode::Applied) return;
+        const auto bit = static_cast<std::uint8_t>(
+            1U << static_cast<std::uint8_t>(type));
+        if ((record.traced_order_reports & bit) != 0) return;
+        record.traced_order_reports = static_cast<std::uint8_t>(
+            record.traced_order_reports | bit);
+        trace(
+            TraceStage::OrderReport,
+            &record,
+            static_cast<std::int32_t>(type),
+            cumulative_filled);
     }
 
     void release_terminal_open(SignalRecord& record) noexcept
@@ -1372,10 +1392,21 @@ void AccountTradingSession::trace_market(const MarketEvent& market) noexcept
 }
 
 void AccountTradingSession::trace_signal(
+    const MarketEvent& market,
     const OrderIntent& intent,
     std::int64_t decision_mono_ns) noexcept
 {
     if (impl_->trace_sink == nullptr) return;
+    TraceEvent trigger{};
+    trigger.trace_id = {impl_->run_id, intent.signal_id};
+    trigger.sequence = ++impl_->trace_sequence;
+    trigger.mono_ns = market.recv_mono_ns;
+    trigger.limit_price_ticks = market.last_price_ticks;
+    trigger.stage = TraceStage::Market;
+    trigger.code = static_cast<std::int32_t>(market.status);
+    trigger.instrument = market.instrument;
+    impl_->trace_sink->try_record(trigger);
+
     TraceEvent event{};
     event.trace_id = {impl_->run_id, intent.signal_id};
     event.sequence = ++impl_->trace_sequence;
@@ -1844,11 +1875,8 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     impl_->recovery_failure(RecoveryFailure::UnknownOrder);
                     continue;
                 }
-                impl_->trace(
-                    TraceStage::OrderReport,
-                    record,
-                    static_cast<std::int32_t>(type),
-                    event.queried_order.VolumeTraded);
+                impl_->trace_order_report(
+                    *record, type, applied, event.queried_order.VolumeTraded);
                 impl_->release_terminal_open(*record);
             }
             if (event.is_last) {
@@ -1929,8 +1957,13 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     continue;
                 }
                 ++impl_->recovery.queried_trades;
-                impl_->trace(
-                    TraceStage::Trade, record, 0, event.queried_trade.Volume);
+                if (applied.code == ApplyCode::Applied) {
+                    impl_->trace(
+                        TraceStage::Trade,
+                        record,
+                        0,
+                        event.queried_trade.Volume);
+                }
                 impl_->apply_trade_effect(*record, report, applied);
             }
             if (event.is_last && impl_->request_positions() != 0) {
@@ -2042,8 +2075,10 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
         if (event.type == CallbackType::Trade) {
             event.trade.client_order_id = record->result.client_order_id;
             result = impl_->state.apply_trade(event.trade);
-            impl_->trace(
-                TraceStage::Trade, record, 0, event.trade.quantity);
+            if (result.code == ApplyCode::Applied) {
+                impl_->trace(
+                    TraceStage::Trade, record, 0, event.trade.quantity);
+            }
         } else {
             const auto type = event.type == CallbackType::InsertRejected
                 ? OrderReportType::Rejected
@@ -2053,11 +2088,8 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 {record->result.client_order_id,
                  type,
                  event.cumulative_filled});
-            impl_->trace(
-                TraceStage::OrderReport,
-                record,
-                static_cast<std::int32_t>(type),
-                event.cumulative_filled);
+            impl_->trace_order_report(
+                *record, type, result, event.cumulative_filled);
         }
         if (result.reconciliation_required
             || result.code == ApplyCode::Conflict

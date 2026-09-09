@@ -26,6 +26,16 @@ public:
     std::size_t size{0};
 };
 
+class QueueTraceSink final : public ctp::TraceSink {
+public:
+    bool try_record(const ctp::TraceEvent& event) noexcept override
+    {
+        return queue.try_push(event);
+    }
+
+    ctp::TraceQueue queue;
+};
+
 ctp::OrderSeed order_seed(std::uint64_t id = 1, int quantity = 5)
 {
     ctp::OrderSeed seed{};
@@ -1142,6 +1152,66 @@ void test_open_fill_submits_one_close_and_reaches_zero(
     }
 }
 
+void test_order_lifecycle_survives_best_effort_trace_saturation(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    QueueTraceSink trace;
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy(), &trace, 78};
+    const auto market = valid_market();
+    const auto best_effort_capacity =
+        ctp::kTraceQueueCapacity - ctp::kCriticalTraceReserve;
+    for (std::size_t index = 0; index < best_effort_capacity; ++index) {
+        session.trace_market(market);
+    }
+    session.trace_market(market);
+
+    const auto intent = opening_intent(802);
+    session.trace_signal(market, intent, healthy_risk_snapshot().now_ns);
+    session.submit(intent, healthy_risk_snapshot());
+    emit_trade(
+        view->spi(), "1", "open-802",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    session.on_market(market, healthy_risk_snapshot());
+    emit_trade(
+        view->spi(), "2", "close-802",
+        ctp::Direction::Sell, ctp::Offset::Close);
+    session.drain_callbacks();
+
+    std::array<ctp::TraceStage, 9> actual{};
+    std::size_t actual_size = 0;
+    ctp::TraceEvent event{};
+    while (trace.queue.try_pop(event)) {
+        if (event.trace_id.signal_id == intent.signal_id
+            && actual_size < actual.size()) {
+            actual[actual_size++] = event.stage;
+        }
+    }
+    const std::array expected{
+        ctp::TraceStage::Market,
+        ctp::TraceStage::Signal,
+        ctp::TraceStage::RiskAccepted,
+        ctp::TraceStage::OrderSubmitted,
+        ctp::TraceStage::Trade,
+        ctp::TraceStage::ExitIntent,
+        ctp::TraceStage::RiskAccepted,
+        ctp::TraceStage::OrderSubmitted,
+        ctp::TraceStage::Trade,
+    };
+    runner.expect(
+        actual_size == expected.size() && actual == expected
+            && trace.queue.best_effort_dropped_count() == 1
+            && trace.queue.critical_dropped_count() == 0,
+        "market trace saturation must not truncate an order lifecycle");
+}
+
 void test_entry_timeout_cancels_once(test_support::TestRunner& runner)
 {
     const ctp::AccountConfig account{
@@ -1374,7 +1444,7 @@ void test_callback_overflow_recovers_a_lost_trade(
             && recovered_position.long_quantity == 1
             && close.action == ctp::ExecutionAction::ExitSubmitted
             && metrics->order_insert_calls == 2
-            && recovered_traces == 2,
+            && recovered_traces == 1,
         "queries must restore a lost fill and a late duplicate must not resubmit");
 
     // 首次溢出故障值会保留，但恢复成功后的新缺口仍必须重新冻结并核对。
@@ -1646,6 +1716,45 @@ void test_session_emits_one_order_trace_without_allocating(
                 && trace.events[index].sequence == index + 1,
             "one order trace must keep stable identity and monotonic sequence");
     }
+}
+
+void test_duplicate_exchange_facts_do_not_consume_trace_capacity(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    CapturingTraceSink trace;
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16,
+        1, 1, {}, &trace, 77};
+
+    session.submit(opening_intent(9151), healthy_risk_snapshot());
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "1");
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRtnOrder(&accepted);
+    session.drain_callbacks();
+    view->spi()->OnRtnOrder(&accepted);
+    session.drain_callbacks();
+    emit_trade(
+        view->spi(), "1", "trade-9151",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    emit_trade(
+        view->spi(), "1", "trade-9151",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+
+    runner.expect(
+        trace.size == 4
+            && trace.events[0].stage == ctp::TraceStage::RiskAccepted
+            && trace.events[1].stage == ctp::TraceStage::OrderSubmitted
+            && trace.events[2].stage == ctp::TraceStage::OrderReport
+            && trace.events[3].stage == ctp::TraceStage::Trade,
+        "duplicate order and trade callbacks must not spend critical trace slots");
 }
 
 void test_restart_restores_identity_without_resubmitting(
@@ -2049,6 +2158,7 @@ int main()
     test_cancel_rejection_and_daily_limit(runner);
     test_session_hot_path_does_not_allocate(runner);
     test_open_fill_submits_one_close_and_reaches_zero(runner);
+    test_order_lifecycle_survives_best_effort_trace_saturation(runner);
     test_close_retry_exhaustion_freezes_without_faking_zero(runner);
     test_entry_timeout_cancels_once(runner);
     test_close_fill_wins_cancel_race_without_reprice(runner);
@@ -2059,6 +2169,7 @@ int main()
     test_recovery_persists_available_funds(runner);
     test_unknown_recovery_order_never_resubmits(runner);
     test_session_emits_one_order_trace_without_allocating(runner);
+    test_duplicate_exchange_facts_do_not_consume_trace_capacity(runner);
     test_restart_restores_identity_without_resubmitting(runner);
     test_restart_daily_limits_are_same_day_and_account_scoped(runner);
     test_missing_uncertain_order_stays_frozen(runner);

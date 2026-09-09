@@ -1152,6 +1152,23 @@ void test_live_validation_rejects_unresolved_placeholders(
         "live validation must reject unresolved configuration placeholders");
 }
 
+void test_live_validation_enforces_traceable_signal_capacity(
+    test_support::TestRunner& runner)
+{
+    auto live = make_live_config(1).live();
+    live.max_signals_per_run = ctp::kLiveSignalCapacity + 1;
+    ctp::RuntimeConfig config{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        make_accounts(1),
+        {},
+        std::move(live)};
+    runner.expect(
+        !ctp::validate_live_engine_config(config).empty(),
+        "live validation must reject runs larger than the trace capacity proof");
+}
+
 }
 
 int main()
@@ -1174,5 +1191,6 @@ int main()
     test_live_runner_refuses_unsafe_latest_trace(runner);
     test_unsafe_restart_freezes_only_its_account(runner);
     test_live_validation_rejects_unresolved_placeholders(runner);
+    test_live_validation_enforces_traceable_signal_capacity(runner);
     return runner.finish();
 }

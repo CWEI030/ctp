@@ -3,6 +3,7 @@
 #include "ctp/engine.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -14,7 +15,8 @@
 
 namespace ctp {
 
-inline constexpr std::size_t kTraceQueueCapacity = 1024;
+inline constexpr std::size_t kTraceQueueCapacity = 8192;
+inline constexpr std::size_t kCriticalTraceReserve = 4096;
 inline constexpr std::size_t kPerformanceQueueCapacity = 4096;
 
 struct TraceId {
@@ -74,7 +76,71 @@ struct TraceEvent {
 
 static_assert(std::is_trivially_copyable<TraceEvent>::value);
 
-using TraceQueue = SpscQueue<TraceEvent, kTraceQueueCapacity>;
+// 每个订单槽最多产生一条风控、一条报单结果、一条撤单和六类规范订单回报；
+// 信号、平仓意图及唯一成交分别受各自固定表容量约束，最后保留检查点和退出标记。
+inline constexpr std::size_t kCriticalTraceEventsPerOrder = 9;
+inline constexpr std::size_t kCriticalTraceCapacityRequired =
+    kLiveOrderCapacity * kCriticalTraceEventsPerOrder
+    + kLiveSignalCapacity * 2
+    + kLiveOrderCapacity + 1
+    + kLiveTradeCapacity
+    + 2;
+static_assert(kCriticalTraceCapacityRequired <= kCriticalTraceReserve);
+static_assert(kCriticalTraceReserve < kTraceQueueCapacity);
+
+inline bool is_critical_trace_event(const TraceEvent& event) noexcept
+{
+    switch (event.stage) {
+    case TraceStage::Market:
+        return event.trace_id.signal_id != 0;
+    case TraceStage::Disconnected:
+    case TraceStage::RecoveryStarted:
+    case TraceStage::RecoveryReady:
+    case TraceStage::RecoveryFrozen:
+        return false;
+    default:
+        return true;
+    }
+}
+
+class TraceQueue {
+public:
+    bool try_push(const TraceEvent& event) noexcept
+    {
+        if (!is_critical_trace_event(event)
+            && queue_.depth() >= kTraceQueueCapacity - kCriticalTraceReserve) {
+            best_effort_dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (queue_.try_push(event)) return true;
+        critical_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    bool try_pop(TraceEvent& event) noexcept { return queue_.try_pop(event); }
+    std::size_t depth() const noexcept { return queue_.depth(); }
+    std::size_t high_watermark() const noexcept
+    {
+        return queue_.high_watermark();
+    }
+    std::uint64_t dropped_count() const noexcept
+    {
+        return critical_dropped_count() + best_effort_dropped_count();
+    }
+    std::uint64_t critical_dropped_count() const noexcept
+    {
+        return critical_dropped_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t best_effort_dropped_count() const noexcept
+    {
+        return best_effort_dropped_.load(std::memory_order_relaxed);
+    }
+
+private:
+    SpscQueue<TraceEvent, kTraceQueueCapacity> queue_;
+    std::atomic<std::uint64_t> critical_dropped_{0};
+    std::atomic<std::uint64_t> best_effort_dropped_{0};
+};
 
 enum class PerformanceStage : std::uint8_t {
     MarketToSignal,
@@ -119,6 +185,8 @@ struct TraceQueueSnapshot {
     std::size_t depth{0};
     std::size_t high_watermark{0};
     std::uint64_t dropped{0};
+    std::uint64_t critical_dropped{0};
+    std::uint64_t best_effort_dropped{0};
 };
 
 struct PerformanceRecorderSnapshot {

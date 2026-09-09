@@ -64,6 +64,42 @@ void test_trace_queue_is_nonblocking_and_counts_drops(
         "trace queue must expose exact drop and high-water counts");
 }
 
+void test_trace_queue_reserves_capacity_for_order_facts(
+    test_support::TestRunner& runner)
+{
+    ctp::TraceQueue queue;
+    auto market = trace_event(1, ctp::TraceStage::Market);
+    market.trace_id.signal_id = 0;
+    const auto best_effort_capacity =
+        ctp::kTraceQueueCapacity - ctp::kCriticalTraceReserve;
+    for (std::size_t index = 0; index < best_effort_capacity; ++index) {
+        market.sequence = index + 1;
+        runner.expect(
+            queue.try_push(market),
+            "unlinked markets must use the best-effort queue region");
+    }
+    runner.expect(
+        !queue.try_push(market),
+        "an unlinked market must not consume the reserved order region");
+
+    auto order_fact = trace_event(10'000, ctp::TraceStage::RiskAccepted);
+    for (std::size_t index = 0; index < ctp::kCriticalTraceReserve; ++index) {
+        order_fact.sequence = 10'000 + index;
+        runner.expect(
+            queue.try_push(order_fact),
+            "order facts must remain writable after market saturation");
+    }
+    runner.expect(
+        !queue.try_push(order_fact),
+        "a physically full queue must reject without blocking");
+    runner.expect(
+        queue.dropped_count() == 2
+            && queue.best_effort_dropped_count() == 1
+            && queue.critical_dropped_count() == 1
+            && queue.high_watermark() == ctp::kTraceQueueCapacity,
+        "critical and best-effort drops must be separately exact");
+}
+
 void test_async_journal_round_trip_and_clean_marker(
     test_support::TestRunner& runner)
 {
@@ -136,6 +172,28 @@ void test_dropped_trace_journal_is_not_a_restart_source(
     runner.expect(
         loaded.clean_shutdown && !loaded.valid && !image.valid,
         "a clean file with dropped business facts must not drive restart");
+    std::filesystem::remove(path);
+}
+
+void test_best_effort_drop_does_not_poison_restart_source(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{
+        "/tmp/ctp_trace_best_effort_drop.csv"};
+    std::filesystem::remove(path);
+    {
+        std::ofstream output{path};
+        output << "ctp_trace_v2,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels\n";
+        output << "ctp_trace_v2,account1,17,9001,1,100,order_submitted,71,41,4000,1,0,0,0,0,IF2609,0,,0,0,0\n";
+        output << "ctp_trace_v2,account1,17,9001,2,200,restart_checkpoint,0,0,0,0,0,0,0,0,,0,20260909,1,1,0\n";
+        output << "ctp_trace_v2,account1,0,0,3,0,clean_stop,0,0,0,7,0,0,0,0,,0,,0,0,0\n";
+    }
+    const auto loaded = ctp::read_trace_journal(path);
+    const auto image = ctp::build_restart_image(loaded);
+    runner.expect(
+        loaded.valid && loaded.clean_shutdown && image.valid
+            && image.uncertain_orders.size() == 1,
+        "best-effort market loss must remain observable without invalidating order recovery");
     std::filesystem::remove(path);
 }
 
@@ -316,9 +374,11 @@ int main()
 {
     test_support::TestRunner runner{"telemetry"};
     test_trace_queue_is_nonblocking_and_counts_drops(runner);
+    test_trace_queue_reserves_capacity_for_order_facts(runner);
     test_async_journal_round_trip_and_clean_marker(runner);
     test_truncated_journal_is_not_a_clean_restart(runner);
     test_dropped_trace_journal_is_not_a_restart_source(runner);
+    test_best_effort_drop_does_not_poison_restart_source(runner);
     test_restart_image_keeps_only_unresolved_orders(runner);
     test_v1_journal_remains_auditable_but_cannot_restore_daily_limits(runner);
     test_latency_statistics_include_tail_and_jitter(runner);

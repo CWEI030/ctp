@@ -257,11 +257,16 @@ void AsyncTraceJournal::stop() noexcept
     stop_event.sequence =
         impl_->largest_sequence.load(std::memory_order_relaxed) + 1;
     stop_event.stage = TraceStage::CleanStop;
-    const auto dropped = impl_->queue.dropped_count();
-    stop_event.code = dropped > static_cast<std::uint64_t>(
+    const auto critical_dropped = impl_->queue.critical_dropped_count();
+    stop_event.code = critical_dropped > static_cast<std::uint64_t>(
             std::numeric_limits<std::int32_t>::max())
         ? std::numeric_limits<std::int32_t>::max()
-        : static_cast<std::int32_t>(dropped);
+        : static_cast<std::int32_t>(critical_dropped);
+    const auto best_effort_dropped = impl_->queue.best_effort_dropped_count();
+    stop_event.quantity = best_effort_dropped > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())
+        ? std::numeric_limits<std::int32_t>::max()
+        : static_cast<std::int32_t>(best_effort_dropped);
     // CleanStop 属于控制面屏障。先等消费者腾出位置，避免等待本身被计入业务丢弃。
     while (impl_->queue.depth() == kTraceQueueCapacity) {
         std::this_thread::yield();
@@ -283,6 +288,8 @@ TraceQueueSnapshot AsyncTraceJournal::snapshot() const noexcept
         impl_->queue.depth(),
         impl_->queue.high_watermark(),
         impl_->queue.dropped_count(),
+        impl_->queue.critical_dropped_count(),
+        impl_->queue.best_effort_dropped_count(),
     };
 }
 
@@ -428,7 +435,7 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
     }
     if (!input.eof() || result.events.empty()) return {};
     result.clean_shutdown = result.events.back().stage == TraceStage::CleanStop;
-    // 只要热路径曾丢过事实，这份文件仍可审计，但不能作为重启事实源。
+    // 关键订单事实缺失时失败关闭；未关联行情丢弃只作容量观测。
     result.valid = result.clean_shutdown && result.events.back().code == 0;
     return result;
 }
