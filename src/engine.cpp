@@ -438,14 +438,15 @@ public:
         const std::filesystem::path& trace_directory,
         std::uint64_t run_id,
         const RestartImage& restart_image,
-        bool restart_blocked = false)
+        bool start_blocked = false)
         : live_(config.live()),
           account_index_(account_index),
           ingress_(ingress),
           strategy_(make_strategy(config.live()))
     {
-        // 某账户恢复事实不完整时只冻结该账户，不创建交易连接，也不阻塞同进程内的健康账户。
-        if (restart_blocked) {
+        // 启动前已确认不可安全运行的账户只冻结自身，不阻塞同进程内的健康账户。
+        if (start_blocked) {
+            initialized_ = false;
             failed_.store(true, std::memory_order_release);
             return;
         }
@@ -457,6 +458,8 @@ public:
             if (!journal_->start()) {
                 journal_.reset();
                 initialized_ = false;
+                failed_.store(true, std::memory_order_release);
+                return;
             }
         }
         session_ = std::make_unique<AccountTradingSession>(
@@ -475,7 +478,11 @@ public:
             config.live().minimum_price_increment);
         if (restart_image.valid
             && !session_->restore_restart_image(restart_image)) {
+            session_.reset();
+            if (journal_) journal_->stop();
+            journal_.reset();
             initialized_ = false;
+            failed_.store(true, std::memory_order_release);
         }
     }
 
@@ -815,28 +822,33 @@ int run_live_engine(
         config.accounts(), config.live().minimum_price_increment};
     std::vector<std::unique_ptr<LiveAccountWorker>> workers;
     workers.reserve(config.accounts().size());
+    std::size_t initialized_workers = 0;
+    const auto add_blocked_worker = [&](std::size_t index) {
+        workers.push_back(std::make_unique<LiveAccountWorker>(
+            config,
+            index,
+            ingress,
+            nullptr,
+            trace_directory,
+            run_id,
+            restarts[index].image,
+            true));
+    };
     for (std::size_t index = 0; index < config.accounts().size(); ++index) {
         const bool restart_blocked = restarts[index].found
             && !restarts[index].image.valid && config.live().allow_orders;
         if (restart_blocked) {
-            workers.push_back(std::make_unique<LiveAccountWorker>(
-                config,
-                index,
-                ingress,
-                nullptr,
-                trace_directory,
-                run_id,
-                restarts[index].image,
-                true));
+            add_blocked_worker(index);
             continue;
         }
         const auto flow_directory = std::string{"runtime/flow/"}
             + config.accounts()[index].alias() + '/';
         auto api = dependencies.create_trader(flow_directory);
         if (!api) {
-            error << "[error] cannot create trader API for account index "
-                  << index << '\n';
-            return 3;
+            error << "[warn] cannot create trader API for account index "
+                  << index << "; isolating account\n";
+            add_blocked_worker(index);
+            continue;
         }
         workers.push_back(std::make_unique<LiveAccountWorker>(
             config,
@@ -848,10 +860,15 @@ int run_live_engine(
             restarts[index].image,
             false));
         if (!workers.back()->initialized()) {
-            error << "[error] cannot start trace journal for account index "
-                  << index << '\n';
-            return 3;
+            error << "[warn] cannot initialize account worker for account index "
+                  << index << "; isolating account\n";
+            continue;
         }
+        ++initialized_workers;
+    }
+    if (initialized_workers == 0) {
+        error << "[error] no account worker could be initialized\n";
+        return 3;
     }
 
     std::atomic<bool> stopping{false};

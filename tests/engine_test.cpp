@@ -120,7 +120,7 @@ private:
     std::shared_ptr<FakeLiveMarketState> state_;
 };
 
-ctp::RuntimeConfig make_live_config(std::size_t account_count)
+ctp::RuntimeConfig make_live_config(std::vector<ctp::AccountConfig> accounts)
 {
     ctp::LiveConfig live{};
     live.market_front = "tcp://127.0.0.1:41213";
@@ -159,9 +159,14 @@ ctp::RuntimeConfig make_live_config(std::size_t account_count)
         "",
         "",
         0,
-        make_accounts(account_count),
+        std::move(accounts),
         {},
         std::move(live)};
+}
+
+ctp::RuntimeConfig make_live_config(std::size_t account_count)
+{
+    return make_live_config(make_accounts(account_count));
 }
 
 std::unique_ptr<test_support::FakeTraderApi> make_recovering_trader(
@@ -670,6 +675,169 @@ void test_live_runner_isolates_one_failed_account(
     runner.expect(
         market->release_calls.load(std::memory_order_relaxed) == 1,
         "the shared market API must be released exactly once");
+}
+
+int run_until_three_healthy_accounts_submit(
+    const ctp::RuntimeConfig& config,
+    const std::shared_ptr<FakeLiveMarketState>& market,
+    const std::vector<std::shared_ptr<test_support::FakeTraderMetrics>>& traders,
+    ctp::LiveEngineDependencies dependencies,
+    std::ostringstream& output,
+    std::ostringstream& error)
+{
+    bool published = false;
+    std::size_t polls = 0;
+    const auto stop_requested = [&] {
+        if (market->subscribed.load(std::memory_order_acquire) && !published) {
+            auto below = make_tick(0);
+            below.LastPrice = 799.8;
+            below.BidPrice1 = 799.6;
+            below.AskPrice1 = 800.0;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&below);
+            auto crossing = make_tick(1);
+            crossing.LastPrice = 800.0;
+            crossing.BidPrice1 = 799.8;
+            crossing.AskPrice1 = 800.2;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&crossing);
+            published = true;
+        }
+        ++polls;
+        return (traders[1]->order_insert_calls == 1
+                && traders[2]->order_insert_calls == 1
+                && traders[3]->order_insert_calls == 1)
+            || polls == 2'000'000;
+    };
+    return ctp::run_live_engine(
+        config, output, error, stop_requested, std::move(dependencies));
+}
+
+void test_live_runner_isolates_trader_creation_failure(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(4);
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    std::size_t next_account = 0;
+    dependencies.create_trader = [&traders, &next_account](const std::string&)
+        -> std::unique_ptr<ctp::TraderApi> {
+        const auto index = next_account++;
+        if (index == 0) return nullptr;
+        return make_recovering_trader(traders[index], false);
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = run_until_three_healthy_accounts_submit(
+        config, market, traders, std::move(dependencies), output, error);
+
+    runner.expect(
+        exit_code == 0 && next_account == 4,
+        "one trader creation failure must not stop healthy accounts");
+    runner.expect(
+        traders[0]->order_insert_calls == 0
+            && traders[1]->order_insert_calls == 1
+            && traders[2]->order_insert_calls == 1
+            && traders[3]->order_insert_calls == 1,
+        "only accounts with a trader API may submit orders");
+    runner.expect(
+        output.str().find("ready=3, failed=1, submitted=3")
+            != std::string::npos,
+        "the summary must include the locally unavailable account");
+}
+
+void test_live_runner_stops_when_all_trader_creations_fail(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(4);
+    std::size_t trader_attempts = 0;
+    std::size_t market_attempts = 0;
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    dependencies.create_market = [&market_attempts] {
+        ++market_attempts;
+        return std::unique_ptr<ctp::MarketApi>{};
+    };
+    dependencies.create_trader = [&trader_attempts](const std::string&)
+        -> std::unique_ptr<ctp::TraderApi> {
+        ++trader_attempts;
+        return nullptr;
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, [] { return false; }, std::move(dependencies));
+
+    runner.expect(
+        exit_code == 3 && trader_attempts == 4 && market_attempts == 0,
+        "the engine must stop only after every account worker is unavailable");
+}
+
+void test_live_runner_isolates_trace_journal_start_failure(
+    test_support::TestRunner& runner)
+{
+    auto accounts = make_accounts(4);
+    accounts[0] = ctp::AccountConfig{
+        "missing/account1",
+        "9999",
+        "user1",
+        "password1",
+        "app1",
+        "auth1",
+        "tcp://127.0.0.1:41001"};
+    auto config = make_live_config(std::move(accounts));
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+
+    const std::filesystem::path trace_root{
+        "/tmp/ctp_trace_start_isolation"};
+    std::filesystem::remove_all(trace_root);
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    std::size_t next_account = 0;
+    dependencies.create_trader = [&traders, &next_account](const std::string&) {
+        const auto index = next_account++;
+        return make_recovering_trader(traders[index], false);
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = run_until_three_healthy_accounts_submit(
+        config, market, traders, std::move(dependencies), output, error);
+
+    runner.expect(
+        exit_code == 0 && next_account == 4,
+        "one trace journal failure must not stop healthy accounts");
+    runner.expect(
+        traders[0]->order_insert_calls == 0
+            && traders[1]->order_insert_calls == 1
+            && traders[2]->order_insert_calls == 1
+            && traders[3]->order_insert_calls == 1,
+        "an account without a trace journal must remain fail-closed");
+    runner.expect(
+        output.str().find("ready=3, failed=1, submitted=3")
+            != std::string::npos,
+        "the summary must include the account without a trace journal");
+    std::filesystem::remove_all(trace_root);
 }
 
 int run_single_account_signal(const ctp::RuntimeConfig& config)
@@ -1182,6 +1350,9 @@ int main()
     test_price_normalization_boundaries(runner);
     test_four_account_fault_matrix(runner);
     test_live_runner_isolates_one_failed_account(runner);
+    test_live_runner_isolates_trader_creation_failure(runner);
+    test_live_runner_stops_when_all_trader_creations_fail(runner);
+    test_live_runner_isolates_trace_journal_start_failure(runner);
     test_live_runner_enforces_margin_and_exchange_time_window(runner);
     test_live_runner_fails_over_first_market_login(runner);
     test_live_runner_fails_over_market_subscription(runner);
