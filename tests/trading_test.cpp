@@ -1272,6 +1272,219 @@ void complete_empty_recovery(
     session.drain_callbacks();
 }
 
+void test_callback_overflow_recovers_a_lost_trade(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    CapturingTraceSink trace;
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 1, 1, 1,
+        auto_close_policy(), &trace, 91};
+    session.start();
+    complete_empty_recovery(session, *view);
+
+    const auto submitted = session.submit(
+        opening_intent(9501), healthy_risk_snapshot());
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "41");
+    accepted.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRtnOrder(&accepted);
+    emit_trade(
+        view->spi(), "41", "lost-open-9501",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+
+    runner.expect(
+        submitted.code == ctp::SubmitCode::Submitted
+            && session.execution_snapshot().frozen
+            && session.execution_snapshot().fault
+                == ctp::AccountFault::CallbackQueueOverflow
+            && session.recovery_snapshot().phase
+                == ctp::RecoveryPhase::QueryingOrders
+            && metrics->authenticate_calls == 1
+            && metrics->login_calls == 1
+            && metrics->order_query_calls == 2,
+        "a ready account must start query reconciliation after callback overflow");
+
+    CThostFtdcRspInfoField ok{};
+    CThostFtdcOrderField filled{};
+    ctp::copy_to_field(filled.OrderRef, "41");
+    filled.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    filled.OrderStatus = THOST_FTDC_OST_AllTraded;
+    filled.VolumeTraded = 1;
+    view->spi()->OnRspQryOrder(
+        &filled, &ok, metrics->order_query_request_id, true);
+    session.drain_callbacks();
+
+    CThostFtdcTradeField trade{};
+    ctp::copy_to_field(trade.OrderRef, "41");
+    ctp::copy_to_field(trade.TradingDay, "20260907");
+    ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+    ctp::copy_to_field(trade.TradeID, "lost-open-9501");
+    ctp::copy_to_field(trade.InstrumentID, "IF2609");
+    trade.Direction = THOST_FTDC_D_Buy;
+    trade.OffsetFlag = THOST_FTDC_OF_Open;
+    trade.Volume = 1;
+    view->spi()->OnRspQryTrade(
+        &trade, &ok, metrics->trade_query_request_id, true);
+    session.drain_callbacks();
+
+    CThostFtdcInvestorPositionField position{};
+    ctp::copy_to_field(position.InstrumentID, "IF2609");
+    position.PosiDirection = THOST_FTDC_PD_Long;
+    position.HedgeFlag = THOST_FTDC_HF_Speculation;
+    position.Position = 1;
+    view->spi()->OnRspQryInvestorPosition(
+        &position, &ok, metrics->position_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcTradingAccountField funds{};
+    funds.Available = 2.0;
+    view->spi()->OnRspQryTradingAccount(
+        &funds, &ok, metrics->account_request_id, true);
+    session.drain_callbacks();
+
+    ctp::OrderSnapshot recovered_order{};
+    ctp::PositionSnapshot recovered_position{};
+    session.order_snapshot(submitted.client_order_id, recovered_order);
+    session.position_snapshot("IF2609", recovered_position);
+    const auto close = session.on_market(
+        valid_market(), healthy_risk_snapshot());
+    emit_trade(
+        view->spi(), "41", "lost-open-9501",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    session.on_market(valid_market(2), healthy_risk_snapshot());
+
+    const auto recovered_traces = std::count_if(
+        trace.events.begin(), trace.events.begin() + trace.size,
+        [](const ctp::TraceEvent& event) {
+            return event.stage == ctp::TraceStage::Trade
+                && event.trace_id.signal_id == 9501;
+        });
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Ready
+            && !session.execution_snapshot().frozen
+            && recovered_order.state == ctp::OrderState::Filled
+            && recovered_position.long_quantity == 1
+            && close.action == ctp::ExecutionAction::ExitSubmitted
+            && metrics->order_insert_calls == 2
+            && recovered_traces == 2,
+        "queries must restore a lost fill and a late duplicate must not resubmit");
+
+    // 首次溢出故障值会保留，但恢复成功后的新缺口仍必须重新冻结并核对。
+    emit_trade(
+        view->spi(), "41", "lost-open-9501",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    emit_trade(
+        view->spi(), "41", "lost-open-9501",
+        ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::QueryingOrders
+            && session.execution_snapshot().frozen
+            && metrics->order_query_calls == 3
+            && session.execution_snapshot().alert_count == 1,
+        "a recovered account must reconcile again after another callback overflow");
+}
+
+void test_callback_overflow_during_recovery_fails_closed(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 1};
+    session.start();
+    complete_empty_recovery(session, *view);
+    session.submit(opening_intent(9502), healthy_risk_snapshot());
+
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "41");
+    accepted.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    view->spi()->OnRtnOrder(&accepted);
+    view->spi()->OnRtnOrder(&accepted);
+    session.drain_callbacks();
+
+    CThostFtdcRspInfoField ok{};
+    view->spi()->OnRspQryOrder(
+        &accepted, &ok, metrics->order_query_request_id, false);
+    view->spi()->OnRspQryOrder(
+        &accepted, &ok, metrics->order_query_request_id, true);
+    session.drain_callbacks();
+
+    runner.expect(
+        session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+            && session.recovery_snapshot().failure
+                == ctp::RecoveryFailure::CallbackQueueOverflow
+            && session.execution_snapshot().frozen
+            && metrics->order_query_calls == 2
+            && metrics->trade_query_calls == 1,
+        "callback overflow during reconciliation must fail closed without retry");
+}
+
+void test_callback_overflow_recovery_is_isolated_across_four_accounts(
+    test_support::TestRunner& runner)
+{
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> metrics;
+    std::vector<test_support::FakeTraderApi*> api_views;
+    std::vector<std::unique_ptr<ctp::AccountTradingSession>> sessions;
+    for (int index = 0; index < 4; ++index) {
+        const ctp::AccountConfig account{
+            "account" + std::to_string(index + 1),
+            "9999", "user" + std::to_string(index + 1),
+            "password", "app", "auth", "front"};
+        auto account_metrics =
+            std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(account_metrics);
+        api_views.push_back(fake.get());
+        metrics.push_back(account_metrics);
+        sessions.push_back(std::make_unique<ctp::AccountTradingSession>(
+            account, risk_limits(), std::move(fake), 8, 16, 8,
+            index == 0 ? 1 : 4));
+        sessions.back()->start();
+        complete_empty_recovery(*sessions.back(), *api_views.back());
+    }
+
+    const auto target_order = sessions[0]->submit(
+        opening_intent(9600), healthy_risk_snapshot());
+    CThostFtdcOrderField accepted{};
+    ctp::copy_to_field(accepted.OrderRef, "41");
+    accepted.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    accepted.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+    api_views[0]->spi()->OnRtnOrder(&accepted);
+    api_views[0]->spi()->OnRtnOrder(&accepted);
+    sessions[0]->drain_callbacks();
+
+    runner.expect(
+        target_order.code == ctp::SubmitCode::Submitted
+            && sessions[0]->execution_snapshot().frozen
+            && sessions[0]->recovery_snapshot().phase
+                == ctp::RecoveryPhase::QueryingOrders
+            && metrics[0]->order_query_calls == 2,
+        "only the overflowing account must enter query reconciliation");
+    for (int index = 1; index < 4; ++index) {
+        const auto submitted = sessions[index]->submit(
+            opening_intent(9600 + index), healthy_risk_snapshot());
+        runner.expect(
+            submitted.code == ctp::SubmitCode::Submitted
+                && sessions[index]->recovery_snapshot().phase
+                    == ctp::RecoveryPhase::Ready
+                && !sessions[index]->execution_snapshot().frozen
+                && metrics[index]->order_query_calls == 1
+                && metrics[index]->order_insert_calls == 1,
+            "callback recovery must not freeze or query another account");
+    }
+}
+
 void test_reconnect_queries_before_unfreezing(test_support::TestRunner& runner)
 {
     const ctp::AccountConfig account{
@@ -1743,6 +1956,9 @@ int main()
     test_close_retry_exhaustion_freezes_without_faking_zero(runner);
     test_entry_timeout_cancels_once(runner);
     test_close_fill_wins_cancel_race_without_reprice(runner);
+    test_callback_overflow_recovers_a_lost_trade(runner);
+    test_callback_overflow_during_recovery_fails_closed(runner);
+    test_callback_overflow_recovery_is_isolated_across_four_accounts(runner);
     test_reconnect_queries_before_unfreezing(runner);
     test_recovery_persists_available_funds(runner);
     test_unknown_recovery_order_never_resubmits(runner);

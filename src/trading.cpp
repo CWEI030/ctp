@@ -999,10 +999,11 @@ struct AccountTradingSession::Impl {
 
     void set_fault(AccountFault reason) noexcept
     {
-        if (fault != AccountFault::None) return;
-        fault = reason;
+        // 故障原因保持首次值，但账户每次出现缺口都必须重新冻结。
         frozen = true;
         reconciliation = true;
+        if (fault != AccountFault::None) return;
+        fault = reason;
         ++alert_count;
     }
 
@@ -1083,17 +1084,30 @@ struct AccountTradingSession::Impl {
             &request, expected_recovery_request_id);
     }
 
-    bool push_callback(const CallbackEvent& event) noexcept
+    int begin_query_reconciliation() noexcept
+    {
+        frozen = true;
+        reconciliation = true;
+        recovery.failure = RecoveryFailure::None;
+        recovery.queried_orders = 0;
+        recovery.queried_trades = 0;
+        recovery.queried_positions = 0;
+        for (auto& record : signals) {
+            record.seen_during_recovery = false;
+        }
+        return request_orders();
+    }
+
+    void push_callback(const CallbackEvent& event) noexcept
     {
         const auto write = callback_write.load(std::memory_order_relaxed);
         const auto next = (write + 1) % callbacks.size();
         if (next == callback_read.load(std::memory_order_acquire)) {
             callback_overflow.store(true, std::memory_order_release);
-            return false;
+            return;
         }
         callbacks[write] = event;
         callback_write.store(next, std::memory_order_release);
-        return true;
     }
 
     bool pop_callback(CallbackEvent& event) noexcept
@@ -1669,7 +1683,10 @@ void copy_from_ctp(std::array<char, N>& destination, const char* source) noexcep
 
 std::size_t AccountTradingSession::drain_callbacks() noexcept
 {
-    if (impl_->callback_overflow.exchange(false, std::memory_order_acq_rel)) {
+    const auto overflow_phase = impl_->recovery.phase;
+    const bool callback_overflow =
+        impl_->callback_overflow.exchange(false, std::memory_order_acq_rel);
+    if (callback_overflow) {
         impl_->set_fault(AccountFault::CallbackQueueOverflow);
     }
     std::size_t applied_count = 0;
@@ -1718,13 +1735,7 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                     event.login.FrontID,
                     event.login.SessionID,
                     event.login.MaxOrderRef);
-                impl_->recovery.queried_orders = 0;
-                impl_->recovery.queried_trades = 0;
-                impl_->recovery.queried_positions = 0;
-                for (auto& record : impl_->signals) {
-                    record.seen_during_recovery = false;
-                }
-                if (impl_->request_orders() != 0) {
+                if (impl_->begin_query_reconciliation() != 0) {
                     impl_->recovery_failure(RecoveryFailure::RequestRejected);
                 }
             }
@@ -2025,6 +2036,28 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             }
         }
         impl_->release_terminal_open(*record);
+    }
+    if (callback_overflow) {
+        const bool overflowed_during_recovery =
+            overflow_phase == RecoveryPhase::Connecting
+            || overflow_phase == RecoveryPhase::Authenticating
+            || overflow_phase == RecoveryPhase::LoggingIn
+            || overflow_phase == RecoveryPhase::QueryingOrders
+            || overflow_phase == RecoveryPhase::QueryingTrades
+            || overflow_phase == RecoveryPhase::QueryingPositions
+            || overflow_phase == RecoveryPhase::QueryingFunds
+            || overflow_phase == RecoveryPhase::Reconciling;
+        if (overflowed_during_recovery) {
+            impl_->recovery_failure(RecoveryFailure::CallbackQueueOverflow);
+        } else if (overflow_phase == RecoveryPhase::Ready
+                   && impl_->recovery.phase == RecoveryPhase::Ready) {
+            // 先排空已入队回报，再由账户线程发起查询，
+            // 避免队列尚在满载时立即丢失查询响应。
+            impl_->trace(TraceStage::RecoveryStarted);
+            if (impl_->begin_query_reconciliation() != 0) {
+                impl_->recovery_failure(RecoveryFailure::RequestRejected);
+            }
+        }
     }
     return applied_count;
 }

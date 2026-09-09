@@ -300,6 +300,7 @@ enum class RecoveryFailure : std::uint8_t {
     InvalidPosition,
     InvalidFunds,
     CapacityExceeded,
+    CallbackQueueOverflow,
 };
 
 struct RecoverySnapshot {
