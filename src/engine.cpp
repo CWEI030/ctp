@@ -314,9 +314,10 @@ class LiveMarketConnection final : public CThostFtdcMdSpi {
 public:
     LiveMarketConnection(
         const RuntimeConfig& config,
+        const AccountConfig& account,
         MarketIngress& ingress,
         std::unique_ptr<MarketApi> api)
-        : account_(config.accounts().front()),
+        : account_(account),
           live_(config.live()),
           ingress_(ingress),
           api_(std::move(api))
@@ -811,12 +812,59 @@ int run_live_engine(
 
     std::atomic<bool> stopping{false};
     for (auto& worker : workers) worker->start(stopping);
-    LiveMarketConnection market{
-        config, ingress, dependencies.create_market()};
-    if (!market.start()) {
+
+    std::unique_ptr<LiveMarketConnection> market;
+    std::size_t market_account_index = 0;
+    std::size_t next_market_account = 0;
+    std::size_t failed_market_accounts = 0;
+    bool market_was_running = false;
+
+    // 行情是共享资源，但登录凭据不是全局单点。候选失败后先完整释放旧
+    // API，再按配置顺序用下一账户创建新实例，避免复用失败会话的内部状态。
+    const auto ensure_market_candidate = [&] {
+        while (failed_market_accounts < config.accounts().size()) {
+            if (market) {
+                if (market->state() != LiveMarketState::Failed) return true;
+                error << "[warn] market candidate failed: account="
+                      << config.accounts()[market_account_index].alias()
+                      << "; trying next account\n";
+                market.reset();
+                ++failed_market_accounts;
+            }
+            if (failed_market_accounts == config.accounts().size()) break;
+
+            market_account_index = next_market_account;
+            next_market_account = (next_market_account + 1)
+                % config.accounts().size();
+            auto api = dependencies.create_market();
+            if (!api) {
+                error << "[warn] cannot create market API: account="
+                      << config.accounts()[market_account_index].alias()
+                      << "; trying next account\n";
+                ++failed_market_accounts;
+                continue;
+            }
+            market = std::make_unique<LiveMarketConnection>(
+                config,
+                config.accounts()[market_account_index],
+                ingress,
+                std::move(api));
+            if (!market->start()) {
+                error << "[warn] cannot start market API: account="
+                      << config.accounts()[market_account_index].alias()
+                      << "; trying next account\n";
+                market.reset();
+                ++failed_market_accounts;
+                continue;
+            }
+        }
+        return false;
+    };
+
+    if (!ensure_market_candidate()) {
         stopping.store(true, std::memory_order_release);
         for (auto& worker : workers) worker->join();
-        error << "[error] cannot create market API\n";
+        error << "[error] all market account credentials failed\n";
         return 3;
     }
 
@@ -825,11 +873,20 @@ int run_live_engine(
            << (config.live().allow_orders ? "enabled" : "disabled") << '\n';
 
     while (!stop_requested()) {
-        if (market.state() == LiveMarketState::Failed) {
-            error << "[error] market login or subscription failed\n";
-            stopping.store(true, std::memory_order_release);
-            for (auto& worker : workers) worker->join();
-            return 3;
+        if (market->state() == LiveMarketState::Running) {
+            if (!market_was_running) {
+                // 成功运行后开启新一轮故障转移预算，供后续重连失败使用。
+                failed_market_accounts = 0;
+                market_was_running = true;
+            }
+        } else if (market->state() == LiveMarketState::Failed) {
+            market_was_running = false;
+            if (!ensure_market_candidate()) {
+                stopping.store(true, std::memory_order_release);
+                for (auto& worker : workers) worker->join();
+                error << "[error] all market account credentials failed\n";
+                return 3;
+            }
         }
         std::this_thread::yield();
     }

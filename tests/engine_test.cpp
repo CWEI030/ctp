@@ -57,6 +57,11 @@ struct FakeLiveMarketState {
     std::atomic<CThostFtdcMdSpi*> spi{nullptr};
     std::atomic<bool> subscribed{false};
     std::atomic<int> release_calls{0};
+    int login_error{0};
+    int subscription_error{0};
+    std::string broker_id;
+    std::string user_id;
+    std::string password;
 };
 
 class FakeLiveMarketApi final : public ctp::MarketApi {
@@ -78,10 +83,17 @@ public:
         state_->spi.load(std::memory_order_acquire)->OnFrontConnected();
     }
 
-    int request_user_login(CThostFtdcReqUserLoginField*, int request_id) override
+    int request_user_login(
+        CThostFtdcReqUserLoginField* request,
+        int request_id) override
     {
+        state_->broker_id = request->BrokerID;
+        state_->user_id = request->UserID;
+        state_->password = request->Password;
+        CThostFtdcRspInfoField info{};
+        info.ErrorID = state_->login_error;
         state_->spi.load(std::memory_order_acquire)->OnRspUserLogin(
-            nullptr, nullptr, request_id, true);
+            nullptr, &info, request_id, true);
         return 0;
     }
 
@@ -89,9 +101,13 @@ public:
     {
         CThostFtdcSpecificInstrumentField response{};
         if (count == 1) ctp::copy_to_field(response.InstrumentID, instruments[0]);
-        state_->subscribed.store(true, std::memory_order_release);
+        CThostFtdcRspInfoField info{};
+        info.ErrorID = state_->subscription_error;
+        if (info.ErrorID == 0) {
+            state_->subscribed.store(true, std::memory_order_release);
+        }
         state_->spi.load(std::memory_order_acquire)->OnRspSubMarketData(
-            &response, nullptr, 1, true);
+            &response, &info, 1, true);
         return 0;
     }
 
@@ -652,6 +668,214 @@ void test_live_runner_isolates_one_failed_account(
         "the shared market API must be released exactly once");
 }
 
+void test_live_runner_fails_over_first_market_login(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(4);
+    std::vector<std::shared_ptr<FakeLiveMarketState>> markets;
+    for (std::size_t index = 0; index < 2; ++index) {
+        markets.push_back(std::make_shared<FakeLiveMarketState>());
+    }
+    markets[0]->login_error = 7;
+
+    std::vector<std::shared_ptr<test_support::FakeTraderMetrics>> traders;
+    for (std::size_t index = 0; index < 4; ++index) {
+        traders.push_back(
+            std::make_shared<test_support::FakeTraderMetrics>());
+    }
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    std::size_t next_market = 0;
+    dependencies.create_market = [&markets, &next_market] {
+        return std::make_unique<FakeLiveMarketApi>(markets[next_market++]);
+    };
+    std::size_t next_account = 0;
+    dependencies.create_trader = [&traders, &next_account](const std::string&) {
+        const auto index = next_account++;
+        return make_recovering_trader(traders[index], index == 0);
+    };
+
+    bool published = false;
+    std::size_t polls = 0;
+    const auto stop_requested = [&] {
+        if (markets[1]->subscribed.load(std::memory_order_acquire)
+            && !published) {
+            auto below = make_tick(0);
+            below.LastPrice = 799.8;
+            below.BidPrice1 = 799.6;
+            below.AskPrice1 = 800.0;
+            markets[1]->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&below);
+            auto crossing = make_tick(1);
+            crossing.LastPrice = 800.0;
+            crossing.BidPrice1 = 799.8;
+            crossing.AskPrice1 = 800.2;
+            markets[1]->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&crossing);
+            published = true;
+        }
+        ++polls;
+        return (traders[1]->order_insert_calls == 1
+                && traders[2]->order_insert_calls == 1
+                && traders[3]->order_insert_calls == 1)
+            || polls == 2'000'000;
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, stop_requested, std::move(dependencies));
+
+    runner.expect(
+        exit_code == 0 && next_market == 2,
+        "a failed first market login must fall through to the next account");
+    runner.expect(
+        markets[0]->user_id == "user1" && markets[0]->password == "password1"
+            && markets[1]->user_id == "user2"
+            && markets[1]->password == "password2",
+        "market failover must try configured account credentials in order");
+    runner.expect(
+        markets[0]->release_calls.load(std::memory_order_relaxed) == 1
+            && markets[1]->release_calls.load(std::memory_order_relaxed) == 1,
+        "each market API must be detached and released exactly once");
+    runner.expect(
+        traders[0]->order_insert_calls == 0
+            && traders[1]->order_insert_calls == 1
+            && traders[2]->order_insert_calls == 1
+            && traders[3]->order_insert_calls == 1,
+        "market credential failover must preserve healthy account order flow");
+    runner.expect(
+        output.str().find("ready=3, failed=1, submitted=3")
+            != std::string::npos,
+        "market failover must preserve independent account outcomes");
+}
+
+void test_live_runner_fails_over_market_subscription(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(2);
+    auto first = std::make_shared<FakeLiveMarketState>();
+    auto second = std::make_shared<FakeLiveMarketState>();
+    first->subscription_error = 9;
+    std::vector<std::shared_ptr<FakeLiveMarketState>> markets{first, second};
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    std::size_t next_market = 0;
+    dependencies.create_market = [&markets, &next_market] {
+        return std::make_unique<FakeLiveMarketApi>(markets[next_market++]);
+    };
+    dependencies.create_trader = [](const std::string&) {
+        return make_recovering_trader(
+            std::make_shared<test_support::FakeTraderMetrics>(), false);
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config,
+        output,
+        error,
+        [second] { return second->subscribed.load(std::memory_order_acquire); },
+        std::move(dependencies));
+
+    runner.expect(
+        exit_code == 0 && next_market == 2 && first->user_id == "user1"
+            && second->user_id == "user2",
+        "a failed subscription must use a fresh API with the next account");
+    runner.expect(
+        first->release_calls.load(std::memory_order_relaxed) == 1
+            && second->release_calls.load(std::memory_order_relaxed) == 1,
+        "subscription failover must release both API instances once");
+}
+
+void test_live_runner_stops_after_all_market_accounts_fail(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(4);
+    std::vector<std::shared_ptr<FakeLiveMarketState>> markets;
+    for (std::size_t index = 0; index < 4; ++index) {
+        auto state = std::make_shared<FakeLiveMarketState>();
+        state->login_error = 10 + static_cast<int>(index);
+        markets.push_back(std::move(state));
+    }
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    std::size_t next_market = 0;
+    dependencies.create_market = [&markets, &next_market] {
+        return std::make_unique<FakeLiveMarketApi>(markets[next_market++]);
+    };
+    dependencies.create_trader = [](const std::string&) {
+        return make_recovering_trader(
+            std::make_shared<test_support::FakeTraderMetrics>(), false);
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, [] { return false; }, std::move(dependencies));
+
+    bool released_once = true;
+    for (const auto& market : markets) {
+        released_once = released_once
+            && market->release_calls.load(std::memory_order_relaxed) == 1;
+    }
+    runner.expect(
+        exit_code == 3 && next_market == 4 && released_once,
+        "the engine must stop only after every market credential fails once");
+    runner.expect(
+        error.str().find("all market account credentials failed")
+            != std::string::npos,
+        "exhausted market failover must report the global failure boundary");
+}
+
+void test_live_runner_reopens_failover_after_running(
+    test_support::TestRunner& runner)
+{
+    auto config = make_live_config(2);
+    auto first = std::make_shared<FakeLiveMarketState>();
+    auto second = std::make_shared<FakeLiveMarketState>();
+    std::vector<std::shared_ptr<FakeLiveMarketState>> markets{first, second};
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    std::size_t next_market = 0;
+    dependencies.create_market = [&markets, &next_market] {
+        return std::make_unique<FakeLiveMarketApi>(markets[next_market++]);
+    };
+    dependencies.create_trader = [](const std::string&) {
+        return make_recovering_trader(
+            std::make_shared<test_support::FakeTraderMetrics>(), false);
+    };
+
+    int running_polls = 0;
+    const auto stop_requested = [&] {
+        if (first->subscribed.load(std::memory_order_acquire)
+            && running_polls++ == 1) {
+            first->login_error = 11;
+            auto* spi = first->spi.load(std::memory_order_acquire);
+            spi->OnFrontDisconnected(0x1001);
+            spi->OnFrontConnected();
+        }
+        return second->subscribed.load(std::memory_order_acquire);
+    };
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config, output, error, stop_requested, std::move(dependencies));
+
+    runner.expect(
+        exit_code == 0 && next_market == 2 && second->user_id == "user2",
+        "a reconnect login failure after running must start a fresh failover round");
+    runner.expect(
+        first->release_calls.load(std::memory_order_relaxed) == 1
+            && second->release_calls.load(std::memory_order_relaxed) == 1,
+        "reconnect failover must release each market API exactly once");
+}
+
 void test_live_runner_restores_latest_identity_before_market(
     test_support::TestRunner& runner)
 {
@@ -802,6 +1026,10 @@ int main()
     test_price_normalization_boundaries(runner);
     test_four_account_fault_matrix(runner);
     test_live_runner_isolates_one_failed_account(runner);
+    test_live_runner_fails_over_first_market_login(runner);
+    test_live_runner_fails_over_market_subscription(runner);
+    test_live_runner_stops_after_all_market_accounts_fail(runner);
+    test_live_runner_reopens_failover_after_running(runner);
     test_live_runner_restores_latest_identity_before_market(runner);
     test_live_runner_refuses_unsafe_latest_trace(runner);
     test_live_validation_rejects_unresolved_placeholders(runner);
