@@ -202,6 +202,34 @@ void test_truncated_journal_is_not_a_clean_restart(
     std::filesystem::remove(path);
 }
 
+void test_structurally_complete_abnormal_journal_allows_counter_recovery(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{
+        "/tmp/ctp_crash_recovery_abnormal_trace.csv"};
+    for (std::size_t flushed_events = 0; flushed_events <= 2;
+         ++flushed_events) {
+        std::filesystem::remove(path);
+        {
+            std::ofstream output{path};
+            output << "ctp_trace_v2,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels\n";
+            if (flushed_events >= 1) {
+                output << "ctp_trace_v2,account1,17,9001,1,100,risk_accepted,71,41,4000,1,0,0,0,0,IF2609,0,,0,0,0\n";
+            }
+            if (flushed_events >= 2) {
+                output << "ctp_trace_v2,account1,17,9001,2,200,order_submitted,71,41,4000,1,0,0,0,0,IF2609,0,,0,0,0\n";
+            }
+        }
+        const auto loaded = ctp::read_trace_journal(path);
+        const auto image = ctp::build_restart_image(loaded);
+        runner.expect(
+            loaded.valid && !loaded.clean_shutdown && !image.valid
+                && loaded.events.size() == flushed_events,
+            "every complete prefix around async log flush must allow counter recovery without becoming a restart image");
+    }
+    std::filesystem::remove(path);
+}
+
 void test_dropped_trace_journal_is_not_a_restart_source(
     test_support::TestRunner& runner)
 {
@@ -515,6 +543,7 @@ int main()
     test_trace_queue_reserves_capacity_for_order_facts(runner);
     test_async_journal_round_trip_and_clean_marker(runner);
     test_truncated_journal_is_not_a_clean_restart(runner);
+    test_structurally_complete_abnormal_journal_allows_counter_recovery(runner);
     test_dropped_trace_journal_is_not_a_restart_source(runner);
     test_best_effort_drop_does_not_poison_restart_source(runner);
     test_restart_image_keeps_only_unresolved_orders(runner);

@@ -451,10 +451,13 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
         result.max_order_ref = std::max(result.max_order_ref, event.order_ref);
         result.events.push_back(event);
     }
-    if (!input.eof() || result.events.empty()) return {};
-    result.clean_shutdown = result.events.back().stage == TraceStage::CleanStop;
-    // 关键订单事实缺失时失败关闭；未关联行情丢弃只作容量观测。
-    result.valid = result.clean_shutdown && result.events.back().code == 0;
+    if (!input.eof()) return {};
+    result.clean_shutdown = !result.events.empty()
+        && result.events.back().stage == TraceStage::CleanStop;
+    // 结构完整与可直接构造重启镜像是两个不同契约。异常退出的日志
+    // 不能驱动本地镜像，但可允许会话连接柜台并以查询事实重新建账。
+    result.valid = !result.clean_shutdown
+        || result.events.back().code == 0;
     return result;
 }
 

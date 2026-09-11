@@ -23,6 +23,7 @@ namespace {
 
 struct RestartLoad {
     bool found{false};
+    bool journal_valid{false};
     RestartImage image;
 };
 
@@ -58,7 +59,9 @@ RestartLoad load_latest_restart(
         latest_path = candidate;
     }
     if (result.found) {
-        result.image = build_restart_image(read_trace_journal(latest_path));
+        const auto journal = read_trace_journal(latest_path);
+        result.journal_valid = journal.valid;
+        result.image = build_restart_image(journal);
     }
     return result;
 }
@@ -955,6 +958,7 @@ int run_live_engine(
             auto restart = load_latest_restart(
                 dependencies.trace_root, account.alias());
             if (restart.found && !restart.image.valid
+                && !restart.journal_valid
                 && config.live().allow_orders) {
                 error << "[warn] latest trace is not safe for restart: account="
                       << account.alias() << '\n';
@@ -1003,7 +1007,9 @@ int run_live_engine(
     };
     for (std::size_t index = 0; index < config.accounts().size(); ++index) {
         const bool restart_blocked = restarts[index].found
-            && !restarts[index].image.valid && config.live().allow_orders;
+            && !restarts[index].image.valid
+            && !restarts[index].journal_valid
+            && config.live().allow_orders;
         if (restart_blocked) {
             add_blocked_worker(index);
             continue;

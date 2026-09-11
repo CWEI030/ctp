@@ -756,6 +756,7 @@ struct SignalRecord {
     OrderIntent intent{};
     SubmitResult result{};
     bool seen_during_recovery{false};
+    bool imported_from_counter{false};
 };
 
 enum class CallbackType : std::uint8_t {
@@ -849,6 +850,49 @@ std::string_view field_view(const std::array<char, N>& field) noexcept
 {
     const auto end = std::find(field.begin(), field.end(), '\0');
     return {field.data(), static_cast<std::size_t>(end - field.begin())};
+}
+
+constexpr std::string_view kOrderOwnershipPrefix{"JCTP1:"};
+constexpr std::uint64_t kLargestCtpOrderRef = 999'999'999'999ULL;
+
+template <std::size_t N>
+std::string_view ctp_field_view(const char (&field)[N]) noexcept
+{
+    const auto end = std::find(std::begin(field), std::end(field), '\0');
+    if (end == std::end(field)) return {};
+    return {field, static_cast<std::size_t>(end - std::begin(field))};
+}
+
+template <std::size_t N>
+bool write_order_ownership(
+    char (&field)[N], std::uint64_t order_ref) noexcept
+{
+    static_assert(N > kOrderOwnershipPrefix.size());
+    std::copy(kOrderOwnershipPrefix.begin(), kOrderOwnershipPrefix.end(), field);
+    const auto converted = std::to_chars(
+        field + kOrderOwnershipPrefix.size(), field + N - 1, order_ref);
+    if (converted.ec != std::errc{}) return false;
+    *converted.ptr = '\0';
+    return true;
+}
+
+template <std::size_t N>
+bool has_order_ownership(
+    const char (&field)[N], std::uint64_t order_ref) noexcept
+{
+    const auto text = ctp_field_view(field);
+    if (text.size() <= kOrderOwnershipPrefix.size()
+        || text.substr(0, kOrderOwnershipPrefix.size())
+            != kOrderOwnershipPrefix) {
+        return false;
+    }
+    std::uint64_t tagged_ref = 0;
+    const auto digits = text.substr(kOrderOwnershipPrefix.size());
+    const auto parsed = std::from_chars(
+        digits.data(), digits.data() + digits.size(), tagged_ref);
+    return !digits.empty() && parsed.ec == std::errc{}
+        && parsed.ptr == digits.data() + digits.size()
+        && tagged_ref == order_ref;
 }
 
 }
@@ -1198,6 +1242,95 @@ struct AccountTradingSession::Impl {
             }
         }
         return nullptr;
+    }
+
+    SignalRecord* import_owned_order(
+        const CThostFtdcOrderField& order,
+        std::uint64_t order_ref,
+        RecoveryFailure& failure) noexcept
+    {
+        failure = RecoveryFailure::UnknownOrder;
+        const bool valid_direction = order.Direction == THOST_FTDC_D_Buy
+            || order.Direction == THOST_FTDC_D_Sell;
+        const bool valid_offset = order.CombOffsetFlag[0] == THOST_FTDC_OF_Open
+            || order.CombOffsetFlag[0] == THOST_FTDC_OF_Close
+            || order.CombOffsetFlag[0] == THOST_FTDC_OF_CloseToday
+            || order.CombOffsetFlag[0] == THOST_FTDC_OF_CloseYesterday;
+        const auto instrument = ctp_field_view(order.InstrumentID);
+        const double price_ticks = order.LimitPrice / minimum_price_increment;
+        if (!has_order_ownership(order.BusinessUnit, order_ref)
+            || !valid_direction || !valid_offset || instrument.empty()
+            || instrument.size() >= kInstrumentIdCapacity
+            || order_ref == 0 || order_ref > kLargestCtpOrderRef
+            || order.VolumeTotalOriginal <= 0 || order.VolumeTraded < 0
+            || order.VolumeTraded > order.VolumeTotalOriginal
+            || !std::isfinite(price_ticks) || price_ticks <= 0.0
+            || price_ticks
+                >= static_cast<double>(std::numeric_limits<std::int64_t>::max())
+            || next_client_order_id == 0
+            || next_client_order_id == std::numeric_limits<std::uint64_t>::max()) {
+            return nullptr;
+        }
+        SignalRecord* free_record = nullptr;
+        for (auto& candidate : signals) {
+            if (!candidate.occupied) {
+                free_record = &candidate;
+                break;
+            }
+        }
+        if (free_record == nullptr) {
+            failure = RecoveryFailure::CapacityExceeded;
+            return nullptr;
+        }
+
+        const auto client_order_id = next_client_order_id;
+        OrderSeed seed{};
+        seed.client_order_id = client_order_id;
+        copy_to_field(seed.instrument, instrument);
+        seed.direction = order.Direction == THOST_FTDC_D_Buy
+            ? Direction::Buy : Direction::Sell;
+        seed.offset = order.CombOffsetFlag[0] == THOST_FTDC_OF_Open
+            ? Offset::Open : Offset::Close;
+        seed.quantity = order.VolumeTotalOriginal;
+        const auto created = state.create_order(seed);
+        if (created.code == ApplyCode::CapacityExceeded) {
+            failure = RecoveryFailure::CapacityExceeded;
+            return nullptr;
+        }
+        if (created.code != ApplyCode::Applied
+            || state.apply_local_event(
+                   client_order_id,
+                   LocalOrderEvent::RiskAccepted).code != ApplyCode::Applied
+            || state.apply_local_event(
+                   client_order_id,
+                   LocalOrderEvent::Submitted).code != ApplyCode::Applied) {
+            return nullptr;
+        }
+
+        ++next_client_order_id;
+        next_order_ref = std::max(next_order_ref, order_ref + 1);
+        free_record->occupied = true;
+        free_record->imported_from_counter = true;
+        free_record->intent.signal_id = order_ref;
+        free_record->intent.instrument = seed.instrument;
+        free_record->intent.direction = seed.direction;
+        free_record->intent.offset = seed.offset;
+        free_record->intent.quantity = seed.quantity;
+        free_record->intent.limit_price_ticks =
+            static_cast<std::int64_t>(std::llround(price_ticks));
+        free_record->intent.purpose = seed.offset == Offset::Open
+            ? OrderPurpose::Entry : OrderPurpose::Exit;
+        free_record->result.code = SubmitCode::Submitted;
+        free_record->result.client_order_id = client_order_id;
+        free_record->result.order_ref = order_ref;
+        free_record->seen_during_recovery = true;
+        if (daily_orders < limits.max_daily_orders) ++daily_orders;
+        if (seed.offset == Offset::Open) {
+            if (daily_signals < limits.max_daily_signals) ++daily_signals;
+            free_record->active_open = true;
+            ++active_open_orders;
+        }
+        return free_record;
     }
 };
 
@@ -1562,7 +1695,6 @@ SubmitResult AccountTradingSession::submit(
     copy_to_field(request.InvestorID, impl_->user_id);
     copy_to_field(request.UserID, impl_->user_id);
     copy_to_field(request.InstrumentID, field_view(intent.instrument));
-    constexpr std::uint64_t kLargestCtpOrderRef = 999'999'999'999ULL;
     if (impl_->next_order_ref > kLargestCtpOrderRef) {
         impl_->state.apply_local_event(
             free_record->result.client_order_id,
@@ -1583,6 +1715,14 @@ SubmitResult AccountTradingSession::submit(
         return free_record->result;
     }
     *converted.ptr = '\0';
+    if (!write_order_ownership(request.BusinessUnit, order_ref)) {
+        impl_->state.apply_local_event(
+            free_record->result.client_order_id,
+            LocalOrderEvent::SubmitRejected);
+        free_record->result.code = SubmitCode::RejectedLocally;
+        impl_->trace(TraceStage::OrderRejected, free_record, -1);
+        return free_record->result;
+    }
     request.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
     request.Direction = intent.direction == Direction::Buy
         ? THOST_FTDC_D_Buy : THOST_FTDC_D_Sell;
@@ -1934,8 +2074,13 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                 auto* record = parse_order_ref(queried_ref, order_ref)
                     ? impl_->find_order_ref(order_ref) : nullptr;
                 if (record == nullptr) {
-                    impl_->recovery_failure(RecoveryFailure::UnknownOrder);
-                    continue;
+                    RecoveryFailure failure = RecoveryFailure::UnknownOrder;
+                    record = impl_->import_owned_order(
+                        event.queried_order, order_ref, failure);
+                    if (record == nullptr) {
+                        impl_->recovery_failure(failure);
+                        continue;
+                    }
                 }
                 record->seen_during_recovery = true;
                 ++impl_->recovery.queried_orders;
@@ -1954,6 +2099,27 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                 }
                 impl_->trace_order_report(
                     *record, type, applied, event.queried_order.VolumeTraded);
+                if (record->imported_from_counter
+                    && record->intent.offset == Offset::Close
+                    && (type == OrderReportType::Accepted
+                        || type == OrderReportType::PartiallyFilled)) {
+                    if (impl_->exit.active
+                        && impl_->exit.active_client_order_id
+                            != record->result.client_order_id) {
+                        impl_->recovery_failure(RecoveryFailure::UnknownOrder);
+                        continue;
+                    }
+                    impl_->exit.active = true;
+                    impl_->exit.instrument = record->intent.instrument;
+                    impl_->exit.direction = record->intent.direction;
+                    impl_->exit.signal_id = record->intent.signal_id;
+                    impl_->exit.active_client_order_id =
+                        record->result.client_order_id;
+                    impl_->exit.pending_quantity = std::max(
+                        0,
+                        record->intent.quantity
+                            - event.queried_order.VolumeTraded);
+                }
                 impl_->release_terminal_open(*record);
             }
             if (event.is_last) {
@@ -2007,7 +2173,10 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                 std::uint64_t order_ref = 0;
                 auto* record = parse_order_ref(queried_ref, order_ref)
                     ? impl_->find_order_ref(order_ref) : nullptr;
-                if (record == nullptr) {
+                if (record == nullptr
+                    || (record->imported_from_counter
+                        && !has_order_ownership(
+                            event.queried_trade.BusinessUnit, order_ref))) {
                     impl_->recovery_failure(RecoveryFailure::UnknownTrade);
                     continue;
                 }

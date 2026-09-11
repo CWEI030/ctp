@@ -1726,6 +1726,227 @@ void test_unknown_recovery_order_never_resubmits(
         "an unknown queried order must freeze without submitting a replacement");
 }
 
+void test_counter_recovery_rejects_invalid_ownership_and_capacity(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    const auto start_recovery = [](
+        ctp::AccountTradingSession& session,
+        test_support::FakeTraderApi& view,
+        const std::shared_ptr<test_support::FakeTraderMetrics>& metrics) {
+        session.start();
+        view.spi()->OnFrontConnected();
+        session.drain_callbacks();
+        CThostFtdcRspInfoField ok{};
+        view.spi()->OnRspAuthenticate(
+            nullptr, &ok, metrics->authenticate_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcRspUserLoginField login{};
+        ctp::copy_to_field(login.TradingDay, "20260911");
+        view.spi()->OnRspUserLogin(
+            &login, &ok, metrics->login_request_id, true);
+        session.drain_callbacks();
+    };
+    const auto make_order = [](const char* ref, const char* marker) {
+        CThostFtdcOrderField order{};
+        ctp::copy_to_field(order.OrderRef, std::string_view{ref});
+        ctp::copy_to_field(order.BusinessUnit, std::string_view{marker});
+        ctp::copy_to_field(order.InstrumentID, "IF2609");
+        order.Direction = THOST_FTDC_D_Buy;
+        order.CombOffsetFlag[0] = THOST_FTDC_OF_Open;
+        order.LimitPrice = 4'000.0;
+        order.VolumeTotalOriginal = 1;
+        order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+        order.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+        return order;
+    };
+
+    {
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        start_recovery(session, *view, metrics);
+        CThostFtdcRspInfoField ok{};
+        auto mismatched = make_order("777", "JCTP1:778");
+        view->spi()->OnRspQryOrder(
+            &mismatched, &ok, metrics->order_query_request_id, true);
+        session.drain_callbacks();
+        runner.expect(
+            session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+                && session.recovery_snapshot().failure
+                    == ctp::RecoveryFailure::UnknownOrder
+                && metrics->order_insert_calls == 0,
+            "a mismatched ownership marker must not import a counter order");
+    }
+
+    {
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        start_recovery(session, *view, metrics);
+        CThostFtdcRspInfoField ok{};
+        view->spi()->OnRspQryOrder(
+            nullptr, &ok, metrics->order_query_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcTradeField orphan{};
+        ctp::copy_to_field(orphan.OrderRef, "777");
+        ctp::copy_to_field(orphan.BusinessUnit, "JCTP1:777");
+        ctp::copy_to_field(orphan.TradingDay, "20260911");
+        ctp::copy_to_field(orphan.ExchangeID, "CFFEX");
+        ctp::copy_to_field(orphan.TradeID, "orphan-fill");
+        ctp::copy_to_field(orphan.InstrumentID, "IF2609");
+        orphan.Direction = THOST_FTDC_D_Buy;
+        orphan.OffsetFlag = THOST_FTDC_OF_Open;
+        orphan.Volume = 1;
+        view->spi()->OnRspQryTrade(
+            &orphan, &ok, metrics->trade_query_request_id, true);
+        session.drain_callbacks();
+        runner.expect(
+            session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+                && session.recovery_snapshot().failure
+                    == ctp::RecoveryFailure::UnknownTrade
+                && metrics->order_insert_calls == 0,
+            "an owned-looking trade without an imported order must fail closed");
+    }
+
+    {
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 1, 16, 1, 32};
+        start_recovery(session, *view, metrics);
+        CThostFtdcRspInfoField ok{};
+        auto first = make_order("777", "JCTP1:777");
+        view->spi()->OnRspQryOrder(
+            &first, &ok, metrics->order_query_request_id, false);
+        session.drain_callbacks();
+        auto second = make_order("778", "JCTP1:778");
+        view->spi()->OnRspQryOrder(
+            &second, &ok, metrics->order_query_request_id, true);
+        session.drain_callbacks();
+        runner.expect(
+            session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
+                && session.recovery_snapshot().failure
+                    == ctp::RecoveryFailure::CapacityExceeded
+                && metrics->order_insert_calls == 0,
+            "owned counter orders beyond fixed capacity must fail closed explicitly");
+    }
+}
+
+void test_owned_counter_order_and_trade_survive_crash_boundaries(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+
+    auto source_metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto source_api = std::make_unique<test_support::FakeTraderApi>(source_metrics);
+    ctp::AccountTradingSession source{
+        account, risk_limits(), std::move(source_api), 8, 16, 8, 32};
+    const auto submitted = source.submit(
+        opening_intent(9701), healthy_risk_snapshot());
+    const auto accepted_request = source_metrics->last_order;
+    runner.expect(
+        submitted.code == ctp::SubmitCode::Submitted
+            && std::string_view{accepted_request.BusinessUnit} == "JCTP1:1",
+        "the ownership marker must cross the API boundary before acceptance");
+
+    // 0：API 接受前；1：API 接受后；2：异步日志刷新前；3：刷新后但无 CleanStop。
+    for (int crash_point = 0; crash_point < 4; ++crash_point) {
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession successor{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        successor.start();
+        view->spi()->OnFrontConnected();
+        successor.drain_callbacks();
+        CThostFtdcRspInfoField ok{};
+        view->spi()->OnRspAuthenticate(
+            nullptr, &ok, metrics->authenticate_request_id, true);
+        successor.drain_callbacks();
+        CThostFtdcRspUserLoginField login{};
+        ctp::copy_to_field(login.TradingDay, "20260911");
+        view->spi()->OnRspUserLogin(
+            &login, &ok, metrics->login_request_id, true);
+        successor.drain_callbacks();
+
+        if (crash_point == 0) {
+            view->spi()->OnRspQryOrder(
+                nullptr, &ok, metrics->order_query_request_id, true);
+        } else {
+            CThostFtdcOrderField order{};
+            ctp::copy_to_field(order.OrderRef, accepted_request.OrderRef);
+            ctp::copy_to_field(order.BusinessUnit, accepted_request.BusinessUnit);
+            ctp::copy_to_field(order.InstrumentID, accepted_request.InstrumentID);
+            order.Direction = accepted_request.Direction;
+            order.CombOffsetFlag[0] = accepted_request.CombOffsetFlag[0];
+            order.LimitPrice = accepted_request.LimitPrice;
+            order.VolumeTotalOriginal = accepted_request.VolumeTotalOriginal;
+            order.VolumeTraded = 1;
+            order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+            order.OrderStatus = THOST_FTDC_OST_AllTraded;
+            view->spi()->OnRspQryOrder(
+                &order, &ok, metrics->order_query_request_id, true);
+        }
+        successor.drain_callbacks();
+
+        if (crash_point == 0) {
+            view->spi()->OnRspQryTrade(
+                nullptr, &ok, metrics->trade_query_request_id, true);
+        } else {
+            CThostFtdcTradeField trade{};
+            ctp::copy_to_field(trade.OrderRef, accepted_request.OrderRef);
+            ctp::copy_to_field(trade.BusinessUnit, accepted_request.BusinessUnit);
+            ctp::copy_to_field(trade.TradingDay, "20260911");
+            ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+            ctp::copy_to_field(trade.TradeID, "crash-fill-1");
+            ctp::copy_to_field(trade.InstrumentID, "IF2609");
+            trade.Direction = THOST_FTDC_D_Buy;
+            trade.OffsetFlag = THOST_FTDC_OF_Open;
+            trade.Volume = 1;
+            view->spi()->OnRspQryTrade(
+                &trade, &ok, metrics->trade_query_request_id, true);
+        }
+        successor.drain_callbacks();
+
+        if (crash_point != 0) {
+            CThostFtdcInvestorPositionField position{};
+            ctp::copy_to_field(position.InstrumentID, "IF2609");
+            position.PosiDirection = THOST_FTDC_PD_Long;
+            position.HedgeFlag = THOST_FTDC_HF_Speculation;
+            position.Position = 1;
+            view->spi()->OnRspQryInvestorPosition(
+                &position, &ok, metrics->position_request_id, true);
+        } else {
+            view->spi()->OnRspQryInvestorPosition(
+                nullptr, &ok, metrics->position_request_id, true);
+        }
+        successor.drain_callbacks();
+        CThostFtdcTradingAccountField funds{};
+        funds.Available = 100.0;
+        view->spi()->OnRspQryTradingAccount(
+            &funds, &ok, metrics->account_request_id, true);
+        successor.drain_callbacks();
+
+        ctp::PositionSnapshot held{};
+        const bool has_position = successor.position_snapshot("IF2609", held);
+        runner.expect(
+            successor.recovery_snapshot().phase == ctp::RecoveryPhase::Ready
+                && metrics->order_insert_calls == 0
+                && (crash_point == 0
+                    ? !has_position
+                    : has_position && held.long_quantity == 1),
+            "each API/log crash boundary must converge from counter facts without resubmitting");
+    }
+}
+
 void test_session_emits_one_order_trace_without_allocating(
     test_support::TestRunner& runner)
 {
@@ -2217,6 +2438,8 @@ int main()
     test_reconnect_queries_before_unfreezing(runner);
     test_recovery_persists_available_funds(runner);
     test_unknown_recovery_order_never_resubmits(runner);
+    test_counter_recovery_rejects_invalid_ownership_and_capacity(runner);
+    test_owned_counter_order_and_trade_survive_crash_boundaries(runner);
     test_session_emits_one_order_trace_without_allocating(runner);
     test_duplicate_exchange_facts_do_not_consume_trace_capacity(runner);
     test_restart_restores_identity_without_resubmitting(runner);

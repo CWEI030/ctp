@@ -1711,6 +1711,61 @@ void test_live_runner_refuses_unsafe_latest_trace(
     std::filesystem::remove_all(trace_root);
 }
 
+void test_live_runner_queries_after_structurally_complete_abnormal_trace(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path trace_root{
+        "/tmp/ctp_crash_recovery_engine_restart"};
+    std::filesystem::remove_all(trace_root);
+    std::filesystem::create_directories(trace_root / "101");
+    {
+        std::ofstream trace{trace_root / "101" / "account1.csv"};
+        trace << "ctp_trace_v2,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels\n";
+        trace << "ctp_trace_v2,account1,17,9001,1,100,risk_accepted,71,41,4000,1,0,0,0,0,IF2609,0,,0,0,0\n";
+    }
+
+    auto config = make_live_config(1);
+    auto market = std::make_shared<FakeLiveMarketState>();
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    std::size_t trader_api_count = 0;
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    dependencies.create_trader = [&trader_api_count, metrics](const std::string&) {
+        ++trader_api_count;
+        return make_recovering_trader(metrics, false);
+    };
+
+    std::atomic<bool> stop{false};
+    std::thread stopper([&stop] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        stop.store(true, std::memory_order_release);
+    });
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config,
+        output,
+        error,
+        [&stop] { return stop.load(std::memory_order_acquire); },
+        std::move(dependencies));
+    stopper.join();
+    runner.expect(
+        exit_code == 0 && trader_api_count == 1
+            && metrics->order_query_calls == 1
+            && metrics->trade_query_calls == 1
+            && metrics->position_calls == 1
+            && metrics->account_calls == 1
+            && metrics->order_insert_calls == 0
+            && output.str().find("ready=1") != std::string::npos
+            && error.str().find("latest trace is not safe for restart")
+                == std::string::npos,
+        "a complete abnormal trace must recover through all counter queries without inserting");
+    std::filesystem::remove_all(trace_root);
+}
+
 void test_unsafe_restart_freezes_only_its_account(
     test_support::TestRunner& runner)
 {
@@ -2318,6 +2373,7 @@ int main()
     test_live_runner_reopens_failover_after_running(runner);
     test_live_runner_restores_latest_identity_before_market(runner);
     test_live_runner_refuses_unsafe_latest_trace(runner);
+    test_live_runner_queries_after_structurally_complete_abnormal_trace(runner);
     test_unsafe_restart_freezes_only_its_account(runner);
     test_live_validation_rejects_unresolved_placeholders(runner);
     test_live_validation_enforces_traceable_signal_capacity(runner);
