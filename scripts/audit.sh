@@ -141,6 +141,15 @@ src/trading.cpp|AccountTradingSession::on_market(
 src/trading.cpp|AccountTradingSession::drain_callbacks(
 src/trading.cpp|void push_callback(const CallbackEvent& event) noexcept
 src/trading.cpp|void trace(
+src/trading.cpp|void record_recovery_response(
+src/trading.cpp|void set_recovery_phase(
+src/trading.cpp|void recovery_failure(
+src/trading.cpp|AccountTradingSession::OnRspAuthenticate(
+src/trading.cpp|AccountTradingSession::OnRspUserLogin(
+src/trading.cpp|AccountTradingSession::OnRspQryOrder(
+src/trading.cpp|AccountTradingSession::OnRspQryTrade(
+src/trading.cpp|AccountTradingSession::OnRspQryInvestorPosition(
+src/trading.cpp|AccountTradingSession::OnRspQryTradingAccount(
 src/trading.cpp|AccountTradingSession::OnRtnOrder(
 src/trading.cpp|AccountTradingSession::OnRtnTrade(
 src/trading.cpp|AccountTradingSession::OnRspOrderInsert(

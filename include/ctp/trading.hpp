@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ctp/config.hpp"
+#include "ctp/recovery.hpp"
 #include "ctp/trader_client.hpp"
 
 #include <array>
@@ -283,38 +284,10 @@ enum class AccountFault : std::uint8_t {
     RecoveryFailed,
 };
 
-enum class RecoveryPhase : std::uint8_t {
-    Idle,
-    Disconnected,
-    Connecting,
-    Authenticating,
-    LoggingIn,
-    QueryingOrders,
-    QueryingTrades,
-    QueryingPositions,
-    QueryingFunds,
-    Reconciling,
-    Ready,
-    Frozen,
-};
-
-enum class RecoveryFailure : std::uint8_t {
-    None,
-    RequestRejected,
-    ResponseError,
-    UnexpectedResponse,
-    UnknownOrder,
-    MissingOrder,
-    UnknownTrade,
-    InvalidPosition,
-    InvalidFunds,
-    CapacityExceeded,
-    CallbackQueueOverflow,
-};
-
 struct RecoverySnapshot {
     RecoveryPhase phase{RecoveryPhase::Idle};
     RecoveryFailure failure{RecoveryFailure::None};
+    RecoveryDiagnostic diagnostic{};
     std::uint32_t generation{0};
     std::uint32_t queried_orders{0};
     std::uint32_t queried_trades{0};

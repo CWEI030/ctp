@@ -787,6 +787,7 @@ struct CallbackEvent {
     CThostFtdcInvestorPositionField queried_position{};
     CThostFtdcTradingAccountField queried_account{};
     int error_id{0};
+    std::array<char, sizeof(CThostFtdcRspInfoField{}.ErrorMsg)> error_message{};
     int request_id{0};
     bool has_payload{false};
     bool is_last{false};
@@ -1006,6 +1007,15 @@ struct AccountTradingSession::Impl {
         event.stage = stage;
         event.code = code;
         event.quantity = quantity;
+        if (stage == TraceStage::RecoveryPhaseChanged
+            || stage == TraceStage::RecoveryResponse
+            || stage == TraceStage::RecoveryFrozen
+            || stage == TraceStage::RecoveryReady
+            || stage == TraceStage::RecoveryStarted
+            || stage == TraceStage::Disconnected) {
+            event.recovery_phase = recovery.phase;
+            event.diagnostic = recovery.diagnostic;
+        }
         if (record != nullptr) {
             event.trace_id.signal_id = record->intent.signal_id;
             event.client_order_id = record->result.client_order_id;
@@ -1096,12 +1106,54 @@ struct AccountTradingSession::Impl {
         ++alert_count;
     }
 
+    void record_recovery_response(const CallbackEvent& event) noexcept
+    {
+        if (recovery.phase == RecoveryPhase::Frozen) return;
+        recovery.diagnostic = {};
+        recovery.diagnostic.error_id = event.error_id;
+        const auto end = std::find(event.error_message.begin(), event.error_message.end(), '\0');
+        const std::string_view raw{event.error_message.data(),
+            static_cast<std::size_t>(end - event.error_message.begin())};
+        std::array<bool, sizeof(CThostFtdcRspInfoField{}.ErrorMsg)> masked{};
+        // 在原始定长文本上合并匹配，重叠凭据不会因先替换较短值而漏出。
+        for (const std::string_view secret : {std::string_view{broker_id},
+                 std::string_view{user_id}, std::string_view{password},
+                 std::string_view{app_id}, std::string_view{auth_code}}) {
+            if (secret.empty()) continue;
+            for (std::size_t index = 0; index < raw.size(); ++index) {
+                const auto length = std::min(secret.size(), raw.size() - index);
+                const bool truncated_tail = raw.size() >= event.error_message.size() - 1;
+                if ((length == secret.size() || truncated_tail)
+                    && raw.substr(index, length) == secret.substr(0, length)) {
+                    std::fill_n(masked.begin() + index, length, true);
+                }
+            }
+        }
+        auto& output = recovery.diagnostic.error_message;
+        for (std::size_t index = 0; index < raw.size() && index + 1 < output.size(); ++index) {
+            const auto value = static_cast<unsigned char>(raw[index]);
+            output[index] = masked[index] ? '*'
+                : value < 32 || value == 127 || value == ',' || value == '"'
+                    ? ' ' : raw[index];
+        }
+        trace(TraceStage::RecoveryResponse);
+    }
+
+    void set_recovery_phase(RecoveryPhase phase) noexcept
+    {
+        recovery.phase = phase;
+        recovery.diagnostic = {};
+        trace(TraceStage::RecoveryPhaseChanged);
+    }
+
     void recovery_failure(RecoveryFailure reason) noexcept
     {
         if (recovery.phase == RecoveryPhase::Frozen) return;
+        recovery.diagnostic.failed_phase = recovery.phase;
         recovery.phase = RecoveryPhase::Frozen;
         recovery.failure = reason;
         set_fault(AccountFault::RecoveryFailed);
+        trace(TraceStage::RecoveryPhaseChanged);
         trace(TraceStage::RecoveryFrozen, nullptr,
               static_cast<std::int32_t>(reason));
     }
@@ -1113,7 +1165,7 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.UserID, user_id);
         copy_to_field(request.AppID, app_id);
         copy_to_field(request.AuthCode, auth_code);
-        recovery.phase = RecoveryPhase::Authenticating;
+        set_recovery_phase(RecoveryPhase::Authenticating);
         expected_recovery_request_id = next_request_id++;
         return api->request_authenticate(
             &request, expected_recovery_request_id);
@@ -1125,7 +1177,7 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.UserID, user_id);
         copy_to_field(request.Password, password);
-        recovery.phase = RecoveryPhase::LoggingIn;
+        set_recovery_phase(RecoveryPhase::LoggingIn);
         expected_recovery_request_id = next_request_id++;
         return api->request_user_login(&request, expected_recovery_request_id);
     }
@@ -1135,7 +1187,7 @@ struct AccountTradingSession::Impl {
         CThostFtdcQryOrderField request{};
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
-        recovery.phase = RecoveryPhase::QueryingOrders;
+        set_recovery_phase(RecoveryPhase::QueryingOrders);
         expected_recovery_request_id = next_request_id++;
         return api->request_order_query(&request, expected_recovery_request_id);
     }
@@ -1145,7 +1197,7 @@ struct AccountTradingSession::Impl {
         CThostFtdcQryTradeField request{};
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
-        recovery.phase = RecoveryPhase::QueryingTrades;
+        set_recovery_phase(RecoveryPhase::QueryingTrades);
         expected_recovery_request_id = next_request_id++;
         return api->request_trade_query(&request, expected_recovery_request_id);
     }
@@ -1156,7 +1208,7 @@ struct AccountTradingSession::Impl {
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
         state.begin_position_reconciliation();
-        recovery.phase = RecoveryPhase::QueryingPositions;
+        set_recovery_phase(RecoveryPhase::QueryingPositions);
         expected_recovery_request_id = next_request_id++;
         return api->request_investor_position(
             &request, expected_recovery_request_id);
@@ -1167,7 +1219,7 @@ struct AccountTradingSession::Impl {
         CThostFtdcQryTradingAccountField request{};
         copy_to_field(request.BrokerID, broker_id);
         copy_to_field(request.InvestorID, user_id);
-        recovery.phase = RecoveryPhase::QueryingFunds;
+        set_recovery_phase(RecoveryPhase::QueryingFunds);
         expected_recovery_request_id = next_request_id++;
         return api->request_trading_account(
             &request, expected_recovery_request_id);
@@ -1429,7 +1481,7 @@ bool AccountTradingSession::activate(
 void AccountTradingSession::start()
 {
     if (!impl_->api || impl_->recovery.phase != RecoveryPhase::Idle) return;
-    impl_->recovery.phase = RecoveryPhase::Connecting;
+    impl_->set_recovery_phase(RecoveryPhase::Connecting);
     impl_->frozen = true;
     impl_->reconciliation = true;
     impl_->api->subscribe_private_topic(THOST_TERT_QUICK, 0);
@@ -2009,9 +2061,13 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
     CallbackEvent event{};
     while (applied_count < maximum && impl_->pop_callback(event)) {
         ++applied_count;
+        if (event.type >= CallbackType::Authenticated
+            && event.type <= CallbackType::QueryFunds) {
+            impl_->record_recovery_response(event);
+        }
         if (event.type == CallbackType::Disconnected) {
             ++impl_->recovery.generation;
-            impl_->recovery.phase = RecoveryPhase::Disconnected;
+            impl_->set_recovery_phase(RecoveryPhase::Disconnected);
             impl_->recovery.failure = RecoveryFailure::None;
             impl_->frozen = true;
             impl_->reconciliation = true;
@@ -2020,6 +2076,8 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
             continue;
         }
         if (event.type == CallbackType::Connected) {
+            impl_->recovery.failure = RecoveryFailure::None;
+            impl_->recovery.diagnostic = {};
             impl_->frozen = true;
             impl_->reconciliation = true;
             impl_->trace(TraceStage::RecoveryStarted);
@@ -2295,12 +2353,12 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                 impl_->recovery.available_funds =
                     static_cast<std::int64_t>(std::llround(available_cents));
                 impl_->recovery.funds_known = true;
-                impl_->recovery.phase = RecoveryPhase::Reconciling;
+                impl_->set_recovery_phase(RecoveryPhase::Reconciling);
                 impl_->state.complete_reconciliation();
                 impl_->reconciliation = false;
                 impl_->frozen = false;
                 impl_->recovery.failure = RecoveryFailure::None;
-                impl_->recovery.phase = RecoveryPhase::Ready;
+                impl_->set_recovery_phase(RecoveryPhase::Ready);
                 impl_->recovery_completions.fetch_add(
                     1, std::memory_order_relaxed);
                 impl_->trace(TraceStage::RecoveryReady);
@@ -2523,6 +2581,10 @@ void AccountTradingSession::OnRspAuthenticate(
     CallbackEvent event{};
     event.type = CallbackType::Authenticated;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     impl_->push_callback(event);
@@ -2537,6 +2599,10 @@ void AccountTradingSession::OnRspUserLogin(
     CallbackEvent event{};
     event.type = CallbackType::LoggedIn;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = response != nullptr;
@@ -2553,6 +2619,10 @@ void AccountTradingSession::OnRspQryOrder(
     CallbackEvent event{};
     event.type = CallbackType::QueryOrder;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = order != nullptr;
@@ -2569,6 +2639,10 @@ void AccountTradingSession::OnRspQryTrade(
     CallbackEvent event{};
     event.type = CallbackType::QueryTrade;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = trade != nullptr;
@@ -2585,6 +2659,10 @@ void AccountTradingSession::OnRspQryInvestorPosition(
     CallbackEvent event{};
     event.type = CallbackType::QueryPosition;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = position != nullptr;
@@ -2601,6 +2679,10 @@ void AccountTradingSession::OnRspQryTradingAccount(
     CallbackEvent event{};
     event.type = CallbackType::QueryFunds;
     event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+            event.error_message.begin());
+    }
     event.request_id = request_id;
     event.is_last = is_last;
     event.has_payload = account != nullptr;

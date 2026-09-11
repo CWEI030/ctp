@@ -2545,8 +2545,186 @@ void test_stale_recovery_response_cannot_advance_phase(
         session.recovery_snapshot().phase == ctp::RecoveryPhase::Frozen
             && session.recovery_snapshot().failure
                 == ctp::RecoveryFailure::UnexpectedResponse
+            && session.recovery_snapshot().diagnostic.failed_phase
+                == ctp::RecoveryPhase::Authenticating
+            && session.recovery_snapshot().diagnostic.error_id == 0
             && metrics->login_calls == 0,
         "a stale request id must freeze instead of advancing recovery");
+}
+
+void test_recovery_diagnostics_are_bounded_redacted_and_account_owned(
+    test_support::TestRunner& runner)
+{
+    const std::array<ctp::RecoveryPhase, 6> phases{
+        ctp::RecoveryPhase::Authenticating, ctp::RecoveryPhase::LoggingIn,
+        ctp::RecoveryPhase::QueryingOrders, ctp::RecoveryPhase::QueryingTrades,
+        ctp::RecoveryPhase::QueryingPositions, ctp::RecoveryPhase::QueryingFunds};
+    for (std::size_t scenario = 0; scenario < phases.size() * 4; ++scenario) {
+        const auto failed = scenario % phases.size();
+        const auto mode = scenario / phases.size();
+        if ((mode == 1 || mode == 2) && failed >= 2 && failed <= 4) continue;
+        if (mode == 2 && failed == 0) continue;
+        const int expected_error_id = mode == 0 ? 7 : 0;
+        const ctp::AccountConfig account{
+            "diagnostics", "9999", "user", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        if (mode == 3) {
+            using FakeApi = test_support::FakeTraderApi;
+            const std::array<int FakeApi::*, 6> return_codes{
+                &FakeApi::authenticate_return_code, &FakeApi::login_return_code,
+                &FakeApi::order_query_return_code, &FakeApi::trade_query_return_code,
+                &FakeApi::position_return_code, &FakeApi::account_return_code};
+            view->*return_codes[failed] = -1;
+        }
+        CapturingTraceSink trace;
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32,
+            1, 1, {}, &trace};
+        const auto deliver = [&](std::size_t index, CThostFtdcRspInfoField* info,
+                                 bool last = true, bool payload = true) {
+            CThostFtdcRspUserLoginField login{};
+            ctp::copy_to_field(login.TradingDay, "20260909");
+            CThostFtdcTradingAccountField funds{};
+            switch (index) {
+            case 0: view->spi()->OnRspAuthenticate(nullptr, info,
+                metrics->authenticate_request_id, last); break;
+            case 1: view->spi()->OnRspUserLogin(payload ? &login : nullptr, info,
+                metrics->login_request_id, last); break;
+            case 2: view->spi()->OnRspQryOrder(nullptr, info,
+                metrics->order_query_request_id, last); break;
+            case 3: view->spi()->OnRspQryTrade(nullptr, info,
+                metrics->trade_query_request_id, last); break;
+            case 4: view->spi()->OnRspQryInvestorPosition(nullptr, info,
+                metrics->position_request_id, last); break;
+            case 5: view->spi()->OnRspQryTradingAccount(payload ? &funds : nullptr, info,
+                metrics->account_request_id, last); break;
+            }
+        };
+        session.start();
+        view->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        for (std::size_t index = 0; index < failed; ++index) {
+            deliver(index, nullptr);
+            session.drain_callbacks();
+        }
+        if (mode == 3) {
+            const auto recovery = session.recovery_snapshot();
+            runner.expect(recovery.phase == ctp::RecoveryPhase::Frozen
+                    && recovery.failure == ctp::RecoveryFailure::RequestRejected
+                    && recovery.diagnostic.failed_phase == phases[failed]
+                    && recovery.diagnostic.error_id == 0
+                    && recovery.diagnostic.error_message[0] == '\0',
+                "synchronous request failure must identify its phase without inventing a CTP response error");
+            continue;
+        }
+        runner.expect(session.recovery_snapshot().phase == phases[failed],
+            "diagnostic fixture must reach the intended callback");
+        CThostFtdcRspInfoField error{};
+        error.ErrorID = expected_error_id;
+        ctp::copy_to_field(error.ErrorMsg, "denied 9999 user password app auth,\n\t\"");
+        test_support::AllocationProbe probe;
+        deliver(failed, &error, mode != 1, mode != 2);
+        // SDK 的回调参数可立即复用；账户线程必须持有独立副本。
+        error.ErrorID = 99;
+        ctp::copy_to_field(error.ErrorMsg, "replacement");
+        session.drain_callbacks();
+        probe.stop();
+        const auto frozen = session.recovery_snapshot();
+        runner.expect(probe.count() == 0
+                && frozen.phase == ctp::RecoveryPhase::Frozen
+                && frozen.failure == ctp::RecoveryFailure::ResponseError
+                && frozen.diagnostic.failed_phase == phases[failed]
+                && frozen.diagnostic.error_id == expected_error_id
+                && ctp::field_text(frozen.diagnostic.error_message)
+                    == "denied **** **** ******** *** ****    ",
+            "every callback must preserve an allocation-free sanitized failure snapshot");
+        const auto& event = trace.events[trace.size - 1];
+        runner.expect(event.stage == ctp::TraceStage::RecoveryFrozen
+                && event.recovery_phase == ctp::RecoveryPhase::Frozen
+                && event.diagnostic.failed_phase == phases[failed]
+                && event.diagnostic.error_id == expected_error_id
+                && event.diagnostic.error_message == frozen.diagnostic.error_message,
+            "frozen trace must carry the same sanitized evidence as the snapshot");
+        deliver(failed, &error);
+        session.drain_callbacks();
+        runner.expect(session.recovery_snapshot().diagnostic.error_id == expected_error_id,
+            "late callbacks must not overwrite the first failure evidence");
+
+        view->spi()->OnFrontDisconnected(0x1001);
+        session.drain_callbacks();
+        runner.expect(session.recovery_snapshot().phase == ctp::RecoveryPhase::Disconnected
+                && session.recovery_snapshot().diagnostic.error_id == 0,
+            "disconnect must clear callback evidence before the next recovery attempt");
+        view->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        for (std::size_t index = 0; index < phases.size(); ++index) {
+            if (index >= 2 && index <= 4) {
+                deliver(index, nullptr, false);
+                session.drain_callbacks();
+                runner.expect(session.recovery_snapshot().phase == phases[index],
+                    "non-final empty query response must not advance recovery");
+            }
+            deliver(index, nullptr);
+            session.drain_callbacks();
+        }
+        const auto ready = session.recovery_snapshot();
+        runner.expect(ready.phase == ctp::RecoveryPhase::Ready
+                && ready.failure == ctp::RecoveryFailure::None
+                && ready.diagnostic.error_id == 0
+                && ready.diagnostic.failed_phase == ctp::RecoveryPhase::Idle
+                && ready.diagnostic.error_message[0] == '\0',
+            "successful null-info recovery must clear old failure diagnostics");
+        for (const auto phase : {ctp::RecoveryPhase::Connecting,
+                 ctp::RecoveryPhase::Disconnected,
+                 ctp::RecoveryPhase::Authenticating, ctp::RecoveryPhase::LoggingIn,
+                 ctp::RecoveryPhase::QueryingOrders, ctp::RecoveryPhase::QueryingTrades,
+                 ctp::RecoveryPhase::QueryingPositions, ctp::RecoveryPhase::QueryingFunds,
+                 ctp::RecoveryPhase::Reconciling, ctp::RecoveryPhase::Ready,
+                 ctp::RecoveryPhase::Frozen}) {
+            runner.expect(std::any_of(trace.events.begin(), trace.events.begin() + trace.size,
+                    [phase](const auto& item) {
+                        return item.stage == ctp::TraceStage::RecoveryPhaseChanged
+                            && item.recovery_phase == phase;
+                    }), "recovery trace must expose every visited phase");
+        }
+    }
+}
+
+void test_recovery_diagnostic_truncation_and_empty_secrets(
+    test_support::TestRunner& runner)
+{
+    for (std::size_t scenario = 0; scenario < 4; ++scenario) {
+        const bool empty = scenario % 2 != 0;
+        const bool terminated = scenario >= 2;
+        const ctp::AccountConfig account{"diagnostics", "", "abc",
+            empty ? "" : "abcdef", "", "", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{
+            account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        session.start();
+        view->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        CThostFtdcRspInfoField error{};
+        error.ErrorID = -7;
+        std::fill(std::begin(error.ErrorMsg), std::end(error.ErrorMsg), 'x');
+        std::copy_n("abcdef", 6, error.ErrorMsg);
+        std::copy_n("abcde", 5, std::end(error.ErrorMsg) - (terminated ? 6 : 5));
+        if (terminated) error.ErrorMsg[sizeof(error.ErrorMsg) - 1] = '\0';
+        view->spi()->OnRspAuthenticate(nullptr, &error, 1, true);
+        session.drain_callbacks();
+        const auto diagnostic = session.recovery_snapshot().diagnostic;
+        const auto text = ctp::field_text(diagnostic.error_message);
+        runner.expect(text.size() == 80 && diagnostic.error_message.back() == '\0'
+                && diagnostic.error_id == -7
+                && text.substr(0, 6) == (empty ? "***def" : "******")
+                && (terminated ? text.substr(75) == (empty ? "***de" : "*****")
+                               : text.substr(76) == (empty ? "***d" : "****")),
+            "full SDK messages must be bounded and overlapping or truncated credentials masked with or without a terminator");
+    }
 }
 
 void test_each_recovery_query_error_stays_frozen(
@@ -2666,5 +2844,7 @@ int main()
     test_one_of_four_recovery_failures_is_isolated(runner);
     test_stale_recovery_response_cannot_advance_phase(runner);
     test_each_recovery_query_error_stays_frozen(runner);
+    test_recovery_diagnostics_are_bounded_redacted_and_account_owned(runner);
+    test_recovery_diagnostic_truncation_and_empty_secrets(runner);
     return runner.finish();
 }

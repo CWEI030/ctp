@@ -220,6 +220,9 @@ std::unique_ptr<test_support::FakeTraderApi> make_recovering_trader(
     api->on_authenticate = [metrics, reject_authentication](auto& self) {
         CThostFtdcRspInfoField info{};
         info.ErrorID = reject_authentication ? 7 : 0;
+        if (reject_authentication) {
+            ctp::copy_to_field(info.ErrorMsg, "denied,\npassword1");
+        }
         self.spi()->OnRspAuthenticate(
             nullptr, &info, metrics->authenticate_request_id, true);
     };
@@ -1045,6 +1048,13 @@ void test_live_runner_isolates_one_failed_account(
             != std::string::npos,
         "the final summary must preserve per-account outcomes");
     runner.expect(
+        output.str().find("phase=Frozen, failure=ResponseError, failed_phase=Authenticating, ErrorID=7, ErrorMsg=denied  *********")
+            != std::string::npos
+            && output.str().find("phase=Ready, failure=None, failed_phase=Idle, ErrorID=0")
+                != std::string::npos
+            && output.str().find("password") == std::string::npos,
+        "recovery summaries must expose the failing callback and redact credentials");
+    runner.expect(
         market->release_calls.load(std::memory_order_relaxed) == 1,
         "the shared market API must be released exactly once");
 }
@@ -1153,6 +1163,11 @@ void test_live_runner_stops_when_all_trader_creations_fail(
     runner.expect(
         exit_code == 3 && trader_attempts == 4 && market_attempts == 0,
         "the engine must stop only after every account worker is unavailable");
+    for (std::size_t index = 1; index <= 4; ++index) {
+        runner.expect(output.str().find("[recovery] account=account"
+                + std::to_string(index) + ", initialized=0, phase=Idle") != std::string::npos,
+            "uninitialized accounts must remain visible in the diagnostic summary");
+    }
 }
 
 void test_live_runner_isolates_trace_journal_start_failure(
@@ -1537,6 +1552,11 @@ void test_live_runner_stops_after_all_market_accounts_fail(
         error.str().find("all market account credentials failed")
             != std::string::npos,
         "exhausted market failover must report the global failure boundary");
+    for (std::size_t index = 1; index <= 4; ++index) {
+        runner.expect(output.str().find("[recovery] account=account"
+                + std::to_string(index) + ", initialized=1") != std::string::npos,
+            "market startup failure must still summarize every joined account worker");
+    }
 }
 
 void test_live_runner_reopens_failover_after_running(

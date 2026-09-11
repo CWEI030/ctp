@@ -130,6 +130,10 @@ void test_trace_queue_reserves_capacity_for_order_facts(
     runner.expect(
         !queue.try_push(market),
         "an unlinked market must not consume the reserved order region");
+    runner.expect(
+        !queue.try_push(trace_event(9000, ctp::TraceStage::RecoveryResponse))
+            && !queue.try_push(trace_event(9001, ctp::TraceStage::RecoveryPhaseChanged)),
+        "recovery diagnostics must not consume reserved order capacity");
 
     auto order_fact = trace_event(10'000, ctp::TraceStage::RiskAccepted);
     for (std::size_t index = 0; index < ctp::kCriticalTraceReserve; ++index) {
@@ -142,8 +146,8 @@ void test_trace_queue_reserves_capacity_for_order_facts(
         !queue.try_push(order_fact),
         "a physically full queue must reject without blocking");
     runner.expect(
-        queue.dropped_count() == 2
-            && queue.best_effort_dropped_count() == 1
+        queue.dropped_count() == 4
+            && queue.best_effort_dropped_count() == 3
             && queue.critical_dropped_count() == 1
             && queue.high_watermark() == ctp::kTraceQueueCapacity,
         "critical and best-effort drops must be separately exact");
@@ -186,6 +190,63 @@ void test_async_journal_round_trip_and_clean_marker(
             && text.find("auth") == std::string::npos,
         "trace output must not contain credential fields");
     std::filesystem::remove(path);
+}
+
+void test_v3_diagnostics_round_trip_and_reject_malformed_fields(
+    test_support::TestRunner& runner)
+{
+    char directory[] = "/tmp/ctp-diagnostic-trace-XXXXXX";
+    const auto* created = ::mkdtemp(directory);
+    runner.expect(created != nullptr, "diagnostic fixture directory must be unique");
+    if (created == nullptr) return;
+    const auto path = std::filesystem::path{created} / "trace.csv";
+    {
+        ctp::AsyncTraceJournal journal{path, "account1"};
+        runner.expect(journal.start(), "diagnostic journal must start");
+        auto event = trace_event(1, ctp::TraceStage::RecoveryFrozen);
+        event.recovery_phase = ctp::RecoveryPhase::Frozen;
+        event.diagnostic.failed_phase = ctp::RecoveryPhase::QueryingFunds;
+        event.diagnostic.error_id = -7;
+        ctp::copy_to_field(event.diagnostic.error_message, "denied ********");
+        runner.expect(journal.try_record(event)
+                && journal.try_record(restart_checkpoint(2)),
+            "diagnostic and checkpoint must be accepted together");
+        journal.stop();
+    }
+    const auto loaded = ctp::read_trace_journal(path);
+    runner.expect(loaded.valid && loaded.clean_shutdown && loaded.events.size() == 3
+            && loaded.events[0].recovery_phase == ctp::RecoveryPhase::Frozen
+            && loaded.events[0].diagnostic.failed_phase == ctp::RecoveryPhase::QueryingFunds
+            && loaded.events[0].diagnostic.error_id == -7
+            && ctp::field_text(loaded.events[0].diagnostic.error_message) == "denied ********"
+            && ctp::build_restart_image(loaded).valid
+            && ctp::build_restart_image(loaded).daily_signals == 7,
+        "v3 must round-trip diagnostics without changing checkpoint semantics");
+    std::ifstream input{path};
+    std::string header;
+    std::string row;
+    std::getline(input, header);
+    std::getline(input, row);
+    input.close();
+    runner.expect(header.find("ctp_trace_v3,") == 0,
+        "new journal writer must identify its schema version");
+    const auto suffix = row.rfind(",11,8,-7,denied ********");
+    runner.expect(suffix != std::string::npos, "fixture must contain the diagnostic columns");
+    if (suffix != std::string::npos) {
+        const auto prefix = row.substr(0, suffix);
+        for (const auto& invalid : std::vector<std::string>{
+                 ",12,8,-7,denied", ",11,12,-7,denied", ",11,8,2147483648,denied",
+                 ",11,8,-7," + std::string(81, 'x'), ",11,8,-7,tab\there",
+                 ",11,8,-7,quote\"here", ",11,8,-7,comma,here", ",11,8,-7"}) {
+            {
+                std::ofstream output{path};
+                output << header << '\n' << prefix << invalid << '\n';
+            }
+            runner.expect(!ctp::read_trace_journal(path).valid,
+                "invalid diagnostic fields must not become a trusted journal");
+        }
+    }
+    std::filesystem::remove_all(created);
 }
 
 void test_abnormal_exit_after_start_keeps_a_complete_empty_journal(
@@ -255,6 +316,13 @@ void test_structurally_complete_abnormal_journal_allows_counter_recovery(
             loaded.valid && !loaded.clean_shutdown && !image.valid
                 && loaded.events.size() == flushed_events,
             "every complete prefix around async log flush must allow counter recovery without becoming a restart image");
+        for (const auto& event : loaded.events) {
+            runner.expect(event.recovery_phase == ctp::RecoveryPhase::Idle
+                    && event.diagnostic.error_id == 0
+                    && event.diagnostic.failed_phase == ctp::RecoveryPhase::Idle
+                    && event.diagnostic.error_message[0] == '\0',
+                "legacy v2 must default absent diagnostic fields");
+        }
     }
     std::filesystem::remove(path);
 }
@@ -344,7 +412,11 @@ void test_v1_journal_remains_auditable_but_cannot_restore_daily_limits(
     const auto loaded = ctp::read_trace_journal(path);
     const auto image = ctp::build_restart_image(loaded);
     runner.expect(
-        loaded.valid && loaded.clean_shutdown && !image.valid,
+        loaded.valid && loaded.clean_shutdown && !image.valid
+            && loaded.events[0].recovery_phase == ctp::RecoveryPhase::Idle
+            && loaded.events[0].diagnostic.error_id == 0
+            && loaded.events[0].diagnostic.failed_phase == ctp::RecoveryPhase::Idle
+            && loaded.events[0].diagnostic.error_message[0] == '\0',
         "legacy v1 trace must remain readable but cannot refresh daily quotas");
     std::filesystem::remove(path);
 }
@@ -571,6 +643,7 @@ int main()
     test_trace_queue_is_nonblocking_and_counts_drops(runner);
     test_trace_queue_reserves_capacity_for_order_facts(runner);
     test_async_journal_round_trip_and_clean_marker(runner);
+    test_v3_diagnostics_round_trip_and_reject_malformed_fields(runner);
     test_abnormal_exit_after_start_keeps_a_complete_empty_journal(runner);
     test_truncated_journal_is_not_a_clean_restart(runner);
     test_structurally_complete_abnormal_journal_allows_counter_recovery(runner);

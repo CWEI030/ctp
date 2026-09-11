@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ctp/engine.hpp"
+#include "ctp/recovery.hpp"
 
 #include <array>
 #include <atomic>
@@ -41,6 +42,8 @@ enum class TraceStage : std::uint8_t {
     RecoveryFrozen,
     RestartCheckpoint,
     CleanStop,
+    RecoveryPhaseChanged,
+    RecoveryResponse,
 };
 
 enum class TraceOrderReportCode : std::int32_t {
@@ -72,6 +75,8 @@ struct TraceEvent {
     std::uint32_t daily_signals{0};
     std::uint32_t daily_orders{0};
     std::uint32_t daily_cancels{0};
+    RecoveryPhase recovery_phase{RecoveryPhase::Idle};
+    RecoveryDiagnostic diagnostic{};
 };
 
 static_assert(std::is_trivially_copyable<TraceEvent>::value);
@@ -97,6 +102,8 @@ inline bool is_critical_trace_event(const TraceEvent& event) noexcept
     case TraceStage::RecoveryStarted:
     case TraceStage::RecoveryReady:
     case TraceStage::RecoveryFrozen:
+    case TraceStage::RecoveryPhaseChanged:
+    case TraceStage::RecoveryResponse:
         return false;
     default:
         return true;

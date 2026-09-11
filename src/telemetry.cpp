@@ -23,6 +23,8 @@ constexpr std::string_view kHeaderV1 =
     "ctp_trace_v1,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code";
 constexpr std::string_view kHeaderV2 =
     "ctp_trace_v2,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels";
+constexpr std::string_view kHeaderV3 =
+    "ctp_trace_v3,account_id,run_id,signal_id,sequence,mono_ns,stage,client_order_id,order_ref,limit_price_ticks,quantity,attempt,direction,offset,purpose,instrument,code,trading_day,daily_signals,daily_orders,daily_cancels,recovery_phase,failed_phase,error_id,error_message";
 
 std::string_view stage_name(TraceStage stage) noexcept
 {
@@ -43,6 +45,8 @@ std::string_view stage_name(TraceStage stage) noexcept
     case TraceStage::RecoveryFrozen: return "recovery_frozen";
     case TraceStage::RestartCheckpoint: return "restart_checkpoint";
     case TraceStage::CleanStop: return "clean_stop";
+    case TraceStage::RecoveryPhaseChanged: return "recovery_phase_changed";
+    case TraceStage::RecoveryResponse: return "recovery_response";
     }
     return "invalid";
 }
@@ -57,7 +61,8 @@ bool parse_stage(std::string_view text, TraceStage& stage) noexcept
              TraceStage::Disconnected, TraceStage::RecoveryStarted,
              TraceStage::RecoveryReady, TraceStage::RecoveryFrozen,
              TraceStage::RestartCheckpoint,
-             TraceStage::CleanStop}) {
+             TraceStage::CleanStop, TraceStage::RecoveryPhaseChanged,
+             TraceStage::RecoveryResponse}) {
         if (stage_name(candidate) == text) {
             stage = candidate;
             return true;
@@ -78,7 +83,7 @@ bool parse_integer(std::string_view text, Integer& value) noexcept
 std::vector<std::string_view> split_line(const std::string& line)
 {
     std::vector<std::string_view> fields;
-    fields.reserve(21);
+    fields.reserve(25);
     std::size_t begin = 0;
     while (true) {
         const auto comma = line.find(',', begin);
@@ -176,7 +181,7 @@ struct AsyncTraceJournal::Impl {
 
     void write(const TraceEvent& event)
     {
-        output << "ctp_trace_v2," << account_id << ','
+        output << "ctp_trace_v3," << account_id << ','
                << event.trace_id.run_id << ',' << event.trace_id.signal_id << ','
                << event.sequence << ',' << event.mono_ns << ','
                << stage_name(event.stage) << ',' << event.client_order_id << ','
@@ -187,7 +192,11 @@ struct AsyncTraceJournal::Impl {
                << static_cast<unsigned>(event.purpose) << ','
                << instrument_view(event) << ',' << event.code << ','
                << trading_day_view(event) << ',' << event.daily_signals << ','
-               << event.daily_orders << ',' << event.daily_cancels << '\n';
+               << event.daily_orders << ',' << event.daily_cancels << ','
+               << static_cast<unsigned>(event.recovery_phase) << ','
+               << static_cast<unsigned>(event.diagnostic.failed_phase) << ','
+               << event.diagnostic.error_id << ','
+               << field_text(event.diagnostic.error_message) << '\n';
     }
 
     void run()
@@ -249,7 +258,7 @@ bool AsyncTraceJournal::start()
     if (impl_->running.load(std::memory_order_acquire)) return true;
     impl_->output.open(impl_->path, std::ios::out | std::ios::trunc);
     if (!impl_->output) return false;
-    impl_->output << kHeaderV2 << '\n';
+    impl_->output << kHeaderV3 << '\n';
     impl_->output.flush();
     if (!impl_->output) {
         impl_->output.close();
@@ -443,8 +452,9 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
     std::ifstream input{path};
     std::string line;
     if (!std::getline(input, line)) return result;
-    const bool version_two = line == kHeaderV2;
-    if (!version_two && line != kHeaderV1) return result;
+    const bool version_three = line == kHeaderV3;
+    const bool has_checkpoint = version_three || line == kHeaderV2;
+    if (!has_checkpoint && line != kHeaderV1) return result;
 
     std::uint64_t previous_sequence = 0;
     while (std::getline(input, line)) {
@@ -454,8 +464,11 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
         unsigned direction = 0;
         unsigned offset = 0;
         unsigned purpose = 0;
-        if (fields.size() != (version_two ? 21U : 17U)
-            || fields[0] != (version_two ? "ctp_trace_v2" : "ctp_trace_v1")
+        unsigned recovery_phase = 0;
+        unsigned failed_phase = 0;
+        if (fields.size() != (version_three ? 25U : has_checkpoint ? 21U : 17U)
+            || fields[0] != (version_three ? "ctp_trace_v3"
+                : has_checkpoint ? "ctp_trace_v2" : "ctp_trace_v1")
             || fields[1].empty()
             || !parse_integer(fields[2], event.trace_id.run_id)
             || !parse_integer(fields[3], event.trace_id.signal_id)
@@ -472,11 +485,21 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
             || !parse_integer(fields[14], purpose) || purpose > 1
             || fields[15].size() >= event.instrument.size()
             || !parse_integer(fields[16], stage_code)
-            || (version_two
+            || (has_checkpoint
                 && (fields[17].size() >= event.trading_day.size()
                     || !parse_integer(fields[18], event.daily_signals)
                     || !parse_integer(fields[19], event.daily_orders)
                     || !parse_integer(fields[20], event.daily_cancels)))
+            || (version_three
+                && (!parse_integer(fields[21], recovery_phase)
+                    || recovery_phase > static_cast<unsigned>(RecoveryPhase::Frozen)
+                    || !parse_integer(fields[22], failed_phase)
+                    || failed_phase > static_cast<unsigned>(RecoveryPhase::Frozen)
+                    || !parse_integer(fields[23], event.diagnostic.error_id)
+                    || fields[24].size() >= event.diagnostic.error_message.size()
+                    || std::any_of(fields[24].begin(), fields[24].end(), [](unsigned char value) {
+                           return value < 32 || value == 127 || value == '"';
+                       })))
             || (previous_sequence != 0 && event.sequence <= previous_sequence)) {
             return {};
         }
@@ -485,7 +508,12 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
         event.offset = static_cast<std::uint8_t>(offset);
         event.purpose = static_cast<std::uint8_t>(purpose);
         copy_to_field(event.instrument, fields[15]);
-        if (version_two) copy_to_field(event.trading_day, fields[17]);
+        if (has_checkpoint) copy_to_field(event.trading_day, fields[17]);
+        if (version_three) {
+            event.recovery_phase = static_cast<RecoveryPhase>(recovery_phase);
+            event.diagnostic.failed_phase = static_cast<RecoveryPhase>(failed_phase);
+            copy_to_field(event.diagnostic.error_message, fields[24]);
+        }
         if (result.account_id.empty()) result.account_id = std::string{fields[1]};
         if (result.account_id != fields[1]) return {};
         previous_sequence = event.sequence;

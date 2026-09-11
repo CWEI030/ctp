@@ -568,6 +568,18 @@ public:
 
     const std::string& account_alias() const noexcept { return account_alias_; }
 
+    void write_recovery_summary(std::ostream& output) const
+    {
+        output << "[recovery] account=" << account_alias_
+               << ", initialized=" << (initialized_ ? 1 : 0)
+               << ", phase=" << recovery_phase_name(final_recovery_.phase)
+               << ", failure=" << recovery_failure_name(final_recovery_.failure)
+               << ", failed_phase=" << recovery_phase_name(final_recovery_.diagnostic.failed_phase)
+               << ", ErrorID=" << final_recovery_.diagnostic.error_id
+               << ", ErrorMsg=" << field_text(final_recovery_.diagnostic.error_message)
+               << '\n';
+    }
+
     bool final_position_known() const noexcept
     {
         return final_position_known_;
@@ -760,6 +772,7 @@ private:
         }
         session_->drain_callbacks();
         const auto recovery = session_->recovery_snapshot();
+        final_recovery_ = recovery;
         update_acceptance(recovery);
         PositionSnapshot position{};
         const bool has_position = session_->position_snapshot(
@@ -801,6 +814,7 @@ private:
     std::int32_t final_short_position_{0};
     bool final_position_known_{false};
     bool initialized_{true};
+    RecoverySnapshot final_recovery_{};
 };
 
 std::size_t LiveAccountWorker::poll_once() noexcept
@@ -1040,6 +1054,7 @@ int run_live_engine(
         ++initialized_workers;
     }
     if (initialized_workers == 0) {
+        for (const auto& worker : workers) worker->write_recovery_summary(output);
         error << "[error] no account worker could be initialized\n";
         return 3;
     }
@@ -1098,6 +1113,7 @@ int run_live_engine(
     if (!ensure_market_candidate()) {
         stopping.store(true, std::memory_order_release);
         for (auto& worker : workers) worker->join();
+        for (const auto& worker : workers) worker->write_recovery_summary(output);
         error << "[error] all market account credentials failed\n";
         return 3;
     }
@@ -1147,6 +1163,7 @@ int run_live_engine(
     std::size_t position_unknown = 0;
     std::uint64_t submitted = 0;
     for (const auto& worker : workers) {
+        worker->write_recovery_summary(output);
         if (worker->ready()) ++ready;
         if (worker->failed()) ++failed;
         if (!worker->final_position_known()) {
