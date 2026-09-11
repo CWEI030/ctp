@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [[ "$#" -lt 1 || "$#" -gt 2 \
     || ! "$1" =~ ^(replay|benchmark|simnow|hot-path|all-offline)$ ]]; then
-    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|evidence|full|evidence-test]|simnow [preflight|online]|hot-path|all-offline" >&2
+    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|evidence|evidence-test]|simnow [preflight|online]|hot-path|all-offline" >&2
     exit 2
 fi
 
@@ -140,7 +140,6 @@ capture_environment() {
 
 publish_benchmark_root() {
     local result_root="$1"
-    local profile="$2"
     local published_root="evidence/performance/$(basename "$result_root")"
     if [[ -e "$published_root" ]]; then
         echo "published evidence already exists: $published_root" >&2
@@ -171,14 +170,10 @@ publish_benchmark_root() {
     } > "$published_root/matrix_index.tsv"
     cp "$result_root"/environment_*.txt "$published_root/"
     {
-        if [[ "$profile" == "full" ]]; then
-            printf '# 正式离线性能矩阵\n\n'
-        else
-            printf '# 短时高样本离线性能证据\n\n'
-        fi
+        printf '# 短时高样本离线性能证据\n\n'
         printf '本目录由完整原始 CSV 无损发布；逐运行原始 CSV 留在 `%s`。\n\n' "$result_root"
         printf '逐纳秒直方图保留 `(account, stage, latency_ns)` 的精确计数，原始文件摘要见各运行的 `latency_raw.index.tsv`。\n\n'
-        printf '这是共享主机上的离线回放和柜台替身结果，不代表真实 CTP 网络延迟或生产 SLA。短时 evidence 配置只用于补足尾分位样本，不替代 4.7 小时容量/饱和矩阵；四真实账户 SimNow 验收仍未完成。\n'
+        printf '这是共享主机上的离线回放和柜台替身结果，只用于验证测量方法及当前条件下的延迟、吞吐、抖动、CPU、队列和丢弃结果，不代表真实 CTP 网络延迟、生产容量或 SLA；四真实账户 SimNow 验收仍未完成。\n'
     } > "$published_root/README.md"
     (
         cd "$published_root"
@@ -298,8 +293,8 @@ run_benchmark_matrix() {
         run_evidence_test
         return
     fi
-    if [[ ! "$profile" =~ ^(smoke|evidence|full)$ ]]; then
-        echo "benchmark profile must be smoke, evidence, full, or evidence-test" >&2
+    if [[ ! "$profile" =~ ^(smoke|evidence)$ ]]; then
+        echo "benchmark profile must be smoke, evidence, or evidence-test" >&2
         return 2
     fi
     prepare_offline_config
@@ -322,21 +317,7 @@ run_benchmark_matrix() {
                 "$result_root/accounts-$accounts" 1
         done
         capture_environment "$result_root/environment_after.txt" after
-        publish_benchmark_root "$result_root" "$profile"
-        verify_tail_sample_counts "evidence/performance/$(basename "$result_root")"
-    else
-        for repeat in 1 2 3; do
-            for accounts in 1 2 4; do
-                run_one_benchmark "$accounts" 1000 60 900 2000 60 \
-                    "$result_root/steady-a${accounts}-r${repeat}" 16
-            done
-            for rate in 5000 10000 20000; do
-                run_one_benchmark 4 "$rate" 60 900 0 0 \
-                    "$result_root/saturation-${rate}-r${repeat}" 16
-            done
-        done
-        capture_environment "$result_root/environment_after.txt" after
-        publish_benchmark_root "$result_root" "$profile"
+        publish_benchmark_root "$result_root"
         verify_tail_sample_counts "evidence/performance/$(basename "$result_root")"
     fi
     echo "[ok] benchmark evidence root: $result_root"
