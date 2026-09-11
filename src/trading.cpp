@@ -1649,7 +1649,6 @@ SubmitResult AccountTradingSession::submit(
     free_record->occupied = true;
     free_record->intent = intent;
     free_record->result.client_order_id = impl_->next_client_order_id++;
-    if (intent.offset == Offset::Open) ++impl_->daily_signals;
 
     OrderSeed seed{};
     seed.client_order_id = free_record->result.client_order_id;
@@ -1664,8 +1663,7 @@ SubmitResult AccountTradingSession::submit(
 
     auto effective = snapshot;
     effective.daily_signals = std::max(
-        snapshot.daily_signals,
-        impl_->daily_signals - (intent.offset == Offset::Open ? 1U : 0U));
+        snapshot.daily_signals, impl_->daily_signals);
     effective.daily_orders = std::max(snapshot.daily_orders, impl_->daily_orders);
     effective.active_open_orders = std::max(
         snapshot.active_open_orders, impl_->active_open_orders);
@@ -1687,6 +1685,8 @@ SubmitResult AccountTradingSession::submit(
             static_cast<std::int32_t>(reason));
         return free_record->result;
     }
+    // 额度统计通过风控的开仓信号，拒绝不计数，提交失败不退回。
+    if (intent.offset == Offset::Open) ++impl_->daily_signals;
     impl_->state.apply_local_event(
         free_record->result.client_order_id, LocalOrderEvent::RiskAccepted);
 

@@ -2276,6 +2276,89 @@ void test_restart_restores_identity_without_resubmitting(
         "queried fill and position must resume at close without replaying the open");
 }
 
+void test_risk_rejections_preserve_restart_signal_quota(
+    test_support::TestRunner& runner)
+{
+    char directory[] = "/tmp/ctp-signal-quota-XXXXXX";
+    const auto* root = ::mkdtemp(directory);
+    runner.expect(root != nullptr, "signal quota journal directory must exist");
+    if (root == nullptr) return;
+    const auto path = std::filesystem::path{root} / "account1.csv";
+    const ctp::AccountConfig account{
+        "account1", "9999", "user", "password", "app", "auth", "front"};
+    auto limits = risk_limits();
+    limits.max_daily_signals = 2;
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    // 同步拒单不会留下柜台未决单，但已经接受的信号仍占额度。
+    fake->order_insert_return_code = -1;
+    auto* source_api = fake.get();
+    ctp::AsyncTraceJournal journal{path, "account1"};
+    runner.expect(journal.start(), "signal quota journal must start");
+    {
+        ctp::AccountTradingSession source{
+            account, limits, std::move(fake), 16, 32, 8, 32,
+            1, 1, {}, &journal, 101};
+        ctp::RestartImage initial{};
+        initial.valid = true;
+        initial.account_id = "account1";
+        initial.trading_day = "20260909";
+        initial.daily_signals = 1;
+        runner.expect(source.restore_restart_image(initial),
+            "source must restore one of two signal slots");
+        source.start();
+        complete_empty_recovery(source, *source_api);
+        runner.expect(source.recovery_snapshot().phase == ctp::RecoveryPhase::Ready
+                && source.daily_limit_snapshot().signals == 1,
+            "source must finish counter reconciliation before accepting signals");
+        const auto accepted = source.submit(opening_intent(9801), healthy_risk_snapshot());
+        runner.expect(accepted.code == ctp::SubmitCode::RejectedLocally
+                && metrics->order_insert_calls == 1
+                && source.daily_limit_snapshot().signals == 2,
+            "risk-accepted signal must consume its slot even if submission fails");
+        for (std::uint64_t id = 9802; id < 9805; ++id) {
+            const auto rejected = source.submit(opening_intent(id), healthy_risk_snapshot());
+            runner.expect(rejected.risk_reason == ctp::RiskRejectReason::DailySignalLimit
+                    && source.daily_limit_snapshot().signals == 2
+                    && metrics->order_insert_calls == 1,
+                "repeated daily limit rejections must preserve the full quota");
+        }
+        auto disabled = healthy_risk_snapshot();
+        disabled.enabled = false;
+        runner.expect(source.submit(opening_intent(9800), disabled).risk_reason
+                == ctp::RiskRejectReason::AccountDisabled
+                && source.daily_limit_snapshot().signals == 2,
+            "non-quota risk rejection must not consume a signal slot");
+        runner.expect(source.checkpoint_restart_state(), "full quota checkpoint must persist");
+    }
+    journal.stop();
+    const auto image = ctp::build_restart_image(ctp::read_trace_journal(path));
+    auto next_metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto next_api = std::make_unique<test_support::FakeTraderApi>(next_metrics);
+    auto* next_view = next_api.get();
+    ctp::AccountTradingSession successor{
+        account, limits, std::move(next_api),
+        16, 32, 8, 32};
+    runner.expect(image.valid && image.daily_signals == 2
+            && successor.restore_restart_image(image),
+        "successor must restore the real full-quota journal without initialization failure");
+    successor.start();
+    complete_empty_recovery(successor, *next_view);
+    runner.expect(successor.recovery_snapshot().phase == ctp::RecoveryPhase::Ready,
+        "successor must become ready after restoring the full quota");
+    runner.expect(successor.submit(opening_intent(9810), healthy_risk_snapshot()).risk_reason
+            == ctp::RiskRejectReason::DailySignalLimit
+            && next_metrics->order_insert_calls == 0,
+        "same-day restart must not refresh the signal quota");
+    runner.expect(successor.activate(1, 1, "0", "20260910")
+            && successor.daily_limit_snapshot().signals == 0
+            && successor.submit(opening_intent(9811), healthy_risk_snapshot()).code
+                == ctp::SubmitCode::Submitted
+            && next_metrics->order_insert_calls == 1,
+        "confirmed next trading day must allow a new signal");
+    std::filesystem::remove_all(root);
+}
+
 void test_restart_daily_limits_are_same_day_and_account_scoped(
     test_support::TestRunner& runner)
 {
@@ -2578,6 +2661,7 @@ int main()
     test_duplicate_exchange_facts_do_not_consume_trace_capacity(runner);
     test_restart_restores_identity_without_resubmitting(runner);
     test_restart_daily_limits_are_same_day_and_account_scoped(runner);
+    test_risk_rejections_preserve_restart_signal_quota(runner);
     test_missing_uncertain_order_stays_frozen(runner);
     test_one_of_four_recovery_failures_is_isolated(runner);
     test_stale_recovery_response_cannot_advance_phase(runner);
