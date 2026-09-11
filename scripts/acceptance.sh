@@ -104,7 +104,7 @@ publish_one_benchmark() {
         printf 'repository_root="$(git -C "$script_directory" rev-parse --show-toplevel)"\n'
         printf 'output_directory="${1:-$repository_root/runtime/performance/reproduced-accounts-%s}"\n' "$accounts"
         printf 'temporary_directory="$(mktemp -d)"\n'
-        printf '\''trap '\''\''rm -rf "$temporary_directory"'\''\'' EXIT\n'
+        printf '%s\n' 'trap '\''rm -rf "$temporary_directory"'\'' EXIT'
         printf 'cp "$repository_root/config/accounts.example.ini" "$temporary_directory/accounts.ini"\n'
         printf 'chmod 600 "$temporary_directory/accounts.ini"\n'
         printf '"$repository_root/build/ctp_client" benchmark \\\n'
@@ -261,6 +261,8 @@ run_evidence_test() {
     test ! -e "$published_directory/accounts.ini"
     grep -q 'config/accounts.example.ini' "$published_directory/reproduce.sh"
     grep -q 'BASH_SOURCE' "$published_directory/reproduce.sh"
+    grep -Fxq 'trap '\''rm -rf "$temporary_directory"'\'' EXIT' \
+        "$published_directory/reproduce.sh"
     bash -n "$published_directory/reproduce.sh"
     if grep -q '/tmp/' "$published_directory/reproduce.sh"; then
         echo "published reproduce script contains a temporary path" >&2
