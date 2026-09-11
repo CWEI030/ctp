@@ -153,7 +153,7 @@ publish_benchmark_root() {
         for source_directory in "$result_root"/*; do
             [[ -d "$source_directory" && -s "$source_directory/manifest.json" ]] || continue
             run_name="$(basename "$source_directory")"
-            publish_one_benchmark "$source_directory" "$published_root/$run_name"
+            publish_one_benchmark "$source_directory" "$published_root/$run_name" >&2
             raw_index="$published_root/$run_name/latency_raw.index.tsv"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$run_name" \
@@ -262,10 +262,10 @@ verify_tail_sample_counts() {
             END {
                 split("market_to_signal signal_to_order_call callback_to_state simulated_end_to_end", stages, " ")
                 for (account = 0; account < accounts; account++) {
-                    for (index = 1; index <= 4; index++) {
-                        key = account SUBSEP stages[index]
+                    for (stage_index = 1; stage_index <= 4; stage_index++) {
+                        key = account SUBSEP stages[stage_index]
                         if (count[key] < 10000) {
-                            printf "insufficient samples: account=%d stage=%s count=%d\n", account, stages[index], count[key] > "/dev/stderr"
+                            printf "insufficient samples: account=%d stage=%s count=%d\n", account, stages[stage_index], count[key] > "/dev/stderr"
                             failed = 1
                         }
                     }

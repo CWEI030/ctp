@@ -1,0 +1,9 @@
+{
+  "delivered_market_events": 38000,
+  "accounts": [
+    {"index": 0, "market_events_enqueued": 38000, "market_events_processed": 38000, "signals": 12667, "submitted": 12667, "rejected": 0, "api_order_calls": 12667, "order_requests": 12667, "order_acceptances": 12667, "order_rejections": 0, "cancel_requests": 0, "cancel_acceptances": 0, "trades": 12667, "traded_volume": 12667, "freeze_transitions": 0, "recovery_completions": 0},
+    {"index": 1, "market_events_enqueued": 38000, "market_events_processed": 38000, "signals": 12667, "submitted": 12667, "rejected": 0, "api_order_calls": 12667, "order_requests": 12667, "order_acceptances": 12667, "order_rejections": 0, "cancel_requests": 0, "cancel_acceptances": 0, "trades": 12667, "traded_volume": 12667, "freeze_transitions": 0, "recovery_completions": 0},
+    {"index": 2, "market_events_enqueued": 38000, "market_events_processed": 38000, "signals": 12667, "submitted": 12667, "rejected": 0, "api_order_calls": 12667, "order_requests": 12667, "order_acceptances": 12667, "order_rejections": 0, "cancel_requests": 0, "cancel_acceptances": 0, "trades": 12667, "traded_volume": 12667, "freeze_transitions": 0, "recovery_completions": 0},
+    {"index": 3, "market_events_enqueued": 38000, "market_events_processed": 38000, "signals": 12667, "submitted": 12667, "rejected": 0, "api_order_calls": 12667, "order_requests": 12667, "order_acceptances": 12667, "order_rejections": 0, "cancel_requests": 0, "cancel_acceptances": 0, "trades": 12667, "traded_volume": 12667, "freeze_transitions": 0, "recovery_completions": 0}
+  ]
+}
