@@ -1835,6 +1835,7 @@ CancelResult AccountTradingSession::cancel(
         impl_->state.apply_order_report(
             {client_order_id, OrderReportType::CancelRejected, 0});
         record->cancel_requested = false;
+        --impl_->daily_cancels;
         return {CancelCode::RejectedLocally, client_order_id, api_code};
     }
     impl_->trace(TraceStage::CancelRequested, record);

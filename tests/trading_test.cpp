@@ -974,21 +974,25 @@ void test_synchronous_cancel_failure_can_be_retried(
     auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
     auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
     fake->order_action_return_code = -1;
+    auto limits = risk_limits();
+    limits.max_daily_cancels = 1;
     ctp::AccountTradingSession session{
-        account, risk_limits(), std::move(fake), 4, 4, 4, 4};
+        account, limits, std::move(fake), 4, 4, 4, 4};
     const auto submitted = session.submit(
         opening_intent(100), healthy_risk_snapshot());
 
     const auto first_cancel = session.cancel(submitted.client_order_id);
     const auto second_cancel = session.cancel(submitted.client_order_id);
+    const auto daily_limits = session.daily_limit_snapshot();
 
     runner.expect(
         first_cancel.code == ctp::CancelCode::RejectedLocally
             && first_cancel.api_return_code == -1
             && second_cancel.code == ctp::CancelCode::RejectedLocally
             && second_cancel.api_return_code == -1
-            && metrics->order_action_calls == 2,
-        "a synchronous cancel failure must allow a later CTP retry");
+            && metrics->order_action_calls == 2
+            && daily_limits.cancels == 0,
+        "a synchronous cancel failure must release quota for a later CTP retry");
 }
 
 void test_unknown_callback_freezes_only_its_account(
@@ -1110,8 +1114,10 @@ void test_cancel_rejection_and_daily_limit(test_support::TestRunner& runner)
     ctp::OrderSnapshot order{};
     session.order_snapshot(submitted.client_order_id, order);
     runner.expect(
-        order.state == ctp::OrderState::Accepted,
-        "a rejected cancellation must restore the last known live order state");
+        order.state == ctp::OrderState::Accepted
+            && session.daily_limit_snapshot().cancels == 1,
+        "an asynchronously rejected cancellation must restore the live order "
+        "and retain submitted cancel quota");
 
     auto no_cancel_limits = risk_limits();
     no_cancel_limits.max_daily_cancels = 0;
