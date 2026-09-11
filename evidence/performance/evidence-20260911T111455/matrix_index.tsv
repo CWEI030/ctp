@@ -1,4 +1,0 @@
-run	accounts	rate	warmup_seconds	duration_seconds	submit_stride	burst_rate	burst_seconds	dropped	raw_samples	raw_sha256
-accounts-1	1	1000	2	36	1	0	0	0	84000	5ea6a162b064ca22b100819d94a5f01f385c7241a870420304d3216063dfc70e
-accounts-2	2	1000	2	36	1	0	0	0	168000	60df45f23302d7c9a92fbf0fc0fb5166bf929e75dd5ef44992b300279e7217d5
-accounts-4	4	1000	2	36	1	0	0	0	336000	0bd152923bb5c23e521cd6b4717c3aa5c7e2a58f3fc66fc1a0af3942b0f3cde0

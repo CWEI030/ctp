@@ -236,6 +236,8 @@ scripts/acceptance.sh all-offline
 
 `benchmark evidence` 会在 `evidence/performance/` 生成可提交的完整有序 `latency_raw.csv`、逐纳秒派生直方图、CPU/队列时间序列、环境快照、固定回放输入、可移植复现脚本和运行索引。它要求每账户四段链路各至少 10000 个样本；提交物保留 `sequence` 与 `mono_ns`，可重新检查事件顺序、时间相关停顿和抖动，并给出当前测量条件下的延迟、吞吐、CPU、积压及丢弃结论。复现脚本不依赖采集时的临时路径；这些离线结果不用于声明生产容量或 SLA。
 
+当前提交证据位于 `evidence/performance/evidence-20260911T141213/`，三份运行清单和采集前后环境快照均记录冻结基线 `e5bf57392dacd42abed821817ce7ca323ed911be`。该目录包含 1、2、4 逻辑账户的完整原始数据、报告与校验清单；从冻结基线到证据提交只允许证据和文档变化。
+
 ## 常见问题
 
 - **CMake 提示缺少 SDK 文件**：确认 `CTP_SDK_ROOT` 指向同时包含 `md/` 和 `trader/` 的目录。
