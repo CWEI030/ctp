@@ -199,8 +199,20 @@ struct AsyncTraceJournal::Impl {
         while (running.load(std::memory_order_acquire) || queue.depth() != 0) {
             if (queue.try_pop(event)) {
                 write(event);
+                written_sequence.store(event.sequence, std::memory_order_release);
             } else {
                 std::this_thread::yield();
+            }
+            const auto requested = flush_request.load(std::memory_order_acquire);
+            if (requested != 0
+                && written_sequence.load(std::memory_order_acquire) >= requested
+                && flushed_sequence.load(std::memory_order_relaxed) < requested) {
+                output.flush();
+                if (!output) {
+                    flush_failed.store(true, std::memory_order_release);
+                } else {
+                    flushed_sequence.store(requested, std::memory_order_release);
+                }
             }
         }
         output.flush();
@@ -213,6 +225,10 @@ struct AsyncTraceJournal::Impl {
     std::thread writer;
     std::atomic<bool> running{false};
     std::atomic<std::uint64_t> largest_sequence{0};
+    std::atomic<std::uint64_t> written_sequence{0};
+    std::atomic<std::uint64_t> flush_request{0};
+    std::atomic<std::uint64_t> flushed_sequence{0};
+    std::atomic<bool> flush_failed{false};
     std::atomic<std::int32_t> writer_tid{0};
 };
 
@@ -234,6 +250,16 @@ bool AsyncTraceJournal::start()
     impl_->output.open(impl_->path, std::ios::out | std::ios::trunc);
     if (!impl_->output) return false;
     impl_->output << kHeaderV2 << '\n';
+    impl_->output.flush();
+    if (!impl_->output) {
+        impl_->output.close();
+        return false;
+    }
+    impl_->largest_sequence.store(0, std::memory_order_relaxed);
+    impl_->written_sequence.store(0, std::memory_order_relaxed);
+    impl_->flush_request.store(0, std::memory_order_relaxed);
+    impl_->flushed_sequence.store(0, std::memory_order_relaxed);
+    impl_->flush_failed.store(false, std::memory_order_relaxed);
     impl_->running.store(true, std::memory_order_release);
     impl_->writer = std::thread([this] { impl_->run(); });
     return true;
@@ -242,6 +268,7 @@ bool AsyncTraceJournal::start()
 bool AsyncTraceJournal::try_record(const TraceEvent& event) noexcept
 {
     if (!impl_->running.load(std::memory_order_acquire)) return false;
+    if (!impl_->queue.try_push(event)) return false;
     auto previous = impl_->largest_sequence.load(std::memory_order_relaxed);
     while (previous < event.sequence
            && !impl_->largest_sequence.compare_exchange_weak(
@@ -250,7 +277,23 @@ bool AsyncTraceJournal::try_record(const TraceEvent& event) noexcept
                std::memory_order_relaxed,
                std::memory_order_relaxed)) {
     }
-    return impl_->queue.try_push(event);
+    return true;
+}
+
+bool AsyncTraceJournal::flush() noexcept
+{
+    if (!impl_->running.load(std::memory_order_acquire)) return false;
+    const auto target = impl_->largest_sequence.load(std::memory_order_acquire);
+    if (target == 0) return true;
+    impl_->flush_request.store(target, std::memory_order_release);
+    while (impl_->flushed_sequence.load(std::memory_order_acquire) < target) {
+        if (impl_->flush_failed.load(std::memory_order_acquire)
+            || !impl_->running.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
 }
 
 void AsyncTraceJournal::stop() noexcept

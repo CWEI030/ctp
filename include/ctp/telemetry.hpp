@@ -222,6 +222,8 @@ public:
 
     bool start();
     bool try_record(const TraceEvent& event) noexcept override;
+    // 控制面刷新屏障；等待此前已接收的轨迹由日志线程刷新，不得从实时热路径调用。
+    bool flush() noexcept;
     void stop() noexcept;
     TraceQueueSnapshot snapshot() const noexcept;
 

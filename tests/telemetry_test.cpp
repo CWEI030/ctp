@@ -12,6 +12,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 namespace {
 
 std::size_t csv_sample_count(const std::string& text)
@@ -182,6 +185,32 @@ void test_async_journal_round_trip_and_clean_marker(
         text.find("password") == std::string::npos
             && text.find("auth") == std::string::npos,
         "trace output must not contain credential fields");
+    std::filesystem::remove(path);
+}
+
+void test_abnormal_exit_after_start_keeps_a_complete_empty_journal(
+    test_support::TestRunner& runner)
+{
+    const std::filesystem::path path{
+        "/tmp/ctp_crash_boundary_empty_journal.csv"};
+    std::filesystem::remove(path);
+
+    const auto child = ::fork();
+    if (child == 0) {
+        ctp::AsyncTraceJournal journal{path, "account1"};
+        // _exit 不执行析构函数，用真实异常退出证明 start() 已持久化文件头。
+        ::_exit(journal.start() ? 0 : 2);
+    }
+
+    int status = 0;
+    const bool child_ok = child > 0
+        && ::waitpid(child, &status, 0) == child
+        && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    const auto loaded = ctp::read_trace_journal(path);
+    runner.expect(
+        child_ok && loaded.valid && !loaded.clean_shutdown
+            && loaded.account_id.empty() && loaded.events.empty(),
+        "a crash immediately after journal start must leave a complete abnormal prefix");
     std::filesystem::remove(path);
 }
 
@@ -542,6 +571,7 @@ int main()
     test_trace_queue_is_nonblocking_and_counts_drops(runner);
     test_trace_queue_reserves_capacity_for_order_facts(runner);
     test_async_journal_round_trip_and_clean_marker(runner);
+    test_abnormal_exit_after_start_keeps_a_complete_empty_journal(runner);
     test_truncated_journal_is_not_a_clean_restart(runner);
     test_structurally_complete_abnormal_journal_allows_counter_recovery(runner);
     test_dropped_trace_journal_is_not_a_restart_source(runner);
