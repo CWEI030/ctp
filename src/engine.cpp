@@ -736,6 +736,8 @@ private:
         return risk;
     }
 
+    std::size_t poll_once() noexcept;
+
     void run(std::atomic<bool>& stopping) noexcept
     {
         if (!session_) {
@@ -749,50 +751,8 @@ private:
         }
         session_->start();
         while (!stopping.load(std::memory_order_acquire)) {
-            session_->drain_callbacks();
-            const auto recovery = session_->recovery_snapshot();
-            ready_.store(
-                recovery.phase == RecoveryPhase::Ready,
-                std::memory_order_release);
-            if (recovery.phase == RecoveryPhase::Frozen) {
-                failed_.store(true, std::memory_order_release);
-            }
-            update_acceptance(recovery);
-            if (ingress_.snapshot(account_index_).overflowed) {
-                session_->mark_fault(AccountFault::MarketQueueOverflow);
-                failed_.store(true, std::memory_order_release);
-                if (live_.acceptance) {
-                    acceptance_status_.store(
-                        AcceptanceStatus::Fail, std::memory_order_release);
-                }
-            }
-
-            MarketEvent market{};
-            std::size_t drained = 0;
-            while (drained < 256 && ingress_.try_pop(account_index_, market)) {
-                ++drained;
-                if (recovery.phase != RecoveryPhase::Ready) continue;
-                auto risk = risk_snapshot(market);
-                session_->trace_market(market);
-                static_cast<void>(session_->on_market(market, risk));
-                if (!live_.strategy_enabled || !live_.allow_orders) continue;
-                const auto decision = strategy_.on_market(market, risk.now_ns);
-                if (!decision.has_intent) continue;
-                session_->trace_signal(market, decision.intent, risk.now_ns);
-                if (risk.now_ns - rate_window_start_ns_ >= 1'000'000'000) {
-                    rate_window_start_ns_ = risk.now_ns;
-                    orders_in_window_ = 0;
-                }
-                risk.orders_in_rate_window = orders_in_window_;
-                const auto result = session_->submit(decision.intent, risk);
-                if (result.code == SubmitCode::Submitted) {
-                    ++orders_in_window_;
-                    submitted_.fetch_add(1, std::memory_order_relaxed);
-                } else if (live_.acceptance) {
-                    acceptance_status_.store(
-                        AcceptanceStatus::Fail, std::memory_order_release);
-                }
-            }
+            const auto drained = poll_once();
+            // 只有空轮询才让出时间片；一旦取到行情，业务链内不等待。
             if (drained == 0) std::this_thread::yield();
         }
         session_->drain_callbacks();
@@ -839,6 +799,55 @@ private:
     bool final_position_known_{false};
     bool initialized_{true};
 };
+
+std::size_t LiveAccountWorker::poll_once() noexcept
+{
+    session_->drain_callbacks();
+    const auto recovery = session_->recovery_snapshot();
+    ready_.store(
+        recovery.phase == RecoveryPhase::Ready,
+        std::memory_order_release);
+    if (recovery.phase == RecoveryPhase::Frozen) {
+        failed_.store(true, std::memory_order_release);
+    }
+    update_acceptance(recovery);
+    if (ingress_.snapshot(account_index_).overflowed) {
+        session_->mark_fault(AccountFault::MarketQueueOverflow);
+        failed_.store(true, std::memory_order_release);
+        if (live_.acceptance) {
+            acceptance_status_.store(
+                AcceptanceStatus::Fail, std::memory_order_release);
+        }
+    }
+
+    MarketEvent market{};
+    std::size_t drained = 0;
+    while (drained < 256 && ingress_.try_pop(account_index_, market)) {
+        ++drained;
+        if (recovery.phase != RecoveryPhase::Ready) continue;
+        auto risk = risk_snapshot(market);
+        session_->trace_market(market);
+        static_cast<void>(session_->on_market(market, risk));
+        if (!live_.strategy_enabled || !live_.allow_orders) continue;
+        const auto decision = strategy_.on_market(market, risk.now_ns);
+        if (!decision.has_intent) continue;
+        session_->trace_signal(market, decision.intent, risk.now_ns);
+        if (risk.now_ns - rate_window_start_ns_ >= 1'000'000'000) {
+            rate_window_start_ns_ = risk.now_ns;
+            orders_in_window_ = 0;
+        }
+        risk.orders_in_rate_window = orders_in_window_;
+        const auto result = session_->submit(decision.intent, risk);
+        if (result.code == SubmitCode::Submitted) {
+            ++orders_in_window_;
+            submitted_.fetch_add(1, std::memory_order_relaxed);
+        } else if (live_.acceptance) {
+            acceptance_status_.store(
+                AcceptanceStatus::Fail, std::memory_order_release);
+        }
+    }
+    return drained;
+}
 
 bool contains_placeholder(std::string_view value)
 {

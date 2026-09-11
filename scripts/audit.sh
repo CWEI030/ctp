@@ -87,6 +87,12 @@ audit_secrets() {
 extract_function() {
     local source_file="$1"
     local marker="$2"
+    local matches
+    matches="$(grep -Fc -- "$marker" "$source_file")"
+    if [[ "$matches" -ne 1 ]]; then
+        echo "[fail] hot-path marker must match exactly once: $source_file: $marker (matches=$matches)" >&2
+        return 1
+    fi
     awk -v marker="$marker" '
         index($0, marker) != 0 { active = 1; found = 1 }
         active {
@@ -109,7 +115,15 @@ audit_hot_path() {
     while IFS='|' read -r source_file marker; do
         extract_function "$source_file" "$marker" >> "$temporary_file"
     done <<'HOT_PATHS'
+include/ctp/engine.hpp|bool try_push(const Event& event) noexcept
+include/ctp/engine.hpp|bool try_pop(Event& event) noexcept
+src/engine.cpp|MarketIngress::normalize(
+src/engine.cpp|MarketIngress::publish(
+src/engine.cpp|MarketIngress::ingest(
 src/engine.cpp|MarketIngress::OnRtnDepthMarketData(
+src/engine.cpp|void run(std::atomic<bool>& stopping) noexcept
+src/engine.cpp|RiskSnapshot risk_snapshot(
+src/engine.cpp|LiveAccountWorker::poll_once(
 src/strategy.cpp|ThresholdStrategy::on_market(
 src/trading.cpp|AccountTradingState::create_order(
 src/trading.cpp|AccountTradingState::apply_local_event(
@@ -120,15 +134,19 @@ src/trading.cpp|AccountTradingSession::submit(
 src/trading.cpp|AccountTradingSession::cancel(
 src/trading.cpp|AccountTradingSession::on_market(
 src/trading.cpp|AccountTradingSession::drain_callbacks(
+src/trading.cpp|void push_callback(const CallbackEvent& event) noexcept
+src/trading.cpp|void trace(
 src/trading.cpp|AccountTradingSession::OnRtnOrder(
 src/trading.cpp|AccountTradingSession::OnRtnTrade(
 src/trading.cpp|AccountTradingSession::OnRspOrderInsert(
 src/trading.cpp|AccountTradingSession::OnRspOrderAction(
+src/trader_client.cpp|int request_order_insert(
+src/trader_client.cpp|int request_order_action(
 src/telemetry.cpp|AsyncTraceJournal::try_record(
 src/telemetry.cpp|AsyncPerformanceRecorder::try_record(
 HOT_PATHS
 
-    local forbidden='std::(mutex|timed_mutex|recursive_mutex|shared_mutex|lock_guard|unique_lock|scoped_lock|condition_variable|cout|cerr|clog|ofstream)|this_thread::(sleep_|yield)|(^|[^[:alnum:]_])(malloc|calloc|realloc|free|printf|fprintf|fwrite|operator[[:space:]]+new|make_unique|make_shared|new|delete)[[:space:]<(]'
+    local forbidden='std::(mutex|timed_mutex|recursive_mutex|shared_mutex|lock_guard|unique_lock|scoped_lock|condition_variable|cout|cerr|clog|ofstream)|(std::string)([^_[:alnum:]]|$)|std::(vector|deque|list|map|unordered_map|set|unordered_set)[[:space:]<]|this_thread::sleep_|\.(push_back|emplace_back|reserve|resize)\(|(^|[^[:alnum:]_])(malloc|calloc|realloc|free|printf|fprintf|fwrite|operator[[:space:]]+new|make_unique|make_shared|new|delete)[[:space:]<(]'
     if grep -En -- "$forbidden" "$temporary_file"; then
         echo "[fail] application hot path contains a forbidden API" >&2
         return 1

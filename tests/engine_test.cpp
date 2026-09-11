@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -267,6 +268,238 @@ std::unique_ptr<test_support::FakeTraderApi> make_filling_trader(
     };
     return api;
 }
+
+enum class AsyncTraderRequestKind : std::uint8_t {
+    Connect,
+    Authenticate,
+    Login,
+    QueryOrders,
+    QueryTrades,
+    QueryPositions,
+    QueryFunds,
+    Insert,
+    Cancel,
+};
+
+struct AsyncTraderRequest {
+    AsyncTraderRequestKind kind{AsyncTraderRequestKind::Connect};
+    int request_id{0};
+    CThostFtdcInputOrderField order{};
+    CThostFtdcInputOrderActionField action{};
+};
+
+static_assert(std::is_trivially_copyable<AsyncTraderRequest>::value);
+
+struct AsyncHotPathTraderState {
+    std::atomic<int> recovery_complete{0};
+    std::atomic<int> insert_calls{0};
+    std::atomic<int> cancel_calls{0};
+    std::atomic<int> order_reports{0};
+    std::atomic<int> trades{0};
+    std::atomic<int> request_drops{0};
+    std::atomic<bool> identity_ok{true};
+    std::array<char, 16> expected_user{};
+    bool fill_orders{false};
+};
+
+// 柜台替身在独立线程产生回报，使测试经过生产回调队列而非同步重入。
+class AsyncHotPathTraderApi final : public ctp::TraderApi {
+public:
+    explicit AsyncHotPathTraderApi(
+        std::shared_ptr<AsyncHotPathTraderState> state)
+        : state_(std::move(state)), running_(true), worker_([this] { run(); })
+    {
+    }
+
+    ~AsyncHotPathTraderApi() override { release(); }
+
+    void register_spi(CThostFtdcTraderSpi* spi) override
+    {
+        spi_.store(spi, std::memory_order_release);
+    }
+
+    void subscribe_private_topic(THOST_TE_RESUME_TYPE, int) override {}
+    void subscribe_public_topic(THOST_TE_RESUME_TYPE) override {}
+    void register_front(const std::string&) override {}
+
+    void init() override { push({AsyncTraderRequestKind::Connect}); }
+
+    int request_authenticate(
+        CThostFtdcReqAuthenticateField* request, int request_id) override
+    {
+        if (std::strcmp(request->UserID, state_->expected_user.data()) != 0) {
+            state_->identity_ok.store(false, std::memory_order_relaxed);
+        }
+        return push({AsyncTraderRequestKind::Authenticate, request_id});
+    }
+
+    int request_user_login(
+        CThostFtdcReqUserLoginField* request, int request_id) override
+    {
+        if (std::strcmp(request->UserID, state_->expected_user.data()) != 0) {
+            state_->identity_ok.store(false, std::memory_order_relaxed);
+        }
+        return push({AsyncTraderRequestKind::Login, request_id});
+    }
+
+    int request_trading_account(
+        CThostFtdcQryTradingAccountField*, int request_id) override
+    {
+        return push({AsyncTraderRequestKind::QueryFunds, request_id});
+    }
+
+    int request_investor_position(
+        CThostFtdcQryInvestorPositionField*, int request_id) override
+    {
+        return push({AsyncTraderRequestKind::QueryPositions, request_id});
+    }
+
+    int request_order_insert(
+        CThostFtdcInputOrderField* order, int request_id) override
+    {
+        AsyncTraderRequest request{AsyncTraderRequestKind::Insert, request_id};
+        request.order = *order;
+        state_->insert_calls.fetch_add(1, std::memory_order_relaxed);
+        return push(request);
+    }
+
+    int request_order_action(
+        CThostFtdcInputOrderActionField* action, int request_id) override
+    {
+        AsyncTraderRequest request{AsyncTraderRequestKind::Cancel, request_id};
+        request.action = *action;
+        state_->cancel_calls.fetch_add(1, std::memory_order_relaxed);
+        return push(request);
+    }
+
+    int request_order_query(CThostFtdcQryOrderField*, int request_id) override
+    {
+        return push({AsyncTraderRequestKind::QueryOrders, request_id});
+    }
+
+    int request_trade_query(CThostFtdcQryTradeField*, int request_id) override
+    {
+        return push({AsyncTraderRequestKind::QueryTrades, request_id});
+    }
+
+    void release() override
+    {
+        if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+        if (worker_.joinable()) worker_.join();
+        spi_.store(nullptr, std::memory_order_release);
+    }
+
+private:
+    int push(const AsyncTraderRequest& request) noexcept
+    {
+        if (requests_.try_push(request)) return 0;
+        state_->request_drops.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    void emit_order(
+        CThostFtdcTraderSpi& spi,
+        const char* order_ref,
+        char status) noexcept
+    {
+        CThostFtdcOrderField order{};
+        ctp::copy_to_field(order.OrderRef, std::string_view{order_ref});
+        ctp::copy_to_field(order.ExchangeID, "CFFEX");
+        ctp::copy_to_field(order.OrderSysID, "HOTPATH");
+        order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+        order.OrderStatus = status;
+        spi.OnRtnOrder(&order);
+        state_->order_reports.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void emit_trade(
+        CThostFtdcTraderSpi& spi,
+        const CThostFtdcInputOrderField& order) noexcept
+    {
+        CThostFtdcTradeField trade{};
+        ctp::copy_to_field(trade.OrderRef, std::string_view{order.OrderRef});
+        ctp::copy_to_field(trade.TradingDay, "20260911");
+        ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+        ctp::copy_to_field(trade.TradeID, std::string_view{order.OrderRef});
+        ctp::copy_to_field(
+            trade.InstrumentID, std::string_view{order.InstrumentID});
+        trade.Direction = order.Direction;
+        trade.OffsetFlag = order.CombOffsetFlag[0];
+        trade.Volume = order.VolumeTotalOriginal;
+        trade.Price = order.LimitPrice;
+        spi.OnRtnTrade(&trade);
+        state_->trades.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void handle(CThostFtdcTraderSpi& spi, const AsyncTraderRequest& request)
+        noexcept
+    {
+        CThostFtdcRspInfoField ok{};
+        switch (request.kind) {
+        case AsyncTraderRequestKind::Connect:
+            spi.OnFrontConnected();
+            break;
+        case AsyncTraderRequestKind::Authenticate:
+            spi.OnRspAuthenticate(nullptr, &ok, request.request_id, true);
+            break;
+        case AsyncTraderRequestKind::Login: {
+            CThostFtdcRspUserLoginField login{};
+            login.FrontID = 3;
+            login.SessionID = 9;
+            ctp::copy_to_field(login.MaxOrderRef, "20");
+            ctp::copy_to_field(login.TradingDay, "20260911");
+            spi.OnRspUserLogin(&login, &ok, request.request_id, true);
+            break;
+        }
+        case AsyncTraderRequestKind::QueryOrders:
+            spi.OnRspQryOrder(nullptr, &ok, request.request_id, true);
+            break;
+        case AsyncTraderRequestKind::QueryTrades:
+            spi.OnRspQryTrade(nullptr, &ok, request.request_id, true);
+            break;
+        case AsyncTraderRequestKind::QueryPositions:
+            spi.OnRspQryInvestorPosition(
+                nullptr, &ok, request.request_id, true);
+            break;
+        case AsyncTraderRequestKind::QueryFunds: {
+            CThostFtdcTradingAccountField funds{};
+            funds.Available = 100'000.0;
+            spi.OnRspQryTradingAccount(
+                &funds, &ok, request.request_id, true);
+            state_->recovery_complete.fetch_add(1, std::memory_order_release);
+            break;
+        }
+        case AsyncTraderRequestKind::Insert:
+            emit_order(spi, request.order.OrderRef,
+                       THOST_FTDC_OST_NoTradeQueueing);
+            if (state_->fill_orders) emit_trade(spi, request.order);
+            break;
+        case AsyncTraderRequestKind::Cancel:
+            emit_order(spi, request.action.OrderRef, THOST_FTDC_OST_Canceled);
+            break;
+        }
+    }
+
+    void run() noexcept
+    {
+        AsyncTraderRequest request{};
+        while (running_.load(std::memory_order_acquire)
+               || requests_.depth() != 0) {
+            if (!requests_.try_pop(request)) {
+                std::this_thread::yield();
+                continue;
+            }
+            auto* spi = spi_.load(std::memory_order_acquire);
+            if (spi != nullptr) handle(*spi, request);
+        }
+    }
+
+    std::shared_ptr<AsyncHotPathTraderState> state_;
+    ctp::SpscQueue<AsyncTraderRequest, 64> requests_;
+    std::atomic<CThostFtdcTraderSpi*> spi_{nullptr};
+    std::atomic<bool> running_{false};
+    std::thread worker_;
+};
 
 int run_acceptance_with_fills(
     const ctp::RuntimeConfig& config,
@@ -1732,6 +1965,240 @@ void test_online_acceptance_interruption_is_incomplete(
         "an interrupted run must report every unfinished account");
 }
 
+std::uint64_t first_signal_id(const ctp::TraceJournalReadResult& journal)
+{
+    for (const auto& event : journal.events) {
+        if (event.stage == ctp::TraceStage::Signal) {
+            return event.trace_id.signal_id;
+        }
+    }
+    return 0;
+}
+
+bool contains_signal_stage(
+    const ctp::TraceJournalReadResult& journal,
+    std::uint64_t signal_id,
+    ctp::TraceStage stage)
+{
+    for (const auto& event : journal.events) {
+        if (event.trace_id.signal_id == signal_id && event.stage == stage) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_release_four_account_complete_hot_path(
+    test_support::TestRunner& runner)
+{
+#ifndef NDEBUG
+    runner.expect(false, "complete hot-path proof must run in Release mode");
+    return;
+#else
+    const std::filesystem::path trace_root{"/tmp/ctp_hot_path_complete"};
+    std::filesystem::remove_all(trace_root);
+    auto config = make_live_config(4);
+    auto live = config.live();
+    live.cancel_after_market_ticks = 3;
+    ctp::RuntimeConfig stress_config{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        config.accounts(),
+        {},
+        std::move(live)};
+
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::array<std::shared_ptr<AsyncHotPathTraderState>, 4> traders;
+    for (std::size_t index = 0; index < traders.size(); ++index) {
+        traders[index] = std::make_shared<AsyncHotPathTraderState>();
+        ctp::copy_to_field(
+            traders[index]->expected_user,
+            stress_config.accounts()[index].user_id());
+        traders[index]->fill_orders = index >= 2;
+    }
+
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    std::size_t next_account = 0;
+    dependencies.create_trader = [&traders, &next_account](const std::string&) {
+        return std::make_unique<AsyncHotPathTraderApi>(
+            traders[next_account++]);
+    };
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> completed{false};
+    std::atomic<std::size_t> hot_allocations{0};
+    std::thread feeder([market, &traders, &stop, &completed, &hot_allocations] {
+        const auto startup_deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds{5};
+        while (std::chrono::steady_clock::now() < startup_deadline) {
+            bool ready = market->subscribed.load(std::memory_order_acquire);
+            for (const auto& trader : traders) {
+                ready = ready && trader->recovery_complete.load(
+                    std::memory_order_acquire) == 1;
+            }
+            if (ready) break;
+            std::this_thread::yield();
+        }
+
+        auto below = make_tick(0);
+        below.LastPrice = 799.8;
+        below.BidPrice1 = 799.6;
+        below.AskPrice1 = 800.0;
+        for (int index = 0; index < 32; ++index) {
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&below);
+            std::this_thread::yield();
+        }
+
+        test_support::AllocationProbe probe;
+        auto crossing = make_tick(1);
+        crossing.LastPrice = 800.0;
+        crossing.BidPrice1 = 799.8;
+        crossing.AskPrice1 = 800.2;
+        market->spi.load(std::memory_order_acquire)
+            ->OnRtnDepthMarketData(&crossing);
+
+        const auto workload_deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds{5};
+        while (std::chrono::steady_clock::now() < workload_deadline) {
+            bool entries_arrived = true;
+            for (const auto& trader : traders) {
+                entries_arrived = entries_arrived
+                    && trader->insert_calls.load(std::memory_order_acquire) >= 1;
+            }
+            entries_arrived = entries_arrived
+                && traders[2]->trades.load(std::memory_order_acquire) >= 1
+                && traders[3]->trades.load(std::memory_order_acquire) >= 1;
+            if (entries_arrived) break;
+            std::this_thread::yield();
+        }
+
+        // 先让成交回报驱动平仓，再继续投递行情触发撤单，避免测试负载
+        // 把平仓单人为推进到重报价超时。
+        market->spi.load(std::memory_order_acquire)
+            ->OnRtnDepthMarketData(&crossing);
+        while (std::chrono::steady_clock::now() < workload_deadline) {
+            const bool fills_closed =
+                traders[2]->insert_calls.load(std::memory_order_acquire) == 2
+                && traders[3]->insert_calls.load(std::memory_order_acquire) == 2
+                && traders[2]->trades.load(std::memory_order_acquire) == 2
+                && traders[3]->trades.load(std::memory_order_acquire) == 2;
+            if (fills_closed) break;
+            std::this_thread::yield();
+        }
+
+        while (std::chrono::steady_clock::now() < workload_deadline) {
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&crossing);
+            const bool cancel_complete =
+                traders[0]->cancel_calls.load(std::memory_order_acquire) == 1
+                && traders[1]->cancel_calls.load(std::memory_order_acquire) == 1
+                && traders[0]->order_reports.load(std::memory_order_acquire) >= 2
+                && traders[1]->order_reports.load(std::memory_order_acquire) >= 2;
+            const bool fill_complete =
+                traders[2]->insert_calls.load(std::memory_order_acquire) == 2
+                && traders[3]->insert_calls.load(std::memory_order_acquire) == 2
+                && traders[2]->trades.load(std::memory_order_acquire) == 2
+                && traders[3]->trades.load(std::memory_order_acquire) == 2;
+            if (cancel_complete && fill_complete) {
+                completed.store(true, std::memory_order_release);
+                break;
+            }
+            std::this_thread::yield();
+        }
+        probe.stop();
+        hot_allocations.store(probe.count(), std::memory_order_release);
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        stress_config,
+        output,
+        error,
+        [&stop] { return stop.load(std::memory_order_acquire); },
+        std::move(dependencies));
+    feeder.join();
+
+    runner.expect(
+        exit_code == 0 && completed.load(std::memory_order_acquire),
+        "four production account workers must complete the fixed async workload");
+    runner.expect(
+        hot_allocations.load(std::memory_order_acquire) == 0,
+        "the preheated complete application hot path must not allocate");
+    runner.expect(
+        output.str().find("ready=4, failed=0") != std::string::npos,
+        "the workload must finish with four isolated healthy accounts");
+    for (std::size_t index = 0; index < traders.size(); ++index) {
+        const auto& trader = traders[index];
+        runner.expect(
+            trader->identity_ok.load(std::memory_order_relaxed)
+                && trader->request_drops.load(std::memory_order_relaxed) == 0
+                && trader->recovery_complete.load(std::memory_order_relaxed) == 1,
+            "each trader must retain identity without request or callback overflow");
+        if (index < 2) {
+            runner.expect(
+                trader->insert_calls.load(std::memory_order_relaxed) == 1
+                    && trader->cancel_calls.load(std::memory_order_relaxed) == 1
+                    && trader->trades.load(std::memory_order_relaxed) == 0,
+                "cancel accounts must submit and cancel exactly their own order");
+        } else {
+            runner.expect(
+                trader->insert_calls.load(std::memory_order_relaxed) == 2
+                    && trader->cancel_calls.load(std::memory_order_relaxed) == 0
+                    && trader->trades.load(std::memory_order_relaxed) == 2,
+                "fill accounts must independently open and auto-close once");
+        }
+    }
+
+    std::filesystem::path run_directory;
+    for (const auto& entry : std::filesystem::directory_iterator{trace_root}) {
+        if (entry.is_directory()) run_directory = entry.path();
+    }
+    runner.expect(!run_directory.empty(), "the async trace run must be persisted");
+    for (std::size_t index = 0; index < traders.size(); ++index) {
+        const auto journal = ctp::read_trace_journal(
+            run_directory
+            / ("account" + std::to_string(index + 1) + ".csv"));
+        const auto signal_id = first_signal_id(journal);
+        runner.expect(
+            journal.valid && journal.clean_shutdown && signal_id != 0
+                && contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::Market)
+                && contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::Signal)
+                && contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::RiskAccepted)
+                && contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::OrderSubmitted)
+                && contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::OrderReport),
+            "each account must retain one correlated market-to-report trace");
+        runner.expect(
+            index < 2
+                ? contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::CancelRequested)
+                : contains_signal_stage(
+                    journal, signal_id, ctp::TraceStage::Trade)
+                    && contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::ExitIntent),
+            "the correlated trace must retain its cancel or fill/autoclose branch");
+        const auto& clean_stop = journal.events.back();
+        runner.expect(
+            clean_stop.stage == ctp::TraceStage::CleanStop
+                && clean_stop.code == 0 && clean_stop.quantity == 0,
+            "asynchronous trace queues must stop without critical or best-effort loss");
+    }
+    std::filesystem::remove_all(trace_root);
+#endif
+}
+
 }
 
 int main()
@@ -1764,5 +2231,6 @@ int main()
     test_online_acceptance_failure_does_not_stop_healthy_accounts(runner);
     test_online_acceptance_rejects_nonzero_final_position(runner);
     test_online_acceptance_interruption_is_incomplete(runner);
+    test_release_four_account_complete_hot_path(runner);
     return runner.finish();
 }

@@ -3,8 +3,8 @@
 set -euo pipefail
 
 if [[ "$#" -lt 1 || "$#" -gt 2 \
-    || ! "$1" =~ ^(replay|benchmark|simnow|all-offline)$ ]]; then
-    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|full|evidence-test]|simnow [preflight|online]|all-offline" >&2
+    || ! "$1" =~ ^(replay|benchmark|simnow|hot-path|all-offline)$ ]]; then
+    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|full|evidence-test]|simnow [preflight|online]|hot-path|all-offline" >&2
     exit 2
 fi
 
@@ -250,6 +250,15 @@ run_replay() {
     done
 }
 
+run_hot_path() {
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j2 --target ctp_engine_tests
+    # 固定四账户异步负载重复运行，证明生产调度链在 Release 下无分配且不串账户。
+    ctest --test-dir build --output-on-failure -R '^engine$' \
+        --repeat until-fail:20
+    scripts/audit.sh hot-path
+}
+
 run_benchmark_matrix() {
     local profile="${1:-smoke}"
     if [[ "$profile" == "evidence-test" ]]; then
@@ -338,7 +347,9 @@ case "$1" in
     replay) run_replay ;;
     benchmark) run_benchmark_matrix "${2:-smoke}" ;;
     simnow) run_simnow "${2:-preflight}" ;;
+    hot-path) run_hot_path ;;
     all-offline)
+        run_hot_path
         cmake --build build -j2
         ctest --test-dir build --output-on-failure
         run_replay
