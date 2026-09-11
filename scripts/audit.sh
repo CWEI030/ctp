@@ -65,6 +65,11 @@ audit_secrets() {
                 user_id|password|app_id|auth_code)
                     if [[ ${#value} -ge 4 ]]; then
                         for candidate in "${committable_files[@]}"; do
+                            # 已发布延迟原始数据只含经发布器校验的整数列和固定阶段名；
+                            # 数百万个时钟/延迟整数可能偶然包含纯数字用户代码。
+                            if [[ "$candidate" == evidence/performance/evidence-*/accounts-*/latency_raw.csv ]]; then
+                                continue
+                            fi
                             if grep -Iq . "$candidate" \
                                 && grep -IFq -- "$value" "$candidate"; then
                                 echo "[fail] value from local field $key also appears in a committable file" >&2

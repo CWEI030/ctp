@@ -39,10 +39,11 @@ json_number() {
 publish_one_benchmark() {
     local source_directory="$1"
     local published_directory="$2"
+    local replay_file="$3"
     verify_evidence "$source_directory"
     mkdir -p "$published_directory"
 
-    # 正式 CSV 可达数 GB；逐纳秒计数保持全部信息，同时避免把重复文本膨胀提交到 Git。
+    # 原始有序 CSV 保留 sequence 与 mono_ns；直方图仅作为快速重算统计的派生索引。
     {
         printf 'account_index\tstage\tlatency_ns\tcount\n'
         awk -F, '
@@ -83,15 +84,49 @@ publish_one_benchmark() {
             "$raw_sha" "$raw_bytes" "$raw_lines" "$raw_samples"
     } > "$published_directory/latency_raw.index.tsv"
 
-    cp "$source_directory/manifest.json" "$source_directory/queue_raw.csv" \
+    cp "$source_directory/manifest.json" "$source_directory/latency_raw.csv" \
+        "$source_directory/queue_raw.csv" \
         "$source_directory/cpu_raw.csv" "$source_directory/events_summary.json" \
-        "$source_directory/report.md" "$source_directory/reproduce.sh" \
-        "$published_directory/"
+        "$source_directory/report.md" "$published_directory/"
+    cp "$replay_file" "$published_directory/replay_input.csv"
+
+    local accounts rate warmup duration submit_stride burst_rate burst_seconds
+    accounts="$(json_number "$source_directory/manifest.json" accounts)"
+    rate="$(json_number "$source_directory/manifest.json" rate_per_second)"
+    warmup="$(json_number "$source_directory/manifest.json" warmup_seconds)"
+    duration="$(json_number "$source_directory/manifest.json" duration_seconds)"
+    submit_stride="$(json_number "$source_directory/manifest.json" submit_stride)"
+    burst_rate="$(json_number "$source_directory/manifest.json" burst_rate_per_second)"
+    burst_seconds="$(json_number "$source_directory/manifest.json" burst_seconds)"
+    {
+        printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+        printf 'script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"\n'
+        printf 'repository_root="$(git -C "$script_directory" rev-parse --show-toplevel)"\n'
+        printf 'output_directory="${1:-$repository_root/runtime/performance/reproduced-accounts-%s}"\n' "$accounts"
+        printf 'temporary_directory="$(mktemp -d)"\n'
+        printf '\''trap '\''\''rm -rf "$temporary_directory"'\''\'' EXIT\n'
+        printf 'cp "$repository_root/config/accounts.example.ini" "$temporary_directory/accounts.ini"\n'
+        printf 'chmod 600 "$temporary_directory/accounts.ini"\n'
+        printf '"$repository_root/build/ctp_client" benchmark \\\n'
+        printf '  --config "$temporary_directory/accounts.ini" \\\n'
+        printf '  --input "$script_directory/replay_input.csv" \\\n'
+        printf '  --output "$output_directory" \\\n'
+        printf '  --accounts %s --rate %s --warmup-seconds %s \\\n' \
+            "$accounts" "$rate" "$warmup"
+        printf '  --duration-seconds %s --submit-stride %s' \
+            "$duration" "$submit_stride"
+        if [[ "$burst_seconds" -ne 0 ]]; then
+            printf ' --burst-rate %s --burst-seconds %s' \
+                "$burst_rate" "$burst_seconds"
+        fi
+        printf '\n'
+    } > "$published_directory/reproduce.sh"
+    chmod 700 "$published_directory/reproduce.sh"
     (
         cd "$published_directory"
-        sha256sum manifest.json latency_raw.histogram.tsv latency_raw.index.tsv \
-            queue_raw.csv cpu_raw.csv events_summary.json report.md reproduce.sh \
-            > SHA256SUMS
+        sha256sum manifest.json latency_raw.csv latency_raw.histogram.tsv \
+            latency_raw.index.tsv queue_raw.csv cpu_raw.csv events_summary.json \
+            report.md replay_input.csv reproduce.sh > SHA256SUMS
     )
 }
 
@@ -152,7 +187,8 @@ publish_benchmark_root() {
         for source_directory in "$result_root"/*; do
             [[ -d "$source_directory" && -s "$source_directory/manifest.json" ]] || continue
             run_name="$(basename "$source_directory")"
-            publish_one_benchmark "$source_directory" "$published_root/$run_name" >&2
+            publish_one_benchmark "$source_directory" "$published_root/$run_name" \
+                tests/data/replay/minimal_signal_v1.csv >&2
             raw_index="$published_root/$run_name/latency_raw.index.tsv"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$run_name" \
@@ -171,8 +207,8 @@ publish_benchmark_root() {
     cp "$result_root"/environment_*.txt "$published_root/"
     {
         printf '# 短时高样本离线性能证据\n\n'
-        printf '本目录由完整原始 CSV 无损发布；逐运行原始 CSV 留在 `%s`。\n\n' "$result_root"
-        printf '逐纳秒直方图保留 `(account, stage, latency_ns)` 的精确计数，原始文件摘要见各运行的 `latency_raw.index.tsv`。\n\n'
+        printf '每个运行目录都保存完整有序 `latency_raw.csv`；逐纳秒直方图是便于统计重算的派生索引，原始文件摘要见 `latency_raw.index.tsv`。\n\n'
+        printf '`reproduce.sh` 从仓库读取脱敏示例配置、从自身目录读取固定回放输入；可将新的输出目录作为第一个参数传入。\n\n'
         printf '这是共享主机上的离线回放和柜台替身结果，只用于验证测量方法及当前条件下的延迟、吞吐、抖动、CPU、队列和丢弃结果，不代表真实 CTP 网络延迟、生产容量或 SLA；四真实账户 SimNow 验收仍未完成。\n'
     } > "$published_root/README.md"
     (
@@ -192,15 +228,26 @@ run_evidence_test() {
         '2,101,0,market_to_signal,7' \
         '3,102,1,callback_to_state,11' \
         > "$source_directory/latency_raw.csv"
-    for file in manifest.json queue_raw.csv cpu_raw.csv events_summary.json report.md reproduce.sh; do
+    for file in queue_raw.csv cpu_raw.csv events_summary.json report.md reproduce.sh; do
         printf 'fixture\n' > "$source_directory/$file"
     done
+    printf '%s\n' \
+        '{' \
+        '  "accounts": 2,' \
+        '  "rate_per_second": 1000,' \
+        '  "warmup_seconds": 0,' \
+        '  "duration_seconds": 1,' \
+        '  "submit_stride": 1,' \
+        '  "burst_rate_per_second": 0,' \
+        '  "burst_seconds": 0' \
+        '}' > "$source_directory/manifest.json"
     (
         cd "$source_directory"
         sha256sum manifest.json latency_raw.csv queue_raw.csv cpu_raw.csv \
             events_summary.json report.md reproduce.sh > SHA256SUMS
     )
-    publish_one_benchmark "$source_directory" "$published_directory"
+    publish_one_benchmark "$source_directory" "$published_directory" \
+        tests/data/replay/minimal_signal_v1.csv
     local expected="$temporary_directory/expected.tsv"
     printf '%s\n' \
         $'account_index\tstage\tlatency_ns\tcount' \
@@ -208,6 +255,17 @@ run_evidence_test() {
         $'1\tcallback_to_state\t11\t1' > "$expected"
     diff -u "$expected" "$published_directory/latency_raw.histogram.tsv"
     verify_published_against_raw "$published_directory" "$source_directory/latency_raw.csv"
+    cmp "$source_directory/latency_raw.csv" "$published_directory/latency_raw.csv"
+    grep -q '  latency_raw.csv$' "$published_directory/SHA256SUMS"
+    test -s "$published_directory/replay_input.csv"
+    test ! -e "$published_directory/accounts.ini"
+    grep -q 'config/accounts.example.ini' "$published_directory/reproduce.sh"
+    grep -q 'BASH_SOURCE' "$published_directory/reproduce.sh"
+    bash -n "$published_directory/reproduce.sh"
+    if grep -q '/tmp/' "$published_directory/reproduce.sh"; then
+        echo "published reproduce script contains a temporary path" >&2
+        return 1
+    fi
     printf '4,103,1,callback_to_state,13\n' >> "$source_directory/latency_raw.csv"
     if verify_published_against_raw "$published_directory" "$source_directory/latency_raw.csv"; then
         echo "tampered raw CSV unexpectedly passed verification" >&2

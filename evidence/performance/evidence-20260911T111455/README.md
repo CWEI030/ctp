@@ -1,7 +1,9 @@
 # 短时高样本离线性能证据
 
-本目录由完整原始 CSV 无损发布；逐运行原始 CSV 留在 `runtime/performance/evidence-20260911T111455`。
+本目录无损保存三个运行档的完整原始数据、派生统计、环境快照和复现所需输入。
 
-逐纳秒直方图保留 `(account, stage, latency_ns)` 的精确计数，原始文件摘要见各运行的 `latency_raw.index.tsv`。
+每个运行目录都保存完整有序 `latency_raw.csv`，其中保留 `sequence` 和 `mono_ns`；逐纳秒直方图只是便于统计重算的派生索引，原始文件摘要见 `latency_raw.index.tsv`。
+
+`reproduce.sh` 从仓库读取脱敏示例配置、从自身目录读取固定的 `replay_input.csv`，不依赖原采集主机的临时文件；可将新的输出目录作为第一个参数传入。
 
 这是共享主机上的离线回放和柜台替身结果，只用于验证测量方法及当前条件下的延迟、吞吐、抖动、CPU、队列和丢弃结果，不代表真实 CTP 网络延迟、生产容量或 SLA；四真实账户 SimNow 验收仍未完成。
