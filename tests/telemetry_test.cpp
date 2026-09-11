@@ -6,12 +6,26 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
+
+std::size_t csv_sample_count(const std::string& text)
+{
+    std::istringstream input{text};
+    std::set<std::string> samples;
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        const auto comma = line.find(',');
+        if (comma != std::string::npos) samples.insert(line.substr(0, comma));
+    }
+    return samples.size();
+}
 
 ctp::TraceEvent trace_event(
     std::uint64_t sequence,
@@ -324,9 +338,12 @@ void test_offline_benchmark_writes_complete_evidence(
     benchmark.input_path =
         std::string{CTP_SOURCE_DIR} + "/tests/data/replay/minimal_signal_v1.csv";
     benchmark.output_path = output_path.string();
-    benchmark.account_count = 1;
+    benchmark.account_count = 4;
     const std::vector<ctp::AccountConfig> accounts{
-        {"account1", "9999", "user1", "test-password", "app", "auth", "front"}};
+        {"account1", "9999", "user1", "test-password", "app", "auth", "front"},
+        {"account2", "9999", "user2", "test-password", "app", "auth", "front"},
+        {"account3", "9999", "user3", "test-password", "app", "auth", "front"},
+        {"account4", "9999", "user4", "test-password", "app", "auth", "front"}};
     const ctp::RuntimeConfig config{
         ctp::Mode::Benchmark, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0,
         accounts, benchmark};
@@ -362,6 +379,62 @@ void test_offline_benchmark_writes_complete_evidence(
             && event_text.find("\"submitted\": 0") == std::string::npos
             && event_text.find("\"api_order_calls\": 0") == std::string::npos,
         "evidence must identify its replay input and prove entry into submit");
+    std::ifstream queue{output_path / "queue_raw.csv"};
+    const std::string queue_text{
+        std::istreambuf_iterator<char>{queue},
+        std::istreambuf_iterator<char>{}};
+    std::ifstream cpu{output_path / "cpu_raw.csv"};
+    const std::string cpu_text{
+        std::istreambuf_iterator<char>{cpu},
+        std::istreambuf_iterator<char>{}};
+    bool all_queue_roles = true;
+    bool all_thread_roles = true;
+    constexpr std::string_view queue_roles[]{
+        "market_ingress", "trader_request", "trading_callback", "trace", "latency"};
+    constexpr std::string_view thread_roles[]{
+        "account_worker", "trader_callback", "trace_writer", "latency_writer"};
+    for (std::size_t account = 0; account < 4; ++account) {
+        for (const auto role : queue_roles) {
+            all_queue_roles = all_queue_roles
+                && queue_text.find("," + std::to_string(account) + ","
+                                   + std::string{role} + ",")
+                    != std::string::npos;
+        }
+        for (const auto role : thread_roles) {
+            all_thread_roles = all_thread_roles
+                && cpu_text.find(",thread," + std::to_string(account) + ","
+                                 + std::string{role} + ",")
+                    != std::string::npos;
+        }
+    }
+    runner.expect(
+        queue_text.find("capacity,high_watermark,oldest_age_ns,dropped")
+                != std::string::npos
+            && all_queue_roles
+            && csv_sample_count(queue_text) >= 2,
+        "queue evidence must time-sample every queue in the account runtime path");
+    runner.expect(
+        cpu_text.find("scope,account_index,role,tid,user_cpu_ns,system_cpu_ns,voluntary_context_switches,nonvoluntary_context_switches")
+                != std::string::npos
+            && cpu_text.find(",process,-1,process,") != std::string::npos
+            && cpu_text.find(",thread,-1,producer,") != std::string::npos
+            && cpu_text.find(",thread,-1,sampler,") != std::string::npos
+            && all_thread_roles
+            && csv_sample_count(cpu_text) >= 2,
+        "CPU evidence must contain per-thread account and callback time series");
+    runner.expect(
+        event_text.find("\"market_events_enqueued\"") != std::string::npos
+            && event_text.find("\"market_events_processed\"") != std::string::npos
+            && event_text.find("\"order_requests\"") != std::string::npos
+            && event_text.find("\"order_acceptances\"") != std::string::npos
+            && event_text.find("\"order_rejections\"") != std::string::npos
+            && event_text.find("\"cancel_requests\"") != std::string::npos
+            && event_text.find("\"cancel_acceptances\"") != std::string::npos
+            && event_text.find("\"trades\"") != std::string::npos
+            && event_text.find("\"traded_volume\"") != std::string::npos
+            && event_text.find("\"freeze_transitions\"") != std::string::npos
+            && event_text.find("\"recovery_completions\"") != std::string::npos,
+        "event evidence must preserve the complete per-account lifecycle");
     runner.expect(
         manifest_text.find("test-password") == std::string::npos,
         "benchmark metadata must not expose account credentials");

@@ -123,6 +123,10 @@ public:
     {
         return queue_.high_watermark();
     }
+    std::int64_t oldest_age_ns(std::int64_t sample_mono_ns) const noexcept
+    {
+        return queue_.oldest_age_ns(sample_mono_ns);
+    }
     std::uint64_t dropped_count() const noexcept
     {
         return critical_dropped_count() + best_effort_dropped_count();
@@ -183,17 +187,23 @@ LatencyStatistics compute_latency_statistics(
 
 struct TraceQueueSnapshot {
     std::size_t depth{0};
+    std::size_t capacity{0};
     std::size_t high_watermark{0};
+    std::int64_t oldest_age_ns{0};
     std::uint64_t dropped{0};
     std::uint64_t critical_dropped{0};
     std::uint64_t best_effort_dropped{0};
+    std::int32_t writer_tid{0};
 };
 
 struct PerformanceRecorderSnapshot {
     std::size_t depth{0};
+    std::size_t capacity{0};
     std::size_t high_watermark{0};
+    std::int64_t oldest_age_ns{0};
     std::uint64_t dropped{0};
     std::int64_t writer_thread_cpu_ns{0};
+    std::int32_t writer_tid{0};
 };
 
 class TraceSink {

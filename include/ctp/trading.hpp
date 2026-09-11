@@ -358,6 +358,26 @@ struct AccountAcceptanceSnapshot {
     bool lifecycle_failed{false};
 };
 
+struct CallbackQueueSnapshot {
+    std::size_t depth{0};
+    std::size_t capacity{0};
+    std::size_t high_watermark{0};
+    std::int64_t oldest_age_ns{0};
+    std::uint64_t dropped{0};
+};
+
+struct TradingEventSnapshot {
+    std::uint64_t order_requests{0};
+    std::uint64_t order_acceptances{0};
+    std::uint64_t order_rejections{0};
+    std::uint64_t cancel_requests{0};
+    std::uint64_t cancel_acceptances{0};
+    std::uint64_t trades{0};
+    std::uint64_t traded_volume{0};
+    std::uint64_t freeze_transitions{0};
+    std::uint64_t recovery_completions{0};
+};
+
 // 一个实例只属于一个账户，并由该账户执行线程串行修改。
 class AccountTradingState {
 public:
@@ -444,6 +464,8 @@ public:
     void mark_fault(AccountFault fault) noexcept;
     AccountExecutionSnapshot execution_snapshot() const noexcept;
     AccountAcceptanceSnapshot acceptance_snapshot() const noexcept;
+    CallbackQueueSnapshot callback_queue_snapshot() const noexcept;
+    TradingEventSnapshot event_snapshot() const noexcept;
     bool request_reconciliation() noexcept;
     std::size_t drain_callbacks() noexcept;
     bool order_snapshot(

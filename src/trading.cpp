@@ -880,6 +880,7 @@ struct AccountTradingSession::Impl {
           state(source.alias(), order_capacity, trade_capacity),
           signals(signal_capacity),
           callbacks(callback_capacity + 1),
+          callback_enqueue_ns(callback_capacity + 1),
           next_client_order_id(first_client_order_id),
           next_order_ref(first_order_ref),
           policy(close_policy),
@@ -901,9 +902,21 @@ struct AccountTradingSession::Impl {
     AccountTradingState state;
     std::vector<SignalRecord> signals;
     std::vector<CallbackEvent> callbacks;
+    std::vector<std::atomic<std::int64_t>> callback_enqueue_ns;
     std::atomic<std::size_t> callback_write{0};
     std::atomic<std::size_t> callback_read{0};
     std::atomic<bool> callback_overflow{false};
+    std::atomic<std::size_t> callback_high_watermark{0};
+    std::atomic<std::uint64_t> callback_dropped{0};
+    std::atomic<std::uint64_t> order_requests{0};
+    std::atomic<std::uint64_t> order_acceptances{0};
+    std::atomic<std::uint64_t> order_rejections{0};
+    std::atomic<std::uint64_t> cancel_requests{0};
+    std::atomic<std::uint64_t> cancel_acceptances{0};
+    std::atomic<std::uint64_t> trades{0};
+    std::atomic<std::uint64_t> traded_volume{0};
+    std::atomic<std::uint64_t> freeze_transitions{0};
+    std::atomic<std::uint64_t> recovery_completions{0};
     std::uint64_t next_client_order_id{1};
     std::uint64_t next_order_ref{1};
     std::uint32_t daily_signals{0};
@@ -1031,6 +1044,7 @@ struct AccountTradingSession::Impl {
     void set_fault(AccountFault reason) noexcept
     {
         // 故障原因保持首次值，但账户每次出现缺口都必须重新冻结。
+        if (!frozen) freeze_transitions.fetch_add(1, std::memory_order_relaxed);
         frozen = true;
         reconciliation = true;
         if (fault != AccountFault::None) return;
@@ -1135,10 +1149,23 @@ struct AccountTradingSession::Impl {
         const auto next = (write + 1) % callbacks.size();
         if (next == callback_read.load(std::memory_order_acquire)) {
             callback_overflow.store(true, std::memory_order_release);
+            callback_dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         callbacks[write] = event;
+        callback_enqueue_ns[write].store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
         callback_write.store(next, std::memory_order_release);
+        const auto read = callback_read.load(std::memory_order_acquire);
+        const auto depth = next >= read
+            ? next - read : callbacks.size() - read + next;
+        auto previous = callback_high_watermark.load(std::memory_order_relaxed);
+        while (previous < depth
+               && !callback_high_watermark.compare_exchange_weak(
+                   previous, depth, std::memory_order_relaxed)) {
+        }
     }
 
     bool pop_callback(CallbackEvent& event) noexcept
@@ -1146,6 +1173,7 @@ struct AccountTradingSession::Impl {
         const auto read = callback_read.load(std::memory_order_relaxed);
         if (read == callback_write.load(std::memory_order_acquire)) return false;
         event = callbacks[read];
+        callback_enqueue_ns[read].store(0, std::memory_order_relaxed);
         callback_read.store(
             (read + 1) % callbacks.size(), std::memory_order_release);
         return true;
@@ -1382,6 +1410,42 @@ RecoverySnapshot AccountTradingSession::recovery_snapshot() const noexcept
     return impl_->recovery;
 }
 
+CallbackQueueSnapshot AccountTradingSession::callback_queue_snapshot() const noexcept
+{
+    const auto read = impl_->callback_read.load(std::memory_order_acquire);
+    const auto write = impl_->callback_write.load(std::memory_order_acquire);
+    const auto depth = write >= read
+        ? write - read : impl_->callbacks.size() - read + write;
+    std::int64_t oldest_age_ns = 0;
+    if (depth != 0) {
+        const auto enqueued = impl_->callback_enqueue_ns[read].load(
+            std::memory_order_acquire);
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (enqueued > 0 && now > enqueued) oldest_age_ns = now - enqueued;
+    }
+    return {
+        depth,
+        impl_->callbacks.size() - 1,
+        impl_->callback_high_watermark.load(std::memory_order_relaxed),
+        oldest_age_ns,
+        impl_->callback_dropped.load(std::memory_order_relaxed)};
+}
+
+TradingEventSnapshot AccountTradingSession::event_snapshot() const noexcept
+{
+    return {
+        impl_->order_requests.load(std::memory_order_relaxed),
+        impl_->order_acceptances.load(std::memory_order_relaxed),
+        impl_->order_rejections.load(std::memory_order_relaxed),
+        impl_->cancel_requests.load(std::memory_order_relaxed),
+        impl_->cancel_acceptances.load(std::memory_order_relaxed),
+        impl_->trades.load(std::memory_order_relaxed),
+        impl_->traded_volume.load(std::memory_order_relaxed),
+        impl_->freeze_transitions.load(std::memory_order_relaxed),
+        impl_->recovery_completions.load(std::memory_order_relaxed)};
+}
+
 void AccountTradingSession::trace_market(const MarketEvent& market) noexcept
 {
     if (impl_->trace_sink == nullptr) return;
@@ -1431,6 +1495,7 @@ SubmitResult AccountTradingSession::submit(
     const OrderIntent& intent,
     const RiskSnapshot& snapshot) noexcept
 {
+    impl_->order_requests.fetch_add(1, std::memory_order_relaxed);
     SignalRecord* free_record = nullptr;
     for (auto& record : impl_->signals) {
         if (record.occupied
@@ -1552,6 +1617,7 @@ SubmitResult AccountTradingSession::submit(
               &request, impl_->next_request_id++);
     free_record->result.api_return_code = api_code;
     if (api_code != 0) {
+        impl_->order_rejections.fetch_add(1, std::memory_order_relaxed);
         impl_->state.apply_local_event(
             free_record->result.client_order_id,
             LocalOrderEvent::SubmitRejected);
@@ -1578,6 +1644,7 @@ SubmitResult AccountTradingSession::submit(
 CancelResult AccountTradingSession::cancel(
     std::uint64_t client_order_id) noexcept
 {
+    impl_->cancel_requests.fetch_add(1, std::memory_order_relaxed);
     auto* record = impl_->find_order(client_order_id);
     if (record == nullptr) {
         return {CancelCode::UnknownOrder, client_order_id};
@@ -2063,6 +2130,8 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 impl_->frozen = false;
                 impl_->recovery.failure = RecoveryFailure::None;
                 impl_->recovery.phase = RecoveryPhase::Ready;
+                impl_->recovery_completions.fetch_add(
+                    1, std::memory_order_relaxed);
                 impl_->trace(TraceStage::RecoveryReady);
             }
             continue;
@@ -2086,6 +2155,10 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
             event.trade.client_order_id = record->result.client_order_id;
             result = impl_->state.apply_trade(event.trade);
             if (result.code == ApplyCode::Applied) {
+                impl_->trades.fetch_add(1, std::memory_order_relaxed);
+                impl_->traded_volume.fetch_add(
+                    static_cast<std::uint64_t>(event.trade.quantity),
+                    std::memory_order_relaxed);
                 if (record->intent.offset == Offset::Open) {
                     impl_->acceptance.entry_filled_quantity +=
                         static_cast<std::uint32_t>(event.trade.quantity);
@@ -2105,6 +2178,18 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
                 {record->result.client_order_id,
                  type,
                  event.cumulative_filled});
+            if (result.code == ApplyCode::Applied) {
+                if (type == OrderReportType::Accepted) {
+                    impl_->order_acceptances.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else if (type == OrderReportType::Rejected) {
+                    impl_->order_rejections.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else if (type == OrderReportType::Canceled) {
+                    impl_->cancel_acceptances.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
             if (result.code == ApplyCode::Applied
                 && (type == OrderReportType::Rejected
                     || (record->intent.offset == Offset::Open

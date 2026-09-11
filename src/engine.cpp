@@ -205,7 +205,11 @@ MarketQueueSnapshot MarketIngress::snapshot(
     const auto& channel = channels_[account_index];
     return {
         channel.queue.depth(),
+        channel.queue.capacity(),
         channel.queue.high_watermark(),
+        channel.queue.oldest_age_ns(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()),
         channel.queue.dropped_count(),
         channel.overflowed.load(std::memory_order_acquire)};
 }
@@ -218,7 +222,12 @@ MarketPublishResult MarketIngress::ingest(
         return {};
     }
 
-    const MarketEvent event = normalize(tick, recv_mono_ns);
+    return publish(normalize(tick, recv_mono_ns));
+}
+
+MarketPublishResult MarketIngress::publish(const MarketEvent& event) noexcept
+{
+    if (!accepting_.load(std::memory_order_acquire)) return {};
     MarketPublishResult result;
     for (std::size_t index = 0; index < account_count_; ++index) {
         auto& channel = channels_[index];

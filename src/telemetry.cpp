@@ -12,6 +12,8 @@
 #include <numeric>
 #include <string_view>
 #include <thread>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <utility>
 
 namespace ctp {
@@ -190,6 +192,9 @@ struct AsyncTraceJournal::Impl {
 
     void run()
     {
+        writer_tid.store(
+            static_cast<std::int32_t>(::syscall(SYS_gettid)),
+            std::memory_order_release);
         TraceEvent event{};
         while (running.load(std::memory_order_acquire) || queue.depth() != 0) {
             if (queue.try_pop(event)) {
@@ -208,6 +213,7 @@ struct AsyncTraceJournal::Impl {
     std::thread writer;
     std::atomic<bool> running{false};
     std::atomic<std::uint64_t> largest_sequence{0};
+    std::atomic<std::int32_t> writer_tid{0};
 };
 
 AsyncTraceJournal::AsyncTraceJournal(
@@ -286,10 +292,14 @@ TraceQueueSnapshot AsyncTraceJournal::snapshot() const noexcept
 {
     return {
         impl_->queue.depth(),
+        kTraceQueueCapacity,
         impl_->queue.high_watermark(),
+        impl_->queue.oldest_age_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()),
         impl_->queue.dropped_count(),
         impl_->queue.critical_dropped_count(),
         impl_->queue.best_effort_dropped_count(),
+        impl_->writer_tid.load(std::memory_order_acquire),
     };
 }
 
@@ -301,6 +311,9 @@ struct AsyncPerformanceRecorder::Impl {
 
     void run()
     {
+        writer_tid.store(
+            static_cast<std::int32_t>(::syscall(SYS_gettid)),
+            std::memory_order_release);
         timespec cpu_start{};
         timespec cpu_finish{};
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start);
@@ -329,6 +342,7 @@ struct AsyncPerformanceRecorder::Impl {
     std::thread writer;
     std::atomic<bool> running{false};
     std::atomic<std::int64_t> writer_thread_cpu_ns{0};
+    std::atomic<std::int32_t> writer_tid{0};
 };
 
 AsyncPerformanceRecorder::AsyncPerformanceRecorder(std::filesystem::path path)
@@ -370,9 +384,13 @@ PerformanceRecorderSnapshot AsyncPerformanceRecorder::snapshot() const noexcept
 {
     return {
         impl_->queue.depth(),
+        kPerformanceQueueCapacity,
         impl_->queue.high_watermark(),
+        impl_->queue.oldest_age_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()),
         impl_->queue.dropped_count(),
         impl_->writer_thread_cpu_ns.load(std::memory_order_acquire),
+        impl_->writer_tid.load(std::memory_order_acquire),
     };
 }
 

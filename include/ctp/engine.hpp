@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <iosfwd>
 #include <memory>
@@ -71,7 +72,9 @@ public:
             return false;
         }
 
-        events_[write % Capacity] = event;
+        const auto slot = write % Capacity;
+        events_[slot] = event;
+        enqueue_mono_ns_[slot].store(now_ns(), std::memory_order_relaxed);
         write_index_.store(write + 1, std::memory_order_release);
         update_high_watermark(write + 1 - read);
         return true;
@@ -85,7 +88,9 @@ public:
             return false;
         }
 
-        event = events_[read % Capacity];
+        const auto slot = read % Capacity;
+        event = events_[slot];
+        enqueue_mono_ns_[slot].store(0, std::memory_order_relaxed);
         read_index_.store(read + 1, std::memory_order_release);
         return true;
     }
@@ -108,12 +113,31 @@ public:
         return dropped_count_.load(std::memory_order_relaxed);
     }
 
+    constexpr std::size_t capacity() const noexcept { return Capacity; }
+
+    std::int64_t oldest_age_ns(std::int64_t sample_mono_ns) const noexcept
+    {
+        const auto read = read_index_.load(std::memory_order_acquire);
+        const auto write = write_index_.load(std::memory_order_acquire);
+        if (read == write) return 0;
+        const auto enqueued = enqueue_mono_ns_[read % Capacity].load(
+            std::memory_order_acquire);
+        return enqueued > 0 && sample_mono_ns > enqueued
+            ? sample_mono_ns - enqueued : 0;
+    }
+
     void record_drop() noexcept
     {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
+    static std::int64_t now_ns() noexcept
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     void update_high_watermark(std::uint64_t depth) noexcept
     {
         std::uint64_t previous =
@@ -128,6 +152,7 @@ private:
     }
 
     std::array<Event, Capacity> events_{};
+    std::array<std::atomic<std::int64_t>, Capacity> enqueue_mono_ns_{};
     alignas(64) std::atomic<std::uint64_t> write_index_{0};
     alignas(64) std::atomic<std::uint64_t> read_index_{0};
     std::atomic<std::uint64_t> high_watermark_{0};
@@ -136,7 +161,9 @@ private:
 
 struct MarketQueueSnapshot {
     std::size_t depth{0};
+    std::size_t capacity{0};
     std::size_t high_watermark{0};
+    std::int64_t oldest_age_ns{0};
     std::uint64_t dropped{0};
     bool overflowed{false};
 };
@@ -167,6 +194,7 @@ public:
     MarketPublishResult ingest(
         const CThostFtdcDepthMarketDataField* tick,
         std::int64_t recv_mono_ns) noexcept;
+    MarketPublishResult publish(const MarketEvent& event) noexcept;
     void OnRtnDepthMarketData(
         CThostFtdcDepthMarketDataField* tick) override;
 
