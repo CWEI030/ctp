@@ -1400,6 +1400,229 @@ void test_close_retry_exhaustion_freezes_without_faking_zero(
         "retry exhaustion must freeze once while preserving the real position");
 }
 
+void test_settlement_confirmation_gates_recovery(test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16,
+        1, 1, {}, nullptr, 1, 1.0, true};
+    session.start();
+    view->spi()->OnFrontConnected();
+    session.drain_callbacks();
+    view->spi()->OnRspAuthenticate(nullptr, nullptr, metrics->authenticate_request_id, true);
+    session.drain_callbacks();
+    CThostFtdcRspUserLoginField login{};
+    ctp::copy_to_field(login.TradingDay, "20260909");
+    view->spi()->OnRspUserLogin(&login, nullptr, metrics->login_request_id, true);
+    session.drain_callbacks();
+    runner.expect(metrics->order_query_calls == 0 && session.execution_snapshot().frozen,
+                  "login without settlement confirmation must not start order recovery");
+}
+
+struct SettlementFixture {
+    ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    std::shared_ptr<test_support::FakeTraderMetrics> metrics =
+        std::make_shared<test_support::FakeTraderMetrics>();
+    std::unique_ptr<test_support::FakeTraderApi> fake =
+        std::make_unique<test_support::FakeTraderApi>(metrics);
+    test_support::FakeTraderApi* api = fake.get();
+    CapturingTraceSink trace;
+    ctp::AccountTradingSession session;
+
+    explicit SettlementFixture(bool enabled = true, std::size_t capacity = 16)
+        : session(account, risk_limits(), std::move(fake), 8, 16, 8, capacity,
+                  1, 1, {}, &trace, 1, 1.0, enabled)
+    {
+        session.start();
+    }
+
+    void login()
+    {
+        api->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        api->spi()->OnRspAuthenticate(nullptr, nullptr, metrics->authenticate_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcRspUserLoginField response{};
+        ctp::copy_to_field(response.TradingDay, "20260909");
+        api->spi()->OnRspUserLogin(&response, nullptr, metrics->login_request_id, true);
+        session.drain_callbacks();
+    }
+
+    CThostFtdcSettlementInfoConfirmField confirmation() const
+    {
+        CThostFtdcSettlementInfoConfirmField response{};
+        ctp::copy_to_field(response.BrokerID, "9999");
+        ctp::copy_to_field(response.InvestorID, "user1");
+        ctp::copy_to_field(response.ConfirmDate, "20260909");
+        return response;
+    }
+
+    void query(CThostFtdcSettlementInfoConfirmField* response = nullptr, bool last = true)
+    {
+        api->spi()->OnRspQrySettlementInfoConfirm(
+            response, nullptr, metrics->settlement_query_request_id, last);
+        session.drain_callbacks();
+    }
+
+    void recover()
+    {
+        api->spi()->OnRspQryOrder(nullptr, nullptr, metrics->order_query_request_id, true);
+        session.drain_callbacks();
+        api->spi()->OnRspQryTrade(nullptr, nullptr, metrics->trade_query_request_id, true);
+        session.drain_callbacks();
+        api->spi()->OnRspQryInvestorPosition(nullptr, nullptr, metrics->position_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcTradingAccountField funds{};
+        api->spi()->OnRspQryTradingAccount(&funds, nullptr, metrics->account_request_id, true);
+        session.drain_callbacks();
+    }
+};
+
+void test_settlement_success_readonly_and_reconnect(test_support::TestRunner& runner)
+{
+    for (int mode = 0; mode < 4; ++mode) {
+        SettlementFixture f{mode != 0};
+        f.login();
+        if (mode == 0) {
+            runner.expect(f.metrics->settlement_query_calls == 0
+                    && f.metrics->settlement_confirmation_calls == 0,
+                "read-only recovery must not query or acknowledge settlement");
+        } else {
+            runner.expect(std::string_view{f.metrics->last_settlement_query.BrokerID} == "9999"
+                    && std::string_view{f.metrics->last_settlement_query.InvestorID} == "user1",
+                "settlement query must use this account identity");
+            auto response = f.confirmation();
+            if (mode == 3) ctp::copy_to_field(response.ConfirmDate, "20260908");
+            {
+                test_support::AllocationProbe probe;
+                f.api->spi()->OnRspQrySettlementInfoConfirm(
+                    mode == 1 ? nullptr : &response, nullptr,
+                    f.metrics->settlement_query_request_id, false);
+                response = {};
+                f.session.drain_callbacks();
+                probe.stop();
+                runner.expect(probe.count() == 0,
+                    "settlement query callback must copy payload without allocation");
+            }
+            response = f.confirmation();
+            runner.expect(f.metrics->order_query_calls == 0
+                    && f.metrics->settlement_confirmation_calls == 0,
+                "partial settlement query must not advance recovery");
+            f.query();
+            if (mode != 2) {
+                runner.expect(f.metrics->settlement_confirmation_calls == 1
+                        && f.metrics->order_query_calls == 0
+                        && f.session.recovery_snapshot().phase == ctp::RecoveryPhase::ConfirmingSettlement,
+                    "empty or old confirmation must wait for acknowledgement");
+                runner.expect(std::string_view{f.metrics->last_settlement_confirmation.BrokerID} == "9999"
+                        && std::string_view{f.metrics->last_settlement_confirmation.InvestorID} == "user1",
+                    "settlement acknowledgement must use this account identity");
+                // 模拟确认自然日不同于交易日；成功响应仍由柜台裁决。
+                ctp::copy_to_field(response.ConfirmDate, "20260910");
+                test_support::AllocationProbe probe;
+                f.api->spi()->OnRspSettlementInfoConfirm(
+                    &response, nullptr, f.metrics->settlement_confirmation_request_id, true);
+                response = {};
+                f.session.drain_callbacks();
+                probe.stop();
+                runner.expect(probe.count() == 0,
+                    "settlement callback copy and account merge must not allocate");
+            } else {
+                runner.expect(f.metrics->settlement_confirmation_calls == 0,
+                    "current-day confirmation must skip duplicate acknowledgement");
+            }
+        }
+        runner.expect(f.metrics->order_query_calls == 1 && f.session.execution_snapshot().frozen,
+            "settlement success must still wait for all four recovery queries");
+        f.recover();
+        runner.expect(f.session.recovery_snapshot().phase == ctp::RecoveryPhase::Ready,
+            "successful settlement and recovery must become Ready");
+        if (mode == 0) continue;
+        f.api->spi()->OnFrontDisconnected(1);
+        f.session.drain_callbacks();
+        f.login();
+        runner.expect(f.metrics->settlement_query_calls == 2
+                && f.metrics->order_query_calls == 1 && f.session.execution_snapshot().frozen,
+            "reconnect must query remote confirmation before restarting recovery");
+        const auto before = f.metrics->settlement_confirmation_calls;
+        f.query();
+        runner.expect(f.metrics->settlement_confirmation_calls == before + 1,
+            "reconnect must not trust confirmation cached on the old connection");
+    }
+}
+
+void test_settlement_failures_are_closed(test_support::TestRunner& runner)
+{
+    for (bool querying : {true, false}) {
+        // 同步失败、异步拒绝、请求错配、账户错配、缺失响应、静默、
+        // 断线后的迟到回调、队列溢出、非末包及经纪商错配。
+        for (int failure = 0; failure < 10; ++failure) {
+            SettlementFixture f{true, failure == 7 ? 1U : 16U};
+            if (failure == 0) {
+                if (querying) f.api->settlement_query_return_code = -1;
+                else f.api->settlement_confirmation_return_code = -1;
+            }
+            f.login();
+            if (!querying) f.query();
+            const int id = querying ? f.metrics->settlement_query_request_id
+                                    : f.metrics->settlement_confirmation_request_id;
+            auto response = f.confirmation();
+            CThostFtdcRspInfoField error{};
+            error.ErrorID = failure == 1 ? 42 : 0;
+            ctp::copy_to_field(error.ErrorMsg, "denied password,user1\n");
+            if (failure == 3) ctp::copy_to_field(response.InvestorID, "wrong");
+            if (failure == 9) ctp::copy_to_field(response.BrokerID, "wrong");
+            if (failure == 6) {
+                f.api->spi()->OnFrontDisconnected(1);
+                f.session.drain_callbacks();
+            }
+            if (failure != 0 && failure != 5) {
+                auto emit = [&] {
+                    if (querying) {
+                        f.api->spi()->OnRspQrySettlementInfoConfirm(
+                            &response, &error, id + (failure == 2 ? 1 : 0),
+                            failure != 4 && failure != 8);
+                    } else {
+                        f.api->spi()->OnRspSettlementInfoConfirm(
+                            failure == 4 ? nullptr : &response, &error,
+                            id + (failure == 2 ? 1 : 0), failure != 8);
+                    }
+                };
+                emit();
+                if (failure == 7) emit();
+                f.session.drain_callbacks();
+            }
+            const auto snapshot = f.session.recovery_snapshot();
+            const bool pending = failure == 5 || (querying && (failure == 4 || failure == 8));
+            runner.expect(f.session.execution_snapshot().frozen
+                    && (failure == 7 || f.metrics->order_query_calls == 0)
+                    && (pending || snapshot.phase == ctp::RecoveryPhase::Frozen),
+                "settlement rejection, stale response, overflow or silence must not permit trading");
+            const auto submitted = f.session.submit(opening_intent(91), healthy_risk_snapshot());
+            runner.expect(submitted.code == ctp::SubmitCode::RiskRejected
+                    && submitted.risk_reason == ctp::RiskRejectReason::AccountFrozen
+                    && f.metrics->order_insert_calls == 0,
+                "unconfirmed accounts must never reach the order API");
+            if (failure == 1) {
+                runner.expect(snapshot.diagnostic.error_id == 42
+                        && snapshot.diagnostic.failed_phase == (querying
+                            ? ctp::RecoveryPhase::QueryingSettlementConfirmation
+                            : ctp::RecoveryPhase::ConfirmingSettlement)
+                        && std::string_view{snapshot.diagnostic.error_message.data()}.find("password")
+                            == std::string_view::npos
+                        && std::string_view{snapshot.diagnostic.error_message.data()}.find("user1")
+                            == std::string_view::npos,
+                    "settlement errors must retain their phase and code but redact credentials");
+            }
+        }
+    }
+}
+
 void complete_empty_recovery(
     ctp::AccountTradingSession& session,
     test_support::FakeTraderApi& api)
@@ -2800,6 +3023,9 @@ void test_each_recovery_query_error_stays_frozen(
 int main()
 {
     test_support::TestRunner runner{"trading"};
+    test_settlement_confirmation_gates_recovery(runner);
+    test_settlement_success_readonly_and_reconnect(runner);
+    test_settlement_failures_are_closed(runner);
     test_local_order_states(runner);
     test_terminal_and_invalid_transitions(runner);
     test_order_capacity_and_duplicates(runner);

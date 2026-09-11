@@ -195,6 +195,8 @@ public:
     void init() override {}
     int request_authenticate(CThostFtdcReqAuthenticateField*, int) override { return 0; }
     int request_user_login(CThostFtdcReqUserLoginField*, int) override { return 0; }
+    int request_settlement_query(CThostFtdcQrySettlementInfoConfirmField*, int) override { return 0; }
+    int request_settlement_confirmation(CThostFtdcSettlementInfoConfirmField*, int) override { return 0; }
     int request_trading_account(CThostFtdcQryTradingAccountField*, int) override { return 0; }
     int request_investor_position(CThostFtdcQryInvestorPositionField*, int) override { return 0; }
     int request_order_insert(CThostFtdcInputOrderField* request, int) override

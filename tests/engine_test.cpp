@@ -235,6 +235,15 @@ std::unique_ptr<test_support::FakeTraderApi> make_recovering_trader(
         self.spi()->OnRspUserLogin(
             &response, nullptr, metrics->login_request_id, true);
     };
+    api->on_settlement_query = [metrics](auto& self) {
+        self.spi()->OnRspQrySettlementInfoConfirm(
+            nullptr, nullptr, metrics->settlement_query_request_id, true);
+    };
+    api->on_settlement_confirmation = [metrics](auto& self) {
+        auto response = metrics->last_settlement_confirmation;
+        self.spi()->OnRspSettlementInfoConfirm(
+            &response, nullptr, metrics->settlement_confirmation_request_id, true);
+    };
     api->on_order_query = [metrics](auto& self) {
         self.spi()->OnRspQryOrder(
             nullptr, nullptr, metrics->order_query_request_id, true);
@@ -302,6 +311,8 @@ enum class AsyncTraderRequestKind : std::uint8_t {
     Connect,
     Authenticate,
     Login,
+    QuerySettlement,
+    ConfirmSettlement,
     QueryOrders,
     QueryTrades,
     QueryPositions,
@@ -369,6 +380,24 @@ public:
             state_->identity_ok.store(false, std::memory_order_relaxed);
         }
         return push({AsyncTraderRequestKind::Login, request_id});
+    }
+
+    int request_settlement_query(
+        CThostFtdcQrySettlementInfoConfirmField* request, int request_id) override
+    {
+        if (std::strcmp(request->InvestorID, state_->expected_user.data()) != 0) {
+            state_->identity_ok.store(false, std::memory_order_relaxed);
+        }
+        return push({AsyncTraderRequestKind::QuerySettlement, request_id});
+    }
+
+    int request_settlement_confirmation(
+        CThostFtdcSettlementInfoConfirmField* request, int request_id) override
+    {
+        if (std::strcmp(request->InvestorID, state_->expected_user.data()) != 0) {
+            state_->identity_ok.store(false, std::memory_order_relaxed);
+        }
+        return push({AsyncTraderRequestKind::ConfirmSettlement, request_id});
     }
 
     int request_trading_account(
@@ -478,6 +507,16 @@ private:
             ctp::copy_to_field(login.MaxOrderRef, "20");
             ctp::copy_to_field(login.TradingDay, "20260911");
             spi.OnRspUserLogin(&login, &ok, request.request_id, true);
+            break;
+        }
+        case AsyncTraderRequestKind::QuerySettlement:
+            spi.OnRspQrySettlementInfoConfirm(nullptr, &ok, request.request_id, true);
+            break;
+        case AsyncTraderRequestKind::ConfirmSettlement: {
+            CThostFtdcSettlementInfoConfirmField response{};
+            ctp::copy_to_field(response.BrokerID, "9999");
+            ctp::copy_to_field(response.InvestorID, state_->expected_user.data());
+            spi.OnRspSettlementInfoConfirm(&response, &ok, request.request_id, true);
             break;
         }
         case AsyncTraderRequestKind::QueryOrders:
@@ -974,7 +1013,7 @@ void test_four_account_fault_matrix(test_support::TestRunner& runner)
 }
 
 void test_live_runner_isolates_one_failed_account(
-    test_support::TestRunner& runner)
+    test_support::TestRunner& runner, int failure_stage = 0)
 {
     auto config = make_live_config(4);
     auto market = std::make_shared<FakeLiveMarketState>();
@@ -990,9 +1029,26 @@ void test_live_runner_isolates_one_failed_account(
         return std::make_unique<FakeLiveMarketApi>(market);
     };
     std::size_t next_account = 0;
-    dependencies.create_trader = [&traders, &next_account](const std::string&) {
+    dependencies.create_trader = [&traders, &next_account, failure_stage](const std::string&) {
         const auto index = next_account++;
-        return make_recovering_trader(traders[index], index == 0);
+        auto api = make_recovering_trader(traders[index], index == 0 && failure_stage == 0);
+        if (index == 0 && failure_stage != 0) {
+            auto reject = [metrics = traders[index], failure_stage](auto& self) {
+                CThostFtdcRspInfoField info{};
+                info.ErrorID = 42;
+                ctp::copy_to_field(info.ErrorMsg, "denied,\npassword1");
+                if (failure_stage == 1) {
+                    self.spi()->OnRspQrySettlementInfoConfirm(
+                        nullptr, &info, metrics->settlement_query_request_id, true);
+                } else {
+                    self.spi()->OnRspSettlementInfoConfirm(
+                        nullptr, &info, metrics->settlement_confirmation_request_id, true);
+                }
+            };
+            if (failure_stage == 1) api->on_settlement_query = reject;
+            else api->on_settlement_confirmation = reject;
+        }
+        return api;
     };
 
     std::atomic<bool> stop{false};
@@ -1032,10 +1088,12 @@ void test_live_runner_isolates_one_failed_account(
     runner.expect(exit_code == 0, "one account failure must not stop the engine");
     runner.expect(
         traders[0]->order_insert_calls == 0,
-        "the authentication-failed account must never submit an order");
+        "the recovery-failed account must never submit an order");
     for (std::size_t index = 1; index < traders.size(); ++index) {
         runner.expect(
-            traders[index]->account_calls == 1
+            traders[index]->settlement_query_calls == 1
+                && traders[index]->settlement_confirmation_calls == 1
+                && traders[index]->account_calls == 1
                 && traders[index]->order_insert_calls == 1,
             "each healthy account must recover and submit independently");
         runner.expect(
@@ -1047,8 +1105,13 @@ void test_live_runner_isolates_one_failed_account(
         output.str().find("ready=3, failed=1, submitted=3")
             != std::string::npos,
         "the final summary must preserve per-account outcomes");
+    const std::string failed_diagnostic = failure_stage == 0
+        ? "failed_phase=Authenticating, ErrorID=7"
+        : failure_stage == 1 ? "failed_phase=QueryingSettlementConfirmation, ErrorID=42"
+                             : "failed_phase=ConfirmingSettlement, ErrorID=42";
     runner.expect(
-        output.str().find("phase=Frozen, failure=ResponseError, failed_phase=Authenticating, ErrorID=7, ErrorMsg=denied  *********")
+        output.str().find("phase=Frozen, failure=ResponseError, " + failed_diagnostic
+                          + ", ErrorMsg=denied  *********")
             != std::string::npos
             && output.str().find("phase=Ready, failure=None, failed_phase=Idle, ErrorID=0")
                 != std::string::npos
@@ -1057,6 +1120,53 @@ void test_live_runner_isolates_one_failed_account(
     runner.expect(
         market->release_calls.load(std::memory_order_relaxed) == 1,
         "the shared market API must be released exactly once");
+}
+
+void test_live_readonly_does_not_confirm_settlement(test_support::TestRunner& runner)
+{
+    const auto normal = make_live_config(2);
+    auto live = normal.live();
+    live.allow_orders = false;
+    ctp::RuntimeConfig config{
+        ctp::Mode::Engine, "simnow", "", "", "", "", "", "", "", "", 0,
+        normal.accounts(), {}, std::move(live)};
+    auto market = std::make_shared<FakeLiveMarketState>();
+    std::array<std::shared_ptr<test_support::FakeTraderMetrics>, 2> traders{
+        std::make_shared<test_support::FakeTraderMetrics>(),
+        std::make_shared<test_support::FakeTraderMetrics>()};
+    std::atomic<int> funds_responses{0};
+    std::size_t next_account = 0;
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root.clear();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    dependencies.create_trader = [&](const std::string&) {
+        const auto metrics = traders[next_account++];
+        auto api = make_recovering_trader(metrics, false);
+        api->on_account = [metrics, &funds_responses](auto& self) {
+            CThostFtdcTradingAccountField funds{};
+            self.spi()->OnRspQryTradingAccount(
+                &funds, nullptr, metrics->account_request_id, true);
+            funds_responses.fetch_add(1, std::memory_order_release);
+        };
+        return api;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto result = ctp::run_live_engine(config, output, error, [&] {
+        return funds_responses.load(std::memory_order_acquire) == 2
+            || std::chrono::steady_clock::now() >= deadline;
+    }, std::move(dependencies));
+    runner.expect(result == 0 && funds_responses.load() == 2,
+        "read-only workers must finish recovery without settlement acknowledgement");
+    for (const auto& metrics : traders) {
+        runner.expect(metrics->settlement_query_calls == 0
+                && metrics->settlement_confirmation_calls == 0
+                && metrics->order_insert_calls == 0 && metrics->account_calls == 1,
+            "read-only live configuration must preserve zero settlement and order side effects");
+    }
 }
 
 int run_until_three_healthy_accounts_submit(
@@ -2382,6 +2492,9 @@ int main()
     test_price_normalization_boundaries(runner);
     test_four_account_fault_matrix(runner);
     test_live_runner_isolates_one_failed_account(runner);
+    test_live_runner_isolates_one_failed_account(runner, 1);
+    test_live_runner_isolates_one_failed_account(runner, 2);
+    test_live_readonly_does_not_confirm_settlement(runner);
     test_live_runner_isolates_trader_creation_failure(runner);
     test_live_runner_stops_when_all_trader_creations_fail(runner);
     test_live_runner_isolates_trace_journal_start_failure(runner);

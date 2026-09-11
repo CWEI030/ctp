@@ -492,9 +492,9 @@ TraceJournalReadResult read_trace_journal(const std::filesystem::path& path)
                     || !parse_integer(fields[20], event.daily_cancels)))
             || (version_three
                 && (!parse_integer(fields[21], recovery_phase)
-                    || recovery_phase > static_cast<unsigned>(RecoveryPhase::Frozen)
+                    || recovery_phase > static_cast<unsigned>(RecoveryPhase::ConfirmingSettlement)
                     || !parse_integer(fields[22], failed_phase)
-                    || failed_phase > static_cast<unsigned>(RecoveryPhase::Frozen)
+                    || failed_phase > static_cast<unsigned>(RecoveryPhase::ConfirmingSettlement)
                     || !parse_integer(fields[23], event.diagnostic.error_id)
                     || fields[24].size() >= event.diagnostic.error_message.size()
                     || std::any_of(fields[24].begin(), fields[24].end(), [](unsigned char value) {

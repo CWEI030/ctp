@@ -234,8 +234,20 @@ void test_v3_diagnostics_round_trip_and_reject_malformed_fields(
     runner.expect(suffix != std::string::npos, "fixture must contain the diagnostic columns");
     if (suffix != std::string::npos) {
         const auto prefix = row.substr(0, suffix);
+        for (const auto& phases : {std::string{",12,13,-7,denied"},
+                                   std::string{",13,12,-7,denied"}}) {
+            {
+                std::ofstream output{path};
+                output << header << '\n' << prefix << phases << '\n';
+            }
+            const auto settlement = ctp::read_trace_journal(path);
+            runner.expect(settlement.valid && settlement.events.size() == 1
+                    && static_cast<unsigned>(settlement.events[0].recovery_phase) >= 12
+                    && static_cast<unsigned>(settlement.events[0].diagnostic.failed_phase) >= 12,
+                "new settlement phases must decode without changing legacy phase numbers");
+        }
         for (const auto& invalid : std::vector<std::string>{
-                 ",12,8,-7,denied", ",11,12,-7,denied", ",11,8,2147483648,denied",
+                 ",14,8,-7,denied", ",11,14,-7,denied", ",11,8,2147483648,denied",
                  ",11,8,-7," + std::string(81, 'x'), ",11,8,-7,tab\there",
                  ",11,8,-7,quote\"here", ",11,8,-7,comma,here", ",11,8,-7"}) {
             {

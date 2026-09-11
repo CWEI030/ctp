@@ -499,7 +499,8 @@ public:
             make_close_policy(config.live()),
             journal_.get(),
             run_id,
-            config.live().minimum_price_increment);
+            config.live().minimum_price_increment,
+            config.live().allow_orders);
         if (restart_image.valid
             && !session_->restore_restart_image(restart_image)) {
             session_.reset();

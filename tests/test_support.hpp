@@ -88,6 +88,12 @@ struct FakeTraderMetrics {
     std::vector<std::string> calls;
     int authenticate_calls{0};
     int login_calls{0};
+    int settlement_query_calls{0};
+    int settlement_confirmation_calls{0};
+    int settlement_query_request_id{0};
+    int settlement_confirmation_request_id{0};
+    CThostFtdcQrySettlementInfoConfirmField last_settlement_query{};
+    CThostFtdcSettlementInfoConfirmField last_settlement_confirmation{};
     int account_calls{0};
     int position_calls{0};
     std::atomic<int> order_insert_calls{0};
@@ -228,6 +234,26 @@ public:
         return order_action_return_code;
     }
 
+    int request_settlement_query(
+        CThostFtdcQrySettlementInfoConfirmField* request, int request_id) override
+    {
+        ++metrics_->settlement_query_calls;
+        metrics_->settlement_query_request_id = request_id;
+        metrics_->last_settlement_query = *request;
+        if (on_settlement_query) on_settlement_query(*this);
+        return settlement_query_return_code;
+    }
+
+    int request_settlement_confirmation(
+        CThostFtdcSettlementInfoConfirmField* request, int request_id) override
+    {
+        ++metrics_->settlement_confirmation_calls;
+        metrics_->settlement_confirmation_request_id = request_id;
+        metrics_->last_settlement_confirmation = *request;
+        if (on_settlement_confirmation) on_settlement_confirmation(*this);
+        return settlement_confirmation_return_code;
+    }
+
     int request_order_query(CThostFtdcQryOrderField*, int request_id) override
     {
         ++metrics_->order_query_calls;
@@ -258,6 +284,10 @@ public:
     std::function<void(FakeTraderApi&)> on_init;
     std::function<void(FakeTraderApi&)> on_authenticate;
     std::function<void(FakeTraderApi&)> on_login;
+    std::function<void(FakeTraderApi&)> on_settlement_query;
+    std::function<void(FakeTraderApi&)> on_settlement_confirmation;
+    int settlement_query_return_code{0};
+    int settlement_confirmation_return_code{0};
     std::function<void(FakeTraderApi&)> on_account;
     std::function<void(FakeTraderApi&)> on_position;
     std::function<void(FakeTraderApi&)> on_order_insert;

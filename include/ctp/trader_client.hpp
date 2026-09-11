@@ -72,6 +72,10 @@ public:
         CThostFtdcReqAuthenticateField* request, int request_id) = 0;
     virtual int request_user_login(
         CThostFtdcReqUserLoginField* request, int request_id) = 0;
+    virtual int request_settlement_query(
+        CThostFtdcQrySettlementInfoConfirmField* request, int request_id) = 0;
+    virtual int request_settlement_confirmation(
+        CThostFtdcSettlementInfoConfirmField* request, int request_id) = 0;
     virtual int request_trading_account(
         CThostFtdcQryTradingAccountField* request, int request_id) = 0;
     virtual int request_investor_position(

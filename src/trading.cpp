@@ -773,6 +773,8 @@ enum class CallbackType : std::uint8_t {
     QueryTrade,
     QueryPosition,
     QueryFunds,
+    QuerySettlement,
+    ConfirmSettlement,
 };
 
 struct CallbackEvent {
@@ -782,6 +784,7 @@ struct CallbackEvent {
     std::int32_t cumulative_filled{0};
     TradeReport trade{};
     CThostFtdcRspUserLoginField login{};
+    CThostFtdcSettlementInfoConfirmField settlement{};
     CThostFtdcOrderField queried_order{};
     CThostFtdcTradeField queried_trade{};
     CThostFtdcInvestorPositionField queried_position{};
@@ -912,7 +915,8 @@ struct AccountTradingSession::Impl {
         AutoClosePolicy close_policy,
         TraceSink* trace_output,
         std::uint64_t trace_run_id,
-        double price_increment)
+        double price_increment,
+        bool require_settlement)
         : account_id(source.alias()),
           broker_id(source.broker_id()),
           user_id(source.user_id()),
@@ -931,7 +935,8 @@ struct AccountTradingSession::Impl {
           policy(close_policy),
           trace_sink(trace_output),
           run_id(trace_run_id),
-          minimum_price_increment(price_increment)
+          minimum_price_increment(price_increment),
+          confirm_settlement(require_settlement)
     {
     }
 
@@ -993,6 +998,8 @@ struct AccountTradingSession::Impl {
     std::uint64_t run_id{1};
     std::uint64_t trace_sequence{0};
     double minimum_price_increment{1.0};
+    bool confirm_settlement{false};
+    bool settlement_confirmed{false};
 
     void trace(
         TraceStage stage,
@@ -1180,6 +1187,28 @@ struct AccountTradingSession::Impl {
         set_recovery_phase(RecoveryPhase::LoggingIn);
         expected_recovery_request_id = next_request_id++;
         return api->request_user_login(&request, expected_recovery_request_id);
+    }
+
+    int request_settlement_query() noexcept
+    {
+        // 每次登录重新向柜台核对，不复用本地镜像或上一连接的确认状态。
+        settlement_confirmed = false;
+        CThostFtdcQrySettlementInfoConfirmField request{};
+        copy_to_field(request.BrokerID, broker_id);
+        copy_to_field(request.InvestorID, user_id);
+        set_recovery_phase(RecoveryPhase::QueryingSettlementConfirmation);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_settlement_query(&request, expected_recovery_request_id);
+    }
+
+    int request_settlement_confirmation() noexcept
+    {
+        CThostFtdcSettlementInfoConfirmField request{};
+        copy_to_field(request.BrokerID, broker_id);
+        copy_to_field(request.InvestorID, user_id);
+        set_recovery_phase(RecoveryPhase::ConfirmingSettlement);
+        expected_recovery_request_id = next_request_id++;
+        return api->request_settlement_confirmation(&request, expected_recovery_request_id);
     }
 
     int request_orders() noexcept
@@ -1399,7 +1428,8 @@ AccountTradingSession::AccountTradingSession(
     AutoClosePolicy auto_close_policy,
     TraceSink* trace_sink,
     std::uint64_t run_id,
-    double minimum_price_increment)
+    double minimum_price_increment,
+    bool confirm_settlement)
     : impl_(std::make_unique<Impl>(
           account,
           std::move(limits),
@@ -1413,7 +1443,8 @@ AccountTradingSession::AccountTradingSession(
           auto_close_policy,
           trace_sink,
           run_id,
-          minimum_price_increment))
+          minimum_price_increment,
+          confirm_settlement))
 {
     if (impl_->api) impl_->api->register_spi(this);
     if (!std::isfinite(impl_->minimum_price_increment)
@@ -2062,7 +2093,7 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
     while (applied_count < maximum && impl_->pop_callback(event)) {
         ++applied_count;
         if (event.type >= CallbackType::Authenticated
-            && event.type <= CallbackType::QueryFunds) {
+            && event.type <= CallbackType::ConfirmSettlement) {
             impl_->record_recovery_response(event);
         }
         if (event.type == CallbackType::Disconnected) {
@@ -2111,9 +2142,50 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                     event.login.MaxOrderRef,
                     event.login.TradingDay)) {
                     impl_->recovery_failure(RecoveryFailure::ResponseError);
-                } else if (impl_->begin_query_reconciliation() != 0) {
+                } else if ((impl_->confirm_settlement
+                            ? impl_->request_settlement_query()
+                            : impl_->begin_query_reconciliation()) != 0) {
                     impl_->recovery_failure(RecoveryFailure::RequestRejected);
                 }
+            }
+            continue;
+        }
+        if (event.type == CallbackType::QuerySettlement
+            || event.type == CallbackType::ConfirmSettlement) {
+            const bool querying = event.type == CallbackType::QuerySettlement;
+            const auto expected_phase = querying
+                ? RecoveryPhase::QueryingSettlementConfirmation
+                : RecoveryPhase::ConfirmingSettlement;
+            if (impl_->recovery.phase != expected_phase
+                || event.request_id != impl_->expected_recovery_request_id) {
+                impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+                continue;
+            }
+            if (event.error_id != 0
+                || (!querying && (!event.has_payload || !event.is_last))) {
+                impl_->recovery_failure(RecoveryFailure::ResponseError);
+                continue;
+            }
+            if (event.has_payload) {
+                if (ctp_field_view(event.settlement.BrokerID) != impl_->broker_id
+                    || ctp_field_view(event.settlement.InvestorID) != impl_->user_id) {
+                    impl_->recovery_failure(RecoveryFailure::UnexpectedResponse);
+                    continue;
+                }
+                if (querying) {
+                    impl_->settlement_confirmed = impl_->settlement_confirmed
+                        || ctp_field_view(event.settlement.ConfirmDate)
+                            == field_view(impl_->trading_day);
+                }
+            }
+            if (!event.is_last) continue;
+            // 查询空结果或旧日期需要确认；确认成功以柜台响应为准，
+            // 不将模拟环境的自然日与交易日差异误判为拒绝。
+            const int result = querying && !impl_->settlement_confirmed
+                ? impl_->request_settlement_confirmation()
+                : impl_->begin_query_reconciliation();
+            if (result != 0) {
+                impl_->recovery_failure(RecoveryFailure::RequestRejected);
             }
             continue;
         }
@@ -2479,6 +2551,8 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
             overflow_phase == RecoveryPhase::Connecting
             || overflow_phase == RecoveryPhase::Authenticating
             || overflow_phase == RecoveryPhase::LoggingIn
+            || overflow_phase == RecoveryPhase::QueryingSettlementConfirmation
+            || overflow_phase == RecoveryPhase::ConfirmingSettlement
             || overflow_phase == RecoveryPhase::QueryingOrders
             || overflow_phase == RecoveryPhase::QueryingTrades
             || overflow_phase == RecoveryPhase::QueryingPositions
@@ -2607,6 +2681,42 @@ void AccountTradingSession::OnRspUserLogin(
     event.is_last = is_last;
     event.has_payload = response != nullptr;
     if (response != nullptr) event.login = *response;
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnRspQrySettlementInfoConfirm(
+    CThostFtdcSettlementInfoConfirmField* response,
+    CThostFtdcRspInfoField* info, int request_id, bool is_last)
+{
+    CallbackEvent event{};
+    event.type = CallbackType::QuerySettlement;
+    event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+                  event.error_message.begin());
+    }
+    event.request_id = request_id;
+    event.is_last = is_last;
+    event.has_payload = response != nullptr;
+    if (response != nullptr) event.settlement = *response;
+    impl_->push_callback(event);
+}
+
+void AccountTradingSession::OnRspSettlementInfoConfirm(
+    CThostFtdcSettlementInfoConfirmField* response,
+    CThostFtdcRspInfoField* info, int request_id, bool is_last)
+{
+    CallbackEvent event{};
+    event.type = CallbackType::ConfirmSettlement;
+    event.error_id = info == nullptr ? 0 : info->ErrorID;
+    if (info != nullptr) {
+        std::copy(std::begin(info->ErrorMsg), std::end(info->ErrorMsg),
+                  event.error_message.begin());
+    }
+    event.request_id = request_id;
+    event.is_last = is_last;
+    event.has_payload = response != nullptr;
+    if (response != nullptr) event.settlement = *response;
     impl_->push_callback(event);
 }
 

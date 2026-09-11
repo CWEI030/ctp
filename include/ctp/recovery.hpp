@@ -19,6 +19,9 @@ enum class RecoveryPhase : std::uint8_t {
     Reconciling,
     Ready,
     Frozen,
+    // 只追加编号，保持既有持久化轨迹的阶段含义。
+    QueryingSettlementConfirmation,
+    ConfirmingSettlement,
 };
 
 enum class RecoveryFailure : std::uint8_t {
@@ -57,6 +60,8 @@ inline std::string_view recovery_phase_name(RecoveryPhase value) noexcept
     case RecoveryPhase::Reconciling: return "Reconciling";
     case RecoveryPhase::Ready: return "Ready";
     case RecoveryPhase::Frozen: return "Frozen";
+    case RecoveryPhase::QueryingSettlementConfirmation: return "QueryingSettlementConfirmation";
+    case RecoveryPhase::ConfirmingSettlement: return "ConfirmingSettlement";
     }
     return "Invalid";
 }

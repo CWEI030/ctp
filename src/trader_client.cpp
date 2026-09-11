@@ -69,6 +69,18 @@ public:
         return api_->ReqUserLogin(request, request_id);
     }
 
+    int request_settlement_query(
+        CThostFtdcQrySettlementInfoConfirmField* request, int request_id) override
+    {
+        return api_->ReqQrySettlementInfoConfirm(request, request_id);
+    }
+
+    int request_settlement_confirmation(
+        CThostFtdcSettlementInfoConfirmField* request, int request_id) override
+    {
+        return api_->ReqSettlementInfoConfirm(request, request_id);
+    }
+
     int request_trading_account(
         CThostFtdcQryTradingAccountField* request, int request_id) override
     {

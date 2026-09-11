@@ -406,7 +406,9 @@ public:
         AutoClosePolicy auto_close_policy = {},
         TraceSink* trace_sink = nullptr,
         std::uint64_t run_id = 1,
-        double minimum_price_increment = 1.0);
+        double minimum_price_increment = 1.0,
+        // 只读查询不确认结算；live worker 按 allow_orders 显式启用。
+        bool confirm_settlement = false);
     ~AccountTradingSession();
 
     AccountTradingSession(const AccountTradingSession&) = delete;
@@ -463,6 +465,12 @@ public:
         CThostFtdcRspInfoField* info,
         int request_id,
         bool is_last) override;
+    void OnRspQrySettlementInfoConfirm(
+        CThostFtdcSettlementInfoConfirmField* response,
+        CThostFtdcRspInfoField* info, int request_id, bool is_last) override;
+    void OnRspSettlementInfoConfirm(
+        CThostFtdcSettlementInfoConfirmField* response,
+        CThostFtdcRspInfoField* info, int request_id, bool is_last) override;
     void OnRspQryOrder(
         CThostFtdcOrderField* order,
         CThostFtdcRspInfoField* info,

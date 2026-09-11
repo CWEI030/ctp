@@ -146,6 +146,8 @@ src/trading.cpp|void set_recovery_phase(
 src/trading.cpp|void recovery_failure(
 src/trading.cpp|AccountTradingSession::OnRspAuthenticate(
 src/trading.cpp|AccountTradingSession::OnRspUserLogin(
+src/trading.cpp|AccountTradingSession::OnRspQrySettlementInfoConfirm(
+src/trading.cpp|AccountTradingSession::OnRspSettlementInfoConfirm(
 src/trading.cpp|AccountTradingSession::OnRspQryOrder(
 src/trading.cpp|AccountTradingSession::OnRspQryTrade(
 src/trading.cpp|AccountTradingSession::OnRspQryInvestorPosition(
