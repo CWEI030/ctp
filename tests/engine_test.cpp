@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -55,7 +56,6 @@ CThostFtdcDepthMarketDataField make_tick(int millisec = 7)
 }
 
 struct FakeLiveMarketState {
-    std::atomic<CThostFtdcMdSpi*> spi{nullptr};
     std::atomic<bool> subscribed{false};
     std::atomic<int> release_calls{0};
     int login_error{0};
@@ -63,6 +63,30 @@ struct FakeLiveMarketState {
     std::string broker_id;
     std::string user_id;
     std::string password;
+
+    void register_spi(CThostFtdcMdSpi* value)
+    {
+        std::lock_guard<std::mutex> lock{spi_mutex};
+        spi = value;
+    }
+
+    CThostFtdcMdSpi* snapshot_spi() const
+    {
+        std::lock_guard<std::mutex> lock{spi_mutex};
+        return spi;
+    }
+
+    bool publish(CThostFtdcDepthMarketDataField& tick)
+    {
+        std::lock_guard<std::mutex> lock{spi_mutex};
+        if (spi == nullptr) return false;
+        spi->OnRtnDepthMarketData(&tick);
+        return true;
+    }
+
+private:
+    mutable std::mutex spi_mutex;
+    CThostFtdcMdSpi* spi{nullptr};
 };
 
 class FakeLiveMarketApi final : public ctp::MarketApi {
@@ -74,14 +98,14 @@ public:
 
     void register_spi(CThostFtdcMdSpi* spi) override
     {
-        state_->spi.store(spi, std::memory_order_release);
+        state_->register_spi(spi);
     }
 
     void register_front(const std::string&) override {}
 
     void init() override
     {
-        state_->spi.load(std::memory_order_acquire)->OnFrontConnected();
+        if (auto* spi = state_->snapshot_spi()) spi->OnFrontConnected();
     }
 
     int request_user_login(
@@ -93,8 +117,9 @@ public:
         state_->password = request->Password;
         CThostFtdcRspInfoField info{};
         info.ErrorID = state_->login_error;
-        state_->spi.load(std::memory_order_acquire)->OnRspUserLogin(
-            nullptr, &info, request_id, true);
+        if (auto* spi = state_->snapshot_spi()) {
+            spi->OnRspUserLogin(nullptr, &info, request_id, true);
+        }
         return 0;
     }
 
@@ -107,8 +132,9 @@ public:
         if (info.ErrorID == 0) {
             state_->subscribed.store(true, std::memory_order_release);
         }
-        state_->spi.load(std::memory_order_acquire)->OnRspSubMarketData(
-            &response, &info, 1, true);
+        if (auto* spi = state_->snapshot_spi()) {
+            spi->OnRspSubMarketData(&response, &info, 1, true);
+        }
         return 0;
     }
 
@@ -537,14 +563,12 @@ int run_acceptance_with_fills(
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            market->publish(below);
             auto crossing = make_tick(sequence++ % 1000);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            market->publish(crossing);
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
     });
@@ -979,15 +1003,13 @@ void test_live_runner_isolates_one_failed_account(
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            market->publish(below);
 
             auto crossing = make_tick(pair * 2 + 1);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            market->publish(crossing);
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
@@ -1043,14 +1065,12 @@ int run_until_three_healthy_accounts_submit(
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            market->publish(below);
             auto crossing = make_tick(1);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            market->publish(crossing);
             published = true;
         }
         ++polls;
@@ -1214,14 +1234,12 @@ int run_single_account_signal(const ctp::RuntimeConfig& config)
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            market->publish(below);
             auto crossing = make_tick(pair * 2 + 1);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            market->publish(crossing);
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
         stop.store(true, std::memory_order_release);
@@ -1235,7 +1253,8 @@ int run_single_account_signal(const ctp::RuntimeConfig& config)
         [&stop] { return stop.load(std::memory_order_acquire); },
         std::move(dependencies));
     feeder.join();
-    return exit_code == 0 ? trader->order_insert_calls : -1;
+    return exit_code == 0
+        ? trader->order_insert_calls.load(std::memory_order_acquire) : -1;
 }
 
 void test_live_runner_traces_order_rate_rejection(
@@ -1284,14 +1303,12 @@ void test_live_runner_traces_order_rate_rejection(
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            market->publish(below);
             auto crossing = make_tick(sequence * 2 + 1);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            market->publish(crossing);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
         stop.store(true, std::memory_order_release);
@@ -1398,14 +1415,12 @@ void test_live_runner_fails_over_first_market_login(
             below.LastPrice = 799.8;
             below.BidPrice1 = 799.6;
             below.AskPrice1 = 800.0;
-            markets[1]->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            markets[1]->publish(below);
             auto crossing = make_tick(1);
             crossing.LastPrice = 800.0;
             crossing.BidPrice1 = 799.8;
             crossing.AskPrice1 = 800.2;
-            markets[1]->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+            markets[1]->publish(crossing);
             published = true;
         }
         ++polls;
@@ -1548,9 +1563,10 @@ void test_live_runner_reopens_failover_after_running(
         if (first->subscribed.load(std::memory_order_acquire)
             && running_polls++ == 1) {
             first->login_error = 11;
-            auto* spi = first->spi.load(std::memory_order_acquire);
-            spi->OnFrontDisconnected(0x1001);
-            spi->OnFrontConnected();
+            if (auto* spi = first->snapshot_spi()) {
+                spi->OnFrontDisconnected(0x1001);
+                spi->OnFrontConnected();
+            }
         }
         return second->subscribed.load(std::memory_order_acquire);
     };
@@ -1641,14 +1657,12 @@ void test_live_runner_restores_latest_identity_before_market(
         below.LastPrice = 799.8;
         below.BidPrice1 = 799.6;
         below.AskPrice1 = 800.0;
-        market->spi.load(std::memory_order_acquire)
-            ->OnRtnDepthMarketData(&below);
+        market->publish(below);
         auto crossing = make_tick(1);
         crossing.LastPrice = 800.0;
         crossing.BidPrice1 = 799.8;
         crossing.AskPrice1 = 800.2;
-        market->spi.load(std::memory_order_acquire)
-            ->OnRtnDepthMarketData(&crossing);
+        market->publish(crossing);
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
         stop.store(true, std::memory_order_release);
     });
@@ -1988,6 +2002,34 @@ bool contains_signal_stage(
     return false;
 }
 
+enum class HotPathFailureStage : std::uint8_t {
+    None,
+    StartupTimeout,
+    WarmupPublication,
+    EntryPublication,
+    EntryTimeout,
+    ExitPublication,
+    ExitTimeout,
+    CancelPublication,
+    CancelTimeout,
+};
+
+std::string_view hot_path_failure_name(HotPathFailureStage stage)
+{
+    switch (stage) {
+    case HotPathFailureStage::None: return "none";
+    case HotPathFailureStage::StartupTimeout: return "startup timeout";
+    case HotPathFailureStage::WarmupPublication: return "warmup publication";
+    case HotPathFailureStage::EntryPublication: return "entry publication";
+    case HotPathFailureStage::EntryTimeout: return "entry timeout";
+    case HotPathFailureStage::ExitPublication: return "exit publication";
+    case HotPathFailureStage::ExitTimeout: return "exit timeout";
+    case HotPathFailureStage::CancelPublication: return "cancel publication";
+    case HotPathFailureStage::CancelTimeout: return "cancel timeout";
+    }
+    return "unknown";
+}
+
 void test_release_four_account_complete_hot_path(
     test_support::TestRunner& runner)
 {
@@ -2032,17 +2074,34 @@ void test_release_four_account_complete_hot_path(
     std::atomic<bool> stop{false};
     std::atomic<bool> completed{false};
     std::atomic<std::size_t> hot_allocations{0};
-    std::thread feeder([market, &traders, &stop, &completed, &hot_allocations] {
-        const auto startup_deadline = std::chrono::steady_clock::now()
-            + std::chrono::seconds{5};
-        while (std::chrono::steady_clock::now() < startup_deadline) {
+    std::atomic<HotPathFailureStage> failure_stage{
+        HotPathFailureStage::None};
+    std::thread feeder([
+        market, &traders, &stop, &completed, &hot_allocations,
+        &failure_stage] {
+        const auto wait_for = [](auto&& predicate) {
+            const auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::seconds{5};
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (predicate()) return true;
+                std::this_thread::yield();
+            }
+            return predicate();
+        };
+        const auto startup_ready = [&] {
             bool ready = market->subscribed.load(std::memory_order_acquire);
             for (const auto& trader : traders) {
                 ready = ready && trader->recovery_complete.load(
                     std::memory_order_acquire) == 1;
             }
-            if (ready) break;
-            std::this_thread::yield();
+            return ready;
+        };
+        if (!wait_for(startup_ready)) {
+            failure_stage.store(
+                HotPathFailureStage::StartupTimeout,
+                std::memory_order_release);
+            stop.store(true, std::memory_order_release);
+            return;
         }
 
         auto below = make_tick(0);
@@ -2050,22 +2109,33 @@ void test_release_four_account_complete_hot_path(
         below.BidPrice1 = 799.6;
         below.AskPrice1 = 800.0;
         for (int index = 0; index < 32; ++index) {
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&below);
+            if (!market->publish(below)) {
+                failure_stage.store(
+                    HotPathFailureStage::WarmupPublication,
+                    std::memory_order_release);
+                stop.store(true, std::memory_order_release);
+                return;
+            }
             std::this_thread::yield();
         }
 
         test_support::AllocationProbe probe;
+        const auto finish = [&](HotPathFailureStage failure) {
+            probe.stop();
+            hot_allocations.store(probe.count(), std::memory_order_release);
+            failure_stage.store(failure, std::memory_order_release);
+            stop.store(true, std::memory_order_release);
+        };
         auto crossing = make_tick(1);
         crossing.LastPrice = 800.0;
         crossing.BidPrice1 = 799.8;
         crossing.AskPrice1 = 800.2;
-        market->spi.load(std::memory_order_acquire)
-            ->OnRtnDepthMarketData(&crossing);
+        if (!market->publish(crossing)) {
+            finish(HotPathFailureStage::EntryPublication);
+            return;
+        }
 
-        const auto workload_deadline = std::chrono::steady_clock::now()
-            + std::chrono::seconds{5};
-        while (std::chrono::steady_clock::now() < workload_deadline) {
+        const auto entries_arrived = [&] {
             bool entries_arrived = true;
             for (const auto& trader : traders) {
                 entries_arrived = entries_arrived
@@ -2074,27 +2144,38 @@ void test_release_four_account_complete_hot_path(
             entries_arrived = entries_arrived
                 && traders[2]->trades.load(std::memory_order_acquire) >= 1
                 && traders[3]->trades.load(std::memory_order_acquire) >= 1;
-            if (entries_arrived) break;
-            std::this_thread::yield();
+            return entries_arrived;
+        };
+        if (!wait_for(entries_arrived)) {
+            finish(HotPathFailureStage::EntryTimeout);
+            return;
         }
 
         // 先让成交回报驱动平仓，再继续投递行情触发撤单，避免测试负载
         // 把平仓单人为推进到重报价超时。
-        market->spi.load(std::memory_order_acquire)
-            ->OnRtnDepthMarketData(&crossing);
-        while (std::chrono::steady_clock::now() < workload_deadline) {
-            const bool fills_closed =
+        if (!market->publish(crossing)) {
+            finish(HotPathFailureStage::ExitPublication);
+            return;
+        }
+        const auto fills_closed = [&] {
+            return
                 traders[2]->insert_calls.load(std::memory_order_acquire) == 2
                 && traders[3]->insert_calls.load(std::memory_order_acquire) == 2
                 && traders[2]->trades.load(std::memory_order_acquire) == 2
                 && traders[3]->trades.load(std::memory_order_acquire) == 2;
-            if (fills_closed) break;
-            std::this_thread::yield();
+        };
+        if (!wait_for(fills_closed)) {
+            finish(HotPathFailureStage::ExitTimeout);
+            return;
         }
 
-        while (std::chrono::steady_clock::now() < workload_deadline) {
-            market->spi.load(std::memory_order_acquire)
-                ->OnRtnDepthMarketData(&crossing);
+        // 首次报单后的第二笔行情已累计一次等待；再投递两笔即可稳定
+        // 到达 cancel_after_market_ticks=3，避免用无界行情洪泛掩盖调度问题。
+        if (!market->publish(crossing) || !market->publish(crossing)) {
+            finish(HotPathFailureStage::CancelPublication);
+            return;
+        }
+        const auto workload_complete = [&] {
             const bool cancel_complete =
                 traders[0]->cancel_calls.load(std::memory_order_acquire) == 1
                 && traders[1]->cancel_calls.load(std::memory_order_acquire) == 1
@@ -2105,15 +2186,14 @@ void test_release_four_account_complete_hot_path(
                 && traders[3]->insert_calls.load(std::memory_order_acquire) == 2
                 && traders[2]->trades.load(std::memory_order_acquire) == 2
                 && traders[3]->trades.load(std::memory_order_acquire) == 2;
-            if (cancel_complete && fill_complete) {
-                completed.store(true, std::memory_order_release);
-                break;
-            }
-            std::this_thread::yield();
+            return cancel_complete && fill_complete;
+        };
+        if (!wait_for(workload_complete)) {
+            finish(HotPathFailureStage::CancelTimeout);
+            return;
         }
-        probe.stop();
-        hot_allocations.store(probe.count(), std::memory_order_release);
-        stop.store(true, std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+        finish(HotPathFailureStage::None);
     });
 
     std::ostringstream output;
@@ -2126,9 +2206,14 @@ void test_release_four_account_complete_hot_path(
         std::move(dependencies));
     feeder.join();
 
-    runner.expect(
-        exit_code == 0 && completed.load(std::memory_order_acquire),
-        "four production account workers must complete the fixed async workload");
+    const auto observed_failure = failure_stage.load(std::memory_order_acquire);
+    if (exit_code != 0 || !completed.load(std::memory_order_acquire)
+        || observed_failure != HotPathFailureStage::None) {
+        const std::string message =
+            "four-account workload failed at stage: "
+            + std::string{hot_path_failure_name(observed_failure)};
+        runner.expect(false, message);
+    }
     runner.expect(
         hot_allocations.load(std::memory_order_acquire) == 0,
         "the preheated complete application hot path must not allocate");
@@ -2158,42 +2243,52 @@ void test_release_four_account_complete_hot_path(
     }
 
     std::filesystem::path run_directory;
-    for (const auto& entry : std::filesystem::directory_iterator{trace_root}) {
-        if (entry.is_directory()) run_directory = entry.path();
+    if (std::filesystem::exists(trace_root)) {
+        for (const auto& entry :
+             std::filesystem::directory_iterator{trace_root}) {
+            if (entry.is_directory()) run_directory = entry.path();
+        }
     }
     runner.expect(!run_directory.empty(), "the async trace run must be persisted");
-    for (std::size_t index = 0; index < traders.size(); ++index) {
-        const auto journal = ctp::read_trace_journal(
-            run_directory
-            / ("account" + std::to_string(index + 1) + ".csv"));
-        const auto signal_id = first_signal_id(journal);
-        runner.expect(
-            journal.valid && journal.clean_shutdown && signal_id != 0
-                && contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::Market)
-                && contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::Signal)
-                && contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::RiskAccepted)
-                && contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::OrderSubmitted)
-                && contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::OrderReport),
-            "each account must retain one correlated market-to-report trace");
-        runner.expect(
-            index < 2
-                ? contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::CancelRequested)
-                : contains_signal_stage(
-                    journal, signal_id, ctp::TraceStage::Trade)
+    if (!run_directory.empty()) {
+        for (std::size_t index = 0; index < traders.size(); ++index) {
+            const auto journal = ctp::read_trace_journal(
+                run_directory
+                / ("account" + std::to_string(index + 1) + ".csv"));
+            const auto signal_id = first_signal_id(journal);
+            runner.expect(
+                journal.valid && journal.clean_shutdown && signal_id != 0
                     && contains_signal_stage(
-                        journal, signal_id, ctp::TraceStage::ExitIntent),
-            "the correlated trace must retain its cancel or fill/autoclose branch");
-        const auto& clean_stop = journal.events.back();
-        runner.expect(
-            clean_stop.stage == ctp::TraceStage::CleanStop
-                && clean_stop.code == 0 && clean_stop.quantity == 0,
-            "asynchronous trace queues must stop without critical or best-effort loss");
+                        journal, signal_id, ctp::TraceStage::Market)
+                    && contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::Signal)
+                    && contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::RiskAccepted)
+                    && contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::OrderSubmitted)
+                    && contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::OrderReport),
+                "each account must retain one correlated market-to-report trace");
+            runner.expect(
+                index < 2
+                    ? contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::CancelRequested)
+                    : contains_signal_stage(
+                        journal, signal_id, ctp::TraceStage::Trade)
+                        && contains_signal_stage(
+                            journal, signal_id, ctp::TraceStage::ExitIntent),
+                "the correlated trace must retain its cancel or fill/autoclose branch");
+            runner.expect(
+                !journal.events.empty(),
+                "each account trace must contain a clean-stop event");
+            if (!journal.events.empty()) {
+                const auto& clean_stop = journal.events.back();
+                runner.expect(
+                    clean_stop.stage == ctp::TraceStage::CleanStop
+                        && clean_stop.code == 0 && clean_stop.quantity == 0,
+                    "asynchronous trace queues must stop without critical or best-effort loss");
+            }
+        }
     }
     std::filesystem::remove_all(trace_root);
 #endif

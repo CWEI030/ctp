@@ -90,7 +90,7 @@ struct FakeTraderMetrics {
     int login_calls{0};
     int account_calls{0};
     int position_calls{0};
-    int order_insert_calls{0};
+    std::atomic<int> order_insert_calls{0};
     int order_action_calls{0};
     int order_query_calls{0};
     int trade_query_calls{0};
