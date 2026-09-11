@@ -3,17 +3,19 @@
 #include "ctp/field.hpp"
 #include "ctp/strategy.hpp"
 
-#include <array>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <sstream>
 #include <string_view>
@@ -474,33 +476,50 @@ public:
     {
         queue_ << "mono_ns,account_index,queue,depth,capacity,high_watermark,oldest_age_ns,dropped\n";
         cpu_ << "sample_mono_ns,scope,account_index,role,tid,user_cpu_ns,system_cpu_ns,voluntary_context_switches,nonvoluntary_context_switches\n";
+        cpu_rows_.reserve(3 + accounts_.size() * 4);
     }
 
     bool good() const noexcept { return queue_.good() && cpu_.good(); }
 
-    void start()
+    bool start()
     {
         running_.store(true, std::memory_order_release);
         thread_ = std::thread([this] {
             sampler_tid_.store(static_cast<std::int32_t>(::syscall(SYS_gettid)),
                                std::memory_order_release);
             while (running_.load(std::memory_order_acquire)) {
-                sample();
-                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                if (sample()) publish_complete_sample();
+                std::unique_lock lock{sample_mutex_};
+                sample_condition_.wait_for(lock, std::chrono::milliseconds{100},
+                    [this] { return !running_.load(std::memory_order_acquire); });
             }
-            sample();
+            if (sample()) publish_complete_sample();
         });
+
+        // 短基准也必须拥有可比较的时间序列；基准计时从两个完整基线样本之后开始。
+        std::unique_lock lock{sample_mutex_};
+        return sample_condition_.wait_for(lock, std::chrono::seconds{5},
+            [this] { return complete_samples_ >= 2; });
     }
 
     void stop()
     {
         running_.store(false, std::memory_order_release);
+        sample_condition_.notify_all();
         if (thread_.joinable()) thread_.join();
         queue_.flush();
         cpu_.flush();
     }
 
 private:
+    struct CpuSampleRow {
+        std::string_view scope;
+        std::int64_t account;
+        std::string_view role;
+        std::int32_t tid;
+        CpuPoint point;
+    };
+
     void queue_row(std::int64_t now, std::size_t index, std::string_view name,
                    const RuntimeQueueSnapshot& snapshot)
     {
@@ -509,25 +528,53 @@ private:
                << ',' << snapshot.oldest_age_ns << ',' << snapshot.dropped << '\n';
     }
 
-    void cpu_row(std::int64_t now, std::string_view scope, std::int64_t account,
-                 std::string_view role, std::int32_t tid)
+    static bool capture_cpu_row(std::vector<CpuSampleRow>& rows,
+                                std::string_view scope, std::int64_t account,
+                                std::string_view role, std::int32_t tid)
     {
         CpuPoint point{};
-        if (!read_cpu_point(tid, scope == "process", point)) return;
-        cpu_ << now << ',' << scope << ',' << account << ',' << role << ','
-             << tid << ',' << point.user_ns << ',' << point.system_ns << ','
-             << point.voluntary_switches << ','
-             << point.nonvoluntary_switches << '\n';
+        if (!read_cpu_point(tid, scope == "process", point)) return false;
+        rows.push_back({scope, account, role, tid, point});
+        return true;
     }
 
-    void sample()
+    void cpu_row(std::int64_t now, const CpuSampleRow& row)
+    {
+        cpu_ << now << ',' << row.scope << ',' << row.account << ',' << row.role
+             << ',' << row.tid << ',' << row.point.user_ns << ','
+             << row.point.system_ns << ',' << row.point.voluntary_switches << ','
+             << row.point.nonvoluntary_switches << '\n';
+    }
+
+    bool sample()
     {
         const auto now = steady_now_ns();
-        cpu_row(now, "process", -1, "process", static_cast<std::int32_t>(getpid()));
-        cpu_row(now, "thread", -1, "producer",
-                producer_tid_.load(std::memory_order_acquire));
-        cpu_row(now, "thread", -1, "sampler",
-                sampler_tid_.load(std::memory_order_acquire));
+        cpu_rows_.clear();
+        bool complete = capture_cpu_row(cpu_rows_, "process", -1, "process",
+            static_cast<std::int32_t>(getpid()));
+        complete = capture_cpu_row(cpu_rows_, "thread", -1, "producer",
+            producer_tid_.load(std::memory_order_acquire)) && complete;
+        complete = capture_cpu_row(cpu_rows_, "thread", -1, "sampler",
+            sampler_tid_.load(std::memory_order_acquire)) && complete;
+        for (std::size_t index = 0; index < accounts_.size(); ++index) {
+            auto& account = *accounts_[index];
+            const auto trace = account.trace.snapshot();
+            const auto latency = account.recorder.snapshot();
+            complete = capture_cpu_row(cpu_rows_, "thread", index, "account_worker",
+                account.worker_tid.load(std::memory_order_acquire)) && complete;
+            complete = capture_cpu_row(cpu_rows_, "thread", index, "trader_callback",
+                account.api->worker_tid()) && complete;
+            complete = capture_cpu_row(cpu_rows_, "thread", index, "trace_writer",
+                trace.writer_tid) && complete;
+            complete = capture_cpu_row(cpu_rows_, "thread", index, "latency_writer",
+                latency.writer_tid) && complete;
+        }
+        if (!complete) return false;
+
+        std::size_t cpu_index = 0;
+        cpu_row(now, cpu_rows_[cpu_index++]);
+        cpu_row(now, cpu_rows_[cpu_index++]);
+        cpu_row(now, cpu_rows_[cpu_index++]);
         for (std::size_t index = 0; index < accounts_.size(); ++index) {
             auto& account = *accounts_[index];
             const auto market = ingress_.snapshot(index);
@@ -549,13 +596,21 @@ private:
                 {latency.depth, latency.capacity, latency.high_watermark,
                  latency.oldest_age_ns, latency.dropped});
 
-            cpu_row(now, "thread", index, "account_worker",
-                    account.worker_tid.load(std::memory_order_acquire));
-            cpu_row(now, "thread", index, "trader_callback",
-                    account.api->worker_tid());
-            cpu_row(now, "thread", index, "trace_writer", trace.writer_tid);
-            cpu_row(now, "thread", index, "latency_writer", latency.writer_tid);
+            cpu_row(now, cpu_rows_[cpu_index++]);
+            cpu_row(now, cpu_rows_[cpu_index++]);
+            cpu_row(now, cpu_rows_[cpu_index++]);
+            cpu_row(now, cpu_rows_[cpu_index++]);
         }
+        return queue_.good() && cpu_.good();
+    }
+
+    void publish_complete_sample()
+    {
+        {
+            std::lock_guard lock{sample_mutex_};
+            ++complete_samples_;
+        }
+        sample_condition_.notify_all();
     }
 
     MarketIngress& ingress_;
@@ -565,6 +620,10 @@ private:
     std::ofstream cpu_;
     std::atomic<bool> running_{false};
     std::atomic<std::int32_t> sampler_tid_{0};
+    std::mutex sample_mutex_;
+    std::condition_variable sample_condition_;
+    std::size_t complete_samples_{0};
+    std::vector<CpuSampleRow> cpu_rows_;
     std::thread thread_;
 };
 
@@ -757,19 +816,6 @@ int run_benchmark(
             pointer->run(ingress, producer_done, warmup_events);
         });
     }
-    // 确保首个样本包含所有长期线程；该等待只发生在基准控制面启动阶段。
-    for (int attempt = 0; attempt < 10'000; ++attempt) {
-        bool ready = true;
-        for (const auto& account : accounts) {
-            const auto trace = account->trace.snapshot();
-            const auto latency = account->recorder.snapshot();
-            ready = ready && account->worker_tid.load(std::memory_order_acquire) != 0
-                && account->api->worker_tid() != 0
-                && trace.writer_tid != 0 && latency.writer_tid != 0;
-        }
-        if (ready) break;
-        std::this_thread::yield();
-    }
     BenchmarkSampler sampler{ingress, accounts, output_directory, producer_tid};
     if (!sampler.good()) {
         producer_done.store(true, std::memory_order_release);
@@ -777,7 +823,16 @@ int run_benchmark(
         error << "[error] benchmark sampler output cannot be opened\n";
         return 3;
     }
-    sampler.start();
+    if (!sampler.start()) {
+        sampler.stop();
+        producer_done.store(true, std::memory_order_release);
+        for (auto& account : accounts) {
+            if (account->worker.joinable()) account->worker.join();
+        }
+        ingress.stop();
+        error << "[error] benchmark sampler could not collect two complete samples\n";
+        return 3;
+    }
     const auto start_ns = steady_now_ns();
     std::uint64_t delivered_events = 0;
 

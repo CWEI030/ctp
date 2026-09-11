@@ -27,6 +27,24 @@ std::size_t csv_sample_count(const std::string& text)
     return samples.size();
 }
 
+std::size_t csv_sample_count_matching(
+    const std::string& text,
+    const std::string& fields)
+{
+    std::istringstream input{text};
+    std::set<std::string> samples;
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        const auto comma = line.find(',');
+        if (comma != std::string::npos
+            && line.compare(comma, fields.size(), fields) == 0) {
+            samples.insert(line.substr(0, comma));
+        }
+    }
+    return samples.size();
+}
+
 ctp::TraceEvent trace_event(
     std::uint64_t sequence,
     ctp::TraceStage stage = ctp::TraceStage::Signal)
@@ -396,15 +414,15 @@ void test_offline_benchmark_writes_complete_evidence(
     for (std::size_t account = 0; account < 4; ++account) {
         for (const auto role : queue_roles) {
             all_queue_roles = all_queue_roles
-                && queue_text.find("," + std::to_string(account) + ","
-                                   + std::string{role} + ",")
-                    != std::string::npos;
+                && csv_sample_count_matching(
+                    queue_text, "," + std::to_string(account) + ","
+                        + std::string{role} + ",") >= 2;
         }
         for (const auto role : thread_roles) {
             all_thread_roles = all_thread_roles
-                && cpu_text.find(",thread," + std::to_string(account) + ","
-                                 + std::string{role} + ",")
-                    != std::string::npos;
+                && csv_sample_count_matching(
+                    cpu_text, ",thread," + std::to_string(account) + ","
+                        + std::string{role} + ",") >= 2;
         }
     }
     runner.expect(
@@ -416,9 +434,12 @@ void test_offline_benchmark_writes_complete_evidence(
     runner.expect(
         cpu_text.find("scope,account_index,role,tid,user_cpu_ns,system_cpu_ns,voluntary_context_switches,nonvoluntary_context_switches")
                 != std::string::npos
-            && cpu_text.find(",process,-1,process,") != std::string::npos
-            && cpu_text.find(",thread,-1,producer,") != std::string::npos
-            && cpu_text.find(",thread,-1,sampler,") != std::string::npos
+            && csv_sample_count_matching(
+                cpu_text, ",process,-1,process,") >= 2
+            && csv_sample_count_matching(
+                cpu_text, ",thread,-1,producer,") >= 2
+            && csv_sample_count_matching(
+                cpu_text, ",thread,-1,sampler,") >= 2
             && all_thread_roles
             && csv_sample_count(cpu_text) >= 2,
         "CPU evidence must contain per-thread account and callback time series");
