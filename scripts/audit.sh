@@ -139,6 +139,7 @@ src/trading.cpp|AccountTradingSession::submit(
 src/trading.cpp|AccountTradingSession::cancel(
 src/trading.cpp|AccountTradingSession::on_market(
 src/trading.cpp|AccountTradingSession::drain_callbacks(
+src/trading.cpp|bool ctp_order_report_type(
 src/trading.cpp|void push_callback(const CallbackEvent& event) noexcept
 src/trading.cpp|void trace(
 src/trading.cpp|void record_recovery_response(

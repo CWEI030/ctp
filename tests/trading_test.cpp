@@ -1168,6 +1168,100 @@ void test_session_hot_path_does_not_allocate(
         "submit, callback enqueue/drain, cancel, and snapshot must not allocate");
 }
 
+void test_submitting_order_callback_preserves_close_lifecycle(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    auto* view = fake.get();
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 8, 16, 8, 16, 1, 1,
+        auto_close_policy()};
+    const auto entry = session.submit(opening_intent(8101), healthy_risk_snapshot());
+    CThostFtdcOrderField pending{};
+    ctp::copy_to_field(pending.OrderRef, "1");
+    pending.OrderSubmitStatus = THOST_FTDC_OSS_InsertSubmitted;
+    pending.OrderStatus = THOST_FTDC_OST_Unknown;
+    test_support::AllocationProbe probe;
+    view->spi()->OnRtnOrder(&pending);
+    view->spi()->OnRtnOrder(&pending);
+    session.drain_callbacks();
+    ctp::OrderSnapshot before{};
+    session.order_snapshot(entry.client_order_id, before);
+    const auto was_frozen = session.execution_snapshot().frozen;
+    const auto acceptances = session.event_snapshot().order_acceptances;
+    auto filled = pending;
+    filled.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+    filled.OrderStatus = THOST_FTDC_OST_AllTraded;
+    filled.VolumeTraded = 1;
+    view->spi()->OnRtnOrder(&filled);
+    emit_trade(view->spi(), "1", "open-8101", ctp::Direction::Buy, ctp::Offset::Open);
+    view->spi()->OnRtnOrder(&pending);
+    session.drain_callbacks();
+    const auto close = session.on_market(valid_market(), healthy_risk_snapshot());
+    session.on_market(valid_market(2), healthy_risk_snapshot());
+    emit_trade(view->spi(), "1", "open-8101", ctp::Direction::Buy, ctp::Offset::Open);
+    session.drain_callbacks();
+    const auto inserts = metrics->order_insert_calls.load();
+    if (close.action == ctp::ExecutionAction::ExitSubmitted) {
+        ctp::copy_to_field(pending.OrderRef, "2");
+        view->spi()->OnRtnOrder(&pending);
+        emit_trade(view->spi(), "2", "close-8101", ctp::Direction::Sell, ctp::Offset::Close);
+        session.drain_callbacks();
+    }
+    ctp::PositionSnapshot held{};
+    session.position_snapshot("IF2609", held);
+    probe.stop();
+    runner.expect(!was_frozen && before.state == ctp::OrderState::Submitted
+            && acceptances == 0,
+        "Unknown/InsertSubmitted must remain submitted, not frozen or exchange accepted");
+    runner.expect(close.action == ctp::ExecutionAction::ExitSubmitted
+            && inserts == 2 && metrics->last_order.CombOffsetFlag[0] == THOST_FTDC_OF_Close
+            && held.long_quantity == 0 && !session.execution_snapshot().frozen,
+        "pending/fill/late pending must yield exactly one ordinary close and reach flat");
+    runner.expect(probe.count() == 0,
+        "intermediate callbacks and the closing lifecycle must not allocate");
+}
+
+void test_nonqueueing_and_invalid_order_callbacks(test_support::TestRunner& runner)
+{
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        const ctp::AccountConfig account{
+            "account1", "9999", "user1", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        auto limits = risk_limits();
+        limits.max_net_open_position = 2;
+        auto risk = healthy_risk_snapshot();
+        risk.available_funds = 1000;
+        ctp::AccountTradingSession session{account, limits, std::move(fake), 8, 16, 8, 16};
+        auto intent = opening_intent(8102);
+        intent.quantity = 2;
+        const auto submitted = session.submit(intent, risk);
+        CThostFtdcOrderField order{};
+        ctp::copy_to_field(order.OrderRef, scenario == 4 ? "999" : "1");
+        order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+        order.OrderStatus = scenario == 0 ? THOST_FTDC_OST_NoTradeNotQueueing
+            : scenario == 1 ? THOST_FTDC_OST_PartTradedNotQueueing
+            : scenario == 2 ? '?' : THOST_FTDC_OST_Unknown;
+        order.VolumeTraded = scenario == 1 || scenario == 3 ? 1 : 0;
+        if (scenario >= 3) order.OrderSubmitStatus = THOST_FTDC_OSS_InsertSubmitted;
+        view->spi()->OnRtnOrder(&order);
+        session.drain_callbacks();
+        ctp::OrderSnapshot snapshot{};
+        session.order_snapshot(submitted.client_order_id, snapshot);
+        runner.expect(scenario < 2
+                ? snapshot.state == ctp::OrderState::Canceled
+                    && !session.execution_snapshot().frozen
+                    && session.execution_snapshot().active_open_orders == 0
+                : session.execution_snapshot().frozen,
+            "nonqueueing orders must terminate; invalid status, pending fills and unknown identity must freeze");
+    }
+}
+
 void test_open_fill_submits_one_close_and_reaches_zero(
     test_support::TestRunner& runner)
 {
@@ -1946,6 +2040,93 @@ void test_recovery_persists_available_funds(test_support::TestRunner& runner)
             && recovered.funds_known
             && recovered.available_funds == 1'234'567,
         "recovery must retain available funds in fixed-point cents");
+}
+
+void test_recovery_accepts_submitting_order(test_support::TestRunner& runner)
+{
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        const bool owned = scenario != 4;
+        const ctp::AccountConfig account{
+            "account1", "9999", "user1", "password", "app", "auth", "front"};
+        auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+        auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+        auto* view = fake.get();
+        ctp::AccountTradingSession session{account, risk_limits(), std::move(fake), 8, 16, 8, 32};
+        session.start();
+        view->spi()->OnFrontConnected();
+        session.drain_callbacks();
+        CThostFtdcRspInfoField ok{};
+        view->spi()->OnRspAuthenticate(nullptr, &ok, metrics->authenticate_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcRspUserLoginField login{};
+        ctp::copy_to_field(login.TradingDay, "20260909");
+        view->spi()->OnRspUserLogin(&login, &ok, metrics->login_request_id, true);
+        session.drain_callbacks();
+        CThostFtdcOrderField pending{};
+        ctp::copy_to_field(pending.OrderRef, "17");
+        if (owned) ctp::copy_to_field(pending.BusinessUnit, "JCTP1:17");
+        ctp::copy_to_field(pending.InstrumentID, "IF2609");
+        pending.Direction = THOST_FTDC_D_Buy;
+        pending.CombOffsetFlag[0] = scenario == 1 ? THOST_FTDC_OF_Close : THOST_FTDC_OF_Open;
+        pending.LimitPrice = 4000;
+        pending.VolumeTotalOriginal = scenario == 3 ? 2 : 1;
+        pending.VolumeTraded = scenario == 3 ? 1 : 0;
+        pending.OrderStatus = scenario == 2 ? THOST_FTDC_OST_NoTradeNotQueueing
+            : scenario == 3 ? THOST_FTDC_OST_PartTradedNotQueueing
+            : THOST_FTDC_OST_Unknown;
+        pending.OrderSubmitStatus = scenario == 2 || scenario == 3
+            ? THOST_FTDC_OSS_Accepted : THOST_FTDC_OSS_InsertSubmitted;
+        view->spi()->OnRspQryOrder(&pending, &ok, metrics->order_query_request_id, true);
+        session.drain_callbacks();
+        if (owned) {
+            runner.expect(session.recovery_snapshot().phase == ctp::RecoveryPhase::QueryingTrades,
+                "owned pending/nonqueueing queried orders must advance recovery, not become UnknownOrder");
+            ctp::OrderSnapshot recovered{};
+            session.order_snapshot(1, recovered);
+            runner.expect(scenario >= 2
+                    ? recovered.state == ctp::OrderState::Canceled
+                        && session.execution_snapshot().active_open_orders == 0
+                    : recovered.state == ctp::OrderState::Submitted,
+                "query normalization must preserve pending or terminal order semantics");
+            if (scenario == 1) {
+                runner.expect(session.execution_snapshot().active_exit_order_id == 1,
+                    "a recovered submitting close must remain active to prevent duplicate exits");
+            }
+            if (session.recovery_snapshot().phase == ctp::RecoveryPhase::QueryingTrades) {
+                CThostFtdcTradeField trade{};
+                ctp::copy_to_field(trade.OrderRef, "17");
+                ctp::copy_to_field(trade.BusinessUnit, "JCTP1:17");
+                ctp::copy_to_field(trade.InstrumentID, "IF2609");
+                ctp::copy_to_field(trade.TradingDay, "20260909");
+                ctp::copy_to_field(trade.ExchangeID, "CFFEX");
+                ctp::copy_to_field(trade.TradeID, "partial-17");
+                trade.Direction = THOST_FTDC_D_Buy;
+                trade.OffsetFlag = THOST_FTDC_OF_Open;
+                trade.Volume = 1;
+                view->spi()->OnRspQryTrade(scenario == 3 ? &trade : nullptr,
+                    &ok, metrics->trade_query_request_id, true);
+                session.drain_callbacks();
+                CThostFtdcInvestorPositionField held{};
+                ctp::copy_to_field(held.InstrumentID, "IF2609");
+                held.PosiDirection = THOST_FTDC_PD_Long;
+                held.HedgeFlag = THOST_FTDC_HF_Speculation;
+                held.Position = 1;
+                view->spi()->OnRspQryInvestorPosition(scenario == 1 || scenario == 3 ? &held : nullptr,
+                    &ok, metrics->position_request_id, true);
+                session.drain_callbacks();
+                CThostFtdcTradingAccountField funds{};
+                view->spi()->OnRspQryTradingAccount(&funds, &ok, metrics->account_request_id, true);
+                session.drain_callbacks();
+                runner.expect(session.recovery_snapshot().phase == ctp::RecoveryPhase::Ready,
+                    "pending owned orders must permit full query reconciliation");
+            }
+        } else {
+            runner.expect(session.recovery_snapshot().failure == ctp::RecoveryFailure::UnknownOrder,
+                "a pending status must not bypass counter ownership validation");
+        }
+        runner.expect(metrics->order_insert_calls == 0,
+            "recovering a submitting order must never resubmit it");
+    }
 }
 
 void test_unknown_recovery_order_never_resubmits(
@@ -3044,6 +3225,9 @@ int main()
     test_cancel_fill_race_calls_ctp_once(runner);
     test_synchronous_cancel_failure_can_be_retried(runner);
     test_unknown_callback_freezes_only_its_account(runner);
+    test_submitting_order_callback_preserves_close_lifecycle(runner);
+    test_nonqueueing_and_invalid_order_callbacks(runner);
+    test_recovery_accepts_submitting_order(runner);
     test_local_and_exchange_rejections_are_distinct(runner);
     test_callback_queue_overflow_is_explicit(runner);
     test_cancel_rejection_and_daily_limit(runner);

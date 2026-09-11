@@ -67,6 +67,8 @@ enum class OrderReportType : std::uint8_t {
     Filled,
     Canceled,
     CancelRejected,
+    // 仅追加编号，保持订单回报轨迹编码兼容。
+    Submitted,
 };
 
 enum class ApplyCode : std::uint8_t {

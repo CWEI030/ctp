@@ -53,6 +53,7 @@ enum class TraceOrderReportCode : std::int32_t {
     Filled,
     Canceled,
     CancelRejected,
+    Submitted,
 };
 
 // 交易线程只复制定长事实；文本格式化和磁盘写入由后台线程完成。

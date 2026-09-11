@@ -382,7 +382,9 @@ ApplyResult AccountTradingState::apply_order_report(
         || before == OrderState::SubmitRejectedLocally;
 
     const bool invalid_report =
-        (report.type == OrderReportType::Rejected
+        (report.type == OrderReportType::Submitted
+         && report.cumulative_filled != 0)
+        || (report.type == OrderReportType::Rejected
          && report.cumulative_filled != 0)
         || (report.type == OrderReportType::PartiallyFilled
             && (report.cumulative_filled == 0
@@ -400,6 +402,12 @@ ApplyResult AccountTradingState::apply_order_report(
 
     OrderState after = before;
     switch (report.type) {
+    case OrderReportType::Submitted:
+        // 柜台提交中不是交易所接受；迟到的提交回报不能回退活动或终态。
+        if (before == OrderState::Created || before == OrderState::RiskAccepted) {
+            after = OrderState::Submitted;
+        }
+        break;
     case OrderReportType::Accepted:
         if (before == OrderState::Created
             || before == OrderState::RiskAccepted
@@ -808,7 +816,7 @@ bool same_intent(const OrderIntent& left, const OrderIntent& right) noexcept
         && left.attempt == right.attempt;
 }
 
-bool queried_order_type(
+bool ctp_order_report_type(
     const CThostFtdcOrderField& order,
     OrderReportType& type) noexcept
 {
@@ -820,17 +828,25 @@ bool queried_order_type(
         type = OrderReportType::Filled;
         return true;
     }
-    if (order.OrderStatus == THOST_FTDC_OST_PartTradedQueueing
-        || order.OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing) {
+    if (order.OrderStatus == THOST_FTDC_OST_PartTradedQueueing) {
         type = OrderReportType::PartiallyFilled;
         return true;
     }
-    if (order.OrderStatus == THOST_FTDC_OST_Canceled) {
+    if (order.OrderStatus == THOST_FTDC_OST_Canceled
+        || order.OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing
+        || order.OrderStatus == THOST_FTDC_OST_NoTradeNotQueueing) {
         type = OrderReportType::Canceled;
         return true;
     }
     if (order.OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
         type = OrderReportType::Accepted;
+        return true;
+    }
+    // Unknown 是 CTP 的合法提交中状态，不等同于找不到本地订单身份。
+    // 只接纳明确的报单提交组合，其他未知组合仍要求冻结核对。
+    if (order.OrderStatus == THOST_FTDC_OST_Unknown
+        && order.OrderSubmitStatus == THOST_FTDC_OSS_InsertSubmitted) {
+        type = OrderReportType::Submitted;
         return true;
     }
     return false;
@@ -2217,7 +2233,7 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                 record->seen_during_recovery = true;
                 ++impl_->recovery.queried_orders;
                 OrderReportType type{};
-                if (!queried_order_type(event.queried_order, type)) {
+                if (!ctp_order_report_type(event.queried_order, type)) {
                     impl_->recovery_failure(RecoveryFailure::UnknownOrder);
                     continue;
                 }
@@ -2233,7 +2249,8 @@ std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
                     *record, type, applied, event.queried_order.VolumeTraded);
                 if (record->imported_from_counter
                     && record->intent.offset == Offset::Close
-                    && (type == OrderReportType::Accepted
+                    && (type == OrderReportType::Submitted
+                        || type == OrderReportType::Accepted
                         || type == OrderReportType::PartiallyFilled)) {
                     if (impl_->exit.active
                         && impl_->exit.active_client_order_id
@@ -2807,20 +2824,9 @@ void AccountTradingSession::OnRtnOrder(CThostFtdcOrderField* order)
     event.type = CallbackType::Order;
     copy_from_ctp(event.order_ref, order->OrderRef);
     event.cumulative_filled = order->VolumeTraded;
-    if (order->OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
-        event.order_type = OrderReportType::Rejected;
-    } else if (order->OrderSubmitStatus == THOST_FTDC_OSS_CancelRejected) {
+    if (order->OrderSubmitStatus == THOST_FTDC_OSS_CancelRejected) {
         event.order_type = OrderReportType::CancelRejected;
-    } else if (order->OrderStatus == THOST_FTDC_OST_AllTraded) {
-        event.order_type = OrderReportType::Filled;
-    } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedQueueing
-               || order->OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing) {
-        event.order_type = OrderReportType::PartiallyFilled;
-    } else if (order->OrderStatus == THOST_FTDC_OST_Canceled) {
-        event.order_type = OrderReportType::Canceled;
-    } else if (order->OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
-        event.order_type = OrderReportType::Accepted;
-    } else {
+    } else if (!ctp_order_report_type(*order, event.order_type)) {
         event.type = CallbackType::Unknown;
     }
     impl_->push_callback(event);
