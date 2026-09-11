@@ -966,6 +966,31 @@ void test_cancel_fill_race_calls_ctp_once(test_support::TestRunner& runner)
         "a late fill must refine canceled to filled without losing cancel history");
 }
 
+void test_synchronous_cancel_failure_can_be_retried(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    fake->order_action_return_code = -1;
+    ctp::AccountTradingSession session{
+        account, risk_limits(), std::move(fake), 4, 4, 4, 4};
+    const auto submitted = session.submit(
+        opening_intent(100), healthy_risk_snapshot());
+
+    const auto first_cancel = session.cancel(submitted.client_order_id);
+    const auto second_cancel = session.cancel(submitted.client_order_id);
+
+    runner.expect(
+        first_cancel.code == ctp::CancelCode::RejectedLocally
+            && first_cancel.api_return_code == -1
+            && second_cancel.code == ctp::CancelCode::RejectedLocally
+            && second_cancel.api_return_code == -1
+            && metrics->order_action_calls == 2,
+        "a synchronous cancel failure must allow a later CTP retry");
+}
+
 void test_unknown_callback_freezes_only_its_account(
     test_support::TestRunner& runner)
 {
@@ -2422,6 +2447,7 @@ int main()
     test_order_price_converts_ticks_to_ctp_price(runner);
     test_ctp_callbacks_are_drained_on_account_thread(runner);
     test_cancel_fill_race_calls_ctp_once(runner);
+    test_synchronous_cancel_failure_can_be_retried(runner);
     test_unknown_callback_freezes_only_its_account(runner);
     test_local_and_exchange_rejections_are_distinct(runner);
     test_callback_queue_overflow_is_explicit(runner);
