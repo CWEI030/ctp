@@ -29,6 +29,7 @@ struct BenchmarkConfig {
     std::uint32_t duration_seconds{1};
     std::uint64_t burst_rate_per_second{0};
     std::uint32_t burst_seconds{0};
+    std::uint32_t submit_stride{1024};
 };
 
 struct TradingWindow {

@@ -45,6 +45,20 @@ std::size_t csv_sample_count_matching(
     return samples.size();
 }
 
+std::size_t csv_row_count_containing(
+    const std::string& text,
+    const std::string& fields)
+{
+    std::istringstream input{text};
+    std::size_t count = 0;
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        if (line.find(fields) != std::string::npos) ++count;
+    }
+    return count;
+}
+
 ctp::TraceEvent trace_event(
     std::uint64_t sequence,
     ctp::TraceStage stage = ctp::TraceStage::Signal)
@@ -443,6 +457,36 @@ void test_offline_benchmark_writes_complete_evidence(
             && all_thread_roles
             && csv_sample_count(cpu_text) >= 2,
         "CPU evidence must contain per-thread account and callback time series");
+    std::ifstream report{output_path / "report.md"};
+    const std::string report_text{
+        std::istreambuf_iterator<char>{report},
+        std::istreambuf_iterator<char>{}};
+    bool all_reported_queues = true;
+    for (const auto role : queue_roles) {
+        all_reported_queues = all_reported_queues
+            && report_text.find(std::string{"| "} + std::string{role} + " |")
+                != std::string::npos;
+    }
+    runner.expect(
+        report_text.find("CPU 使用情况") != std::string::npos
+            && report_text.find("上下文切换") != std::string::npos,
+        "report must summarize process and per-thread CPU evidence");
+    runner.expect(
+        report_text.find("运行队列汇总") != std::string::npos
+            && all_reported_queues,
+        "report must summarize all five runtime queue kinds");
+    runner.expect(
+        report_text.find("样本不足") != std::string::npos,
+        "short benchmark must not present four samples as credible tail evidence");
+    std::ifstream latency{output_path / "latency_raw.csv"};
+    const std::string latency_text{
+        std::istreambuf_iterator<char>{latency},
+        std::istreambuf_iterator<char>{}};
+    runner.expect(
+        csv_row_count_containing(latency_text, ",callback_to_state,") >= 8
+            && csv_row_count_containing(
+                latency_text, ",simulated_end_to_end,") >= 4,
+        "end-to-end samples must include each account trade callback and state update");
     runner.expect(
         event_text.find("\"market_events_enqueued\"") != std::string::npos
             && event_text.find("\"market_events_processed\"") != std::string::npos

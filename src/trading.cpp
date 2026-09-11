@@ -1855,7 +1855,7 @@ void copy_from_ctp(std::array<char, N>& destination, const char* source) noexcep
 
 }
 
-std::size_t AccountTradingSession::drain_callbacks() noexcept
+std::size_t AccountTradingSession::drain_callbacks(std::size_t maximum) noexcept
 {
     const auto overflow_phase = impl_->recovery.phase;
     const bool callback_overflow =
@@ -1865,7 +1865,7 @@ std::size_t AccountTradingSession::drain_callbacks() noexcept
     }
     std::size_t applied_count = 0;
     CallbackEvent event{};
-    while (impl_->pop_callback(event)) {
+    while (applied_count < maximum && impl_->pop_callback(event)) {
         ++applied_count;
         if (event.type == CallbackType::Disconnected) {
             ++impl_->recovery.generation;

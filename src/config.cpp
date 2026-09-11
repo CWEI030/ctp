@@ -613,6 +613,11 @@ ConfigResult parse_benchmark_config(
             if (!parse_unsigned(value, benchmark.burst_seconds)) {
                 return failure("benchmark burst seconds must be a non-negative integer");
             }
+        } else if (option == "--submit-stride") {
+            if (!parse_unsigned(value, benchmark.submit_stride)
+                || benchmark.submit_stride == 0) {
+                return failure("benchmark submit stride must be a positive integer");
+            }
         } else {
             return failure("unknown benchmark command-line option");
         }

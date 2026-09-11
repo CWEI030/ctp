@@ -407,7 +407,7 @@ void test_benchmark_configuration(TestRunner& runner)
          "--output", "runtime/performance/run-1", "--accounts", "2",
          "--rate", "1000", "--warmup-seconds", "1",
          "--duration-seconds", "3", "--burst-rate", "2000",
-         "--burst-seconds", "1"},
+         "--burst-seconds", "1", "--submit-stride", "7"},
         {});
 
     runner.expect(result.config.has_value(), "valid benchmark options must parse");
@@ -420,6 +420,7 @@ void test_benchmark_configuration(TestRunner& runner)
             && benchmark.account_count == 2
             && benchmark.rate_per_second == 1000
             && benchmark.duration_seconds == 3
+            && benchmark.submit_stride == 7
             && benchmark.burst_rate_per_second == 2000,
         "benchmark options and account configuration must share one immutable config");
 
@@ -430,6 +431,10 @@ void test_benchmark_configuration(TestRunner& runner)
         {"benchmark", "--config", path, "--input", "market.csv",
          "--output", "result", "--accounts", "5"}, {});
     expect_error_contains(runner, too_many, "exceeds enabled account count");
+    const auto zero_stride = parse(
+        {"benchmark", "--config", path, "--input", "market.csv",
+         "--output", "result", "--submit-stride", "0"}, {});
+    expect_error_contains(runner, zero_stride, "submit stride");
 }
 
 void test_engine_uses_default_account_config_path(TestRunner& runner)

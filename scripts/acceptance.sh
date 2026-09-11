@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [[ "$#" -lt 1 || "$#" -gt 2 \
     || ! "$1" =~ ^(replay|benchmark|simnow|hot-path|all-offline)$ ]]; then
-    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|full|evidence-test]|simnow [preflight|online]|hot-path|all-offline" >&2
+    echo "usage: scripts/acceptance.sh replay|benchmark [smoke|evidence|full|evidence-test]|simnow [preflight|online]|hot-path|all-offline" >&2
     exit 2
 fi
 
@@ -140,6 +140,7 @@ capture_environment() {
 
 publish_benchmark_root() {
     local result_root="$1"
+    local profile="$2"
     local published_root="evidence/performance/$(basename "$result_root")"
     if [[ -e "$published_root" ]]; then
         echo "published evidence already exists: $published_root" >&2
@@ -148,18 +149,19 @@ publish_benchmark_root() {
     mkdir -p "$published_root"
     local source_directory run_name manifest raw_index
     {
-        printf 'run\taccounts\trate\twarmup_seconds\tduration_seconds\tburst_rate\tburst_seconds\tdropped\traw_samples\traw_sha256\n'
+        printf 'run\taccounts\trate\twarmup_seconds\tduration_seconds\tsubmit_stride\tburst_rate\tburst_seconds\tdropped\traw_samples\traw_sha256\n'
         for source_directory in "$result_root"/*; do
             [[ -d "$source_directory" && -s "$source_directory/manifest.json" ]] || continue
             run_name="$(basename "$source_directory")"
             publish_one_benchmark "$source_directory" "$published_root/$run_name"
             raw_index="$published_root/$run_name/latency_raw.index.tsv"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$run_name" \
                 "$(json_number "$source_directory/manifest.json" accounts)" \
                 "$(json_number "$source_directory/manifest.json" rate_per_second)" \
                 "$(json_number "$source_directory/manifest.json" warmup_seconds)" \
                 "$(json_number "$source_directory/manifest.json" duration_seconds)" \
+                "$(json_number "$source_directory/manifest.json" submit_stride)" \
                 "$(json_number "$source_directory/manifest.json" burst_rate_per_second)" \
                 "$(json_number "$source_directory/manifest.json" burst_seconds)" \
                 "$(json_number "$source_directory/manifest.json" performance_samples_dropped)" \
@@ -169,10 +171,14 @@ publish_benchmark_root() {
     } > "$published_root/matrix_index.tsv"
     cp "$result_root"/environment_*.txt "$published_root/"
     {
-        printf '# 正式离线性能矩阵\n\n'
+        if [[ "$profile" == "full" ]]; then
+            printf '# 正式离线性能矩阵\n\n'
+        else
+            printf '# 短时高样本离线性能证据\n\n'
+        fi
         printf '本目录由完整原始 CSV 无损发布；逐运行原始 CSV 留在 `%s`。\n\n' "$result_root"
         printf '逐纳秒直方图保留 `(account, stage, latency_ns)` 的精确计数，原始文件摘要见各运行的 `latency_raw.index.tsv`。\n\n'
-        printf '这是共享主机上的离线回放和柜台替身结果，不代表真实 CTP 网络延迟或生产 SLA；四真实账户 SimNow 验收仍未完成。\n'
+        printf '这是共享主机上的离线回放和柜台替身结果，不代表真实 CTP 网络延迟或生产 SLA。短时 evidence 配置只用于补足尾分位样本，不替代 4.7 小时容量/饱和矩阵；四真实账户 SimNow 验收仍未完成。\n'
     } > "$published_root/README.md"
     (
         cd "$published_root"
@@ -223,6 +229,7 @@ run_one_benchmark() {
     local burst_rate="$5"
     local burst_seconds="$6"
     local result_directory="$7"
+    local submit_stride="$8"
     local -a command=(
         ./build/ctp_client benchmark
         --config "$offline_config"
@@ -231,7 +238,8 @@ run_one_benchmark() {
         --accounts "$accounts"
         --rate "$rate"
         --warmup-seconds "$warmup"
-        --duration-seconds "$duration")
+        --duration-seconds "$duration"
+        --submit-stride "$submit_stride")
     if [[ "$burst_seconds" -ne 0 ]]; then
         command+=(--burst-rate "$burst_rate" --burst-seconds "$burst_seconds")
     fi
@@ -241,6 +249,31 @@ run_one_benchmark() {
         "${command[@]}"
     fi
     verify_evidence "$result_directory"
+}
+
+verify_tail_sample_counts() {
+    local published_root="$1"
+    local directory accounts
+    for directory in "$published_root"/*; do
+        [[ -d "$directory" && -s "$directory/manifest.json" ]] || continue
+        accounts="$(json_number "$directory/manifest.json" accounts)"
+        awk -F '\t' -v accounts="$accounts" '
+            NR > 1 { count[$1 SUBSEP $2] += $4 }
+            END {
+                split("market_to_signal signal_to_order_call callback_to_state simulated_end_to_end", stages, " ")
+                for (account = 0; account < accounts; account++) {
+                    for (index = 1; index <= 4; index++) {
+                        key = account SUBSEP stages[index]
+                        if (count[key] < 10000) {
+                            printf "insufficient samples: account=%d stage=%s count=%d\n", account, stages[index], count[key] > "/dev/stderr"
+                            failed = 1
+                        }
+                    }
+                }
+                exit failed
+            }
+        ' "$directory/latency_raw.histogram.tsv"
+    done
 }
 
 run_replay() {
@@ -265,36 +298,46 @@ run_benchmark_matrix() {
         run_evidence_test
         return
     fi
-    if [[ ! "$profile" =~ ^(smoke|full)$ ]]; then
-        echo "benchmark profile must be smoke, full, or evidence-test" >&2
+    if [[ ! "$profile" =~ ^(smoke|evidence|full)$ ]]; then
+        echo "benchmark profile must be smoke, evidence, full, or evidence-test" >&2
         return 2
     fi
     prepare_offline_config
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build -j2 --target ctp_client
     local result_root="runtime/performance/${profile}-$(date +%Y%m%dT%H%M%S)"
     mkdir -p "$result_root"
-    if [[ "$profile" == "full" ]]; then
+    if [[ "$profile" != "smoke" ]]; then
         export CTP_BENCHMARK_CPUSET="${CTP_BENCHMARK_CPUSET:-0-15}"
         capture_environment "$result_root/environment_before.txt" before
     fi
     if [[ "$profile" == "smoke" ]]; then
         for accounts in 1 2 4; do
             run_one_benchmark "$accounts" 1000 0 1 2000 1 \
-                "$result_root/accounts-$accounts"
+                "$result_root/accounts-$accounts" 1024
         done
+    elif [[ "$profile" == "evidence" ]]; then
+        for accounts in 1 2 4; do
+            run_one_benchmark "$accounts" 1000 2 36 0 0 \
+                "$result_root/accounts-$accounts" 1
+        done
+        capture_environment "$result_root/environment_after.txt" after
+        publish_benchmark_root "$result_root" "$profile"
+        verify_tail_sample_counts "evidence/performance/$(basename "$result_root")"
     else
         for repeat in 1 2 3; do
             for accounts in 1 2 4; do
                 run_one_benchmark "$accounts" 1000 60 900 2000 60 \
-                    "$result_root/steady-a${accounts}-r${repeat}"
+                    "$result_root/steady-a${accounts}-r${repeat}" 16
             done
             for rate in 5000 10000 20000; do
                 run_one_benchmark 4 "$rate" 60 900 0 0 \
-                    "$result_root/saturation-${rate}-r${repeat}"
+                    "$result_root/saturation-${rate}-r${repeat}" 16
             done
         done
         capture_environment "$result_root/environment_after.txt" after
-        publish_benchmark_root "$result_root"
+        publish_benchmark_root "$result_root" "$profile"
+        verify_tail_sample_counts "evidence/performance/$(basename "$result_root")"
     fi
     echo "[ok] benchmark evidence root: $result_root"
 }

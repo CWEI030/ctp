@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <cstdio>
 #include <sstream>
@@ -291,11 +292,18 @@ private:
 };
 
 struct BenchmarkAccount {
+    struct PendingOrder {
+        std::uint64_t client_order_id{0};
+        std::int64_t market_receive_ns{0};
+        bool measured{false};
+    };
+
     BenchmarkAccount(
         const AccountConfig& account,
         const StrategyConfig& strategy_config,
         RiskLimits limits,
         std::size_t capacity,
+        std::uint32_t submit_stride_value,
         std::size_t index,
         const std::filesystem::path& output_path)
         : account_index(index),
@@ -308,7 +316,7 @@ struct BenchmarkAccount {
               limits,
               make_api(api),
               capacity,
-              16,
+              capacity,
               capacity,
               1024,
               1,
@@ -317,6 +325,8 @@ struct BenchmarkAccount {
               &trace,
               index + 1)
     {
+        submit_stride = submit_stride_value;
+        pending_orders.reserve(capacity);
         started = trace.start() && recorder.start();
         session.activate(1, 1, "0", "20260909");
     }
@@ -333,21 +343,36 @@ struct BenchmarkAccount {
     {
         worker_tid.store(static_cast<std::int32_t>(::syscall(SYS_gettid)),
                          std::memory_order_release);
-        constexpr std::uint64_t kSubmitStride = 1024;
         MarketEvent market{};
         std::uint64_t sample_sequence = 0;
         while (!producer_done.load(std::memory_order_acquire)
                || ingress.snapshot(account_index).depth != 0
                || api->outstanding() != 0
                || session.callback_queue_snapshot().depth != 0) {
+            const bool callback_measured = pending_head < pending_orders.size()
+                && pending_orders[pending_head].measured;
             const auto callback_begin = steady_now_ns();
-            const auto callbacks = session.drain_callbacks();
+            const auto callbacks = session.drain_callbacks(1);
             const auto callback_end = steady_now_ns();
-            if (callbacks != 0 && processed.load(std::memory_order_relaxed) > warmup_events) {
+            if (callbacks != 0 && callback_measured) {
                 recorder.try_record({++sample_sequence, callback_end,
                     callback_end - callback_begin,
                     static_cast<std::uint32_t>(account_index),
                     PerformanceStage::CallbackToState});
+            }
+            if (callbacks != 0 && pending_head < pending_orders.size()) {
+                OrderSnapshot snapshot{};
+                const auto& pending = pending_orders[pending_head];
+                if (session.order_snapshot(pending.client_order_id, snapshot)
+                    && snapshot.state == OrderState::Filled) {
+                    if (pending.measured) {
+                        recorder.try_record({++sample_sequence, callback_end,
+                            callback_end - pending.market_receive_ns,
+                            static_cast<std::uint32_t>(account_index),
+                            PerformanceStage::SimulatedEndToEnd});
+                    }
+                    ++pending_head;
+                }
             }
             if (!ingress.try_pop(account_index, market)) {
                 std::this_thread::yield();
@@ -365,7 +390,7 @@ struct BenchmarkAccount {
             if (!decision.has_intent) continue;
             const auto signal_count = signals.fetch_add(1, std::memory_order_relaxed) + 1;
             session.trace_signal(market, decision.intent, decision_end);
-            if ((signal_count - 1) % kSubmitStride != 0) continue;
+            if ((signal_count - 1) % submit_stride != 0) continue;
             RiskSnapshot risk{};
             risk.enabled = risk.authenticated = risk.logged_in = true;
             risk.reconciled = risk.trading_window_open = risk.market_valid = true;
@@ -379,6 +404,8 @@ struct BenchmarkAccount {
             const auto submit_end = steady_now_ns();
             if (submit.code == SubmitCode::Submitted) {
                 submitted.fetch_add(1, std::memory_order_relaxed);
+                pending_orders.push_back({
+                    submit.client_order_id, market.recv_mono_ns, measured});
             } else {
                 rejected.fetch_add(1, std::memory_order_relaxed);
             }
@@ -387,9 +414,6 @@ struct BenchmarkAccount {
                     submit_end - submit_begin,
                     static_cast<std::uint32_t>(account_index),
                     PerformanceStage::SignalToOrderCall});
-                recorder.try_record({++sample_sequence, submit_end,
-                    submit_end - begin, static_cast<std::uint32_t>(account_index),
-                    PerformanceStage::SimulatedEndToEnd});
             }
         }
         session.drain_callbacks();
@@ -413,6 +437,9 @@ struct BenchmarkAccount {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> rejected{0};
     std::atomic<std::int32_t> worker_tid{0};
+    std::uint32_t submit_stride{1024};
+    std::vector<PendingOrder> pending_orders;
+    std::size_t pending_head{0};
     std::thread worker;
 };
 
@@ -703,7 +730,128 @@ void write_statistics(
            << value.standard_deviation_ns << " | "
            << value.jitter_p99_p50_ns << " | "
            << value.jitter_p999_p50_ns << " | "
-           << value.maximum_pause_ns << " |\n";
+           << value.maximum_pause_ns << " | ";
+    if (value.count < 200) output << "样本不足：P95";
+    else if (value.count < 1000) output << "样本不足：P99";
+    else if (value.count < 10000) output << "样本不足：P99.9";
+    else output << "P95/P99/P99.9 样本充足";
+    output << " |\n";
+}
+
+std::vector<std::string_view> split_csv(std::string_view line)
+{
+    std::vector<std::string_view> fields;
+    std::size_t begin = 0;
+    while (begin <= line.size()) {
+        const auto comma = line.find(',', begin);
+        fields.push_back(line.substr(begin, comma == std::string_view::npos
+            ? line.size() - begin : comma - begin));
+        if (comma == std::string_view::npos) break;
+        begin = comma + 1;
+    }
+    return fields;
+}
+
+struct QueueSummary {
+    std::uint64_t maximum_depth{0};
+    std::uint64_t maximum_high_watermark{0};
+    std::uint64_t maximum_oldest_age_ns{0};
+    std::uint64_t maximum_dropped{0};
+    std::int64_t first_drop_mono_ns{-1};
+};
+
+using QueueKey = std::pair<std::string, std::size_t>;
+
+std::map<QueueKey, QueueSummary> read_queue_summaries(
+    const std::filesystem::path& path)
+{
+    std::map<QueueKey, QueueSummary> result;
+    std::ifstream input{path};
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        const auto fields = split_csv(line);
+        if (fields.size() != 8) continue;
+        std::int64_t mono_ns = 0;
+        std::size_t account = 0;
+        std::uint64_t depth = 0, high_watermark = 0, oldest = 0, dropped = 0;
+        if (!parse_integer(fields[0], mono_ns)
+            || !parse_integer(fields[1], account)
+            || !parse_integer(fields[3], depth)
+            || !parse_integer(fields[5], high_watermark)
+            || !parse_integer(fields[6], oldest)
+            || !parse_integer(fields[7], dropped)) continue;
+        auto& summary = result[{std::string{fields[2]}, account}];
+        summary.maximum_depth = std::max(summary.maximum_depth, depth);
+        summary.maximum_high_watermark = std::max(
+            summary.maximum_high_watermark, high_watermark);
+        summary.maximum_oldest_age_ns = std::max(
+            summary.maximum_oldest_age_ns, oldest);
+        summary.maximum_dropped = std::max(summary.maximum_dropped, dropped);
+        if (dropped != 0 && summary.first_drop_mono_ns < 0) {
+            summary.first_drop_mono_ns = mono_ns;
+        }
+    }
+    return result;
+}
+
+struct CpuSummary {
+    std::string scope;
+    std::int64_t account{-1};
+    std::string role;
+    std::int32_t tid{0};
+    std::uint64_t first_mono_ns{0};
+    std::uint64_t last_mono_ns{0};
+    CpuPoint first{};
+    CpuPoint last{};
+    double peak_percent{0.0};
+    bool initialized{false};
+};
+
+std::map<std::string, CpuSummary> read_cpu_summaries(
+    const std::filesystem::path& path)
+{
+    std::map<std::string, CpuSummary> result;
+    std::ifstream input{path};
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        const auto fields = split_csv(line);
+        if (fields.size() != 9) continue;
+        std::uint64_t mono_ns = 0;
+        std::int64_t account = -1;
+        std::int32_t tid = 0;
+        CpuPoint point{};
+        if (!parse_integer(fields[0], mono_ns)
+            || !parse_integer(fields[2], account)
+            || !parse_integer(fields[4], tid)
+            || !parse_integer(fields[5], point.user_ns)
+            || !parse_integer(fields[6], point.system_ns)
+            || !parse_integer(fields[7], point.voluntary_switches)
+            || !parse_integer(fields[8], point.nonvoluntary_switches)) continue;
+        const std::string key = std::string{fields[1]} + ":"
+            + std::to_string(account) + ":" + std::string{fields[3]} + ":"
+            + std::to_string(tid);
+        auto& summary = result[key];
+        if (!summary.initialized) {
+            summary.scope = fields[1];
+            summary.account = account;
+            summary.role = fields[3];
+            summary.tid = tid;
+            summary.first_mono_ns = mono_ns;
+            summary.first = point;
+            summary.initialized = true;
+        } else if (mono_ns > summary.last_mono_ns) {
+            const auto wall = mono_ns - summary.last_mono_ns;
+            const auto cpu = point.user_ns + point.system_ns
+                - summary.last.user_ns - summary.last.system_ns;
+            summary.peak_percent = std::max(
+                summary.peak_percent, cpu * 100.0 / wall);
+        }
+        summary.last_mono_ns = mono_ns;
+        summary.last = point;
+    }
+    return result;
 }
 
 }
@@ -783,14 +931,14 @@ int run_benchmark(
         return 3;
     }
     const auto session_capacity = static_cast<std::size_t>(
-        (base_events + burst_events) / 1024 + 32);
+        (base_events + burst_events) / settings.submit_stride + 32);
     const auto output_directory = std::filesystem::path{settings.output_path};
     std::vector<std::unique_ptr<BenchmarkAccount>> accounts;
     accounts.reserve(account_count);
     for (std::size_t index = 0; index < account_count; ++index) {
         accounts.push_back(std::make_unique<BenchmarkAccount>(
             config.accounts()[index], strategy_config, limits, session_capacity,
-            index, output_directory));
+            settings.submit_stride, index, output_directory));
         if (!accounts.back()->started) {
             error << "[error] account evidence writer cannot be opened\n";
             return 3;
@@ -864,13 +1012,10 @@ int run_benchmark(
     sampler.stop();
     ingress.stop();
     std::uint64_t performance_dropped = 0;
-    std::size_t performance_high_watermark = 0;
     for (auto& account : accounts) {
         account->stop_writers();
         const auto snapshot = account->recorder.snapshot();
         performance_dropped += snapshot.dropped;
-        performance_high_watermark = std::max(
-            performance_high_watermark, snapshot.high_watermark);
     }
 
     // 各账户独占 SPSC 延迟队列；完成后在控制面合并为约定的原始证据文件。
@@ -948,6 +1093,7 @@ int run_benchmark(
              << "  \"rate_per_second\": " << settings.rate_per_second << ",\n"
              << "  \"warmup_seconds\": " << settings.warmup_seconds << ",\n"
              << "  \"duration_seconds\": " << settings.duration_seconds << ",\n"
+             << "  \"submit_stride\": " << settings.submit_stride << ",\n"
              << "  \"burst_rate_per_second\": "
              << settings.burst_rate_per_second << ",\n"
              << "  \"burst_seconds\": " << settings.burst_seconds << ",\n"
@@ -961,21 +1107,80 @@ int run_benchmark(
     manifest.close();
 
     const auto raw = read_latency_samples(raw_path);
+    const auto queue_summaries = read_queue_summaries(
+        output_directory / "queue_raw.csv");
+    const auto cpu_summaries = read_cpu_summaries(
+        output_directory / "cpu_raw.csv");
     std::ofstream report{output_directory / "report.md"};
     report << "# CTP 离线基准报告\n\n"
            << "该结果使用离线回放和柜台替身，不能代表真实 CTP 网络延迟。\n\n"
-           << "| 链路 | 数量 | 最小 | P50 | P95 | P99 | P99.9 | 最大 | 平均 | 标准差 | P99-P50 | P99.9-P50 | 最大停顿 |\n"
-           << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+           << "| 链路 | 数量 | 最小 | P50 | P95 | P99 | P99.9 | 最大 | 平均 | 标准差 | P99-P50 | P99.9-P50 | 最大停顿 | 尾分位可信度 |\n"
+           << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n";
     constexpr std::string_view names[]{
         "行情到策略", "信号到报单调用", "回报到状态", "模拟端到端"};
     for (std::size_t index = 0; index < raw.size(); ++index) {
         write_statistics(report, names[index], compute_latency_statistics(raw[index]));
     }
-    report << "\n- 行情吞吐：" << std::fixed << std::setprecision(2)
-           << delivered_events * 1'000'000'000.0 / elapsed_ns << " 条/秒\n"
-           << "- 单账户性能采样队列最高水位最大值："
-           << performance_high_watermark << "\n"
-           << "- 性能采样丢弃合计：" << performance_dropped << "\n";
+    report << "\n## 账户吞吐与生命周期\n\n"
+           << "| 账户 | 行情处理/秒 | 信号 | 提交 | 本地拒绝 | 接受 | 撤单请求 | 撤单接受 | 成交 | 冻结 | 恢复 |\n"
+           << "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (std::size_t index = 0; index < accounts.size(); ++index) {
+        const auto& account = *accounts[index];
+        const auto lifecycle = account.session.event_snapshot();
+        report << "| " << index << " | " << std::fixed << std::setprecision(2)
+               << account.processed.load() * 1'000'000'000.0 / elapsed_ns
+               << " | " << account.signals.load()
+               << " | " << account.submitted.load()
+               << " | " << account.rejected.load()
+               << " | " << lifecycle.order_acceptances
+               << " | " << lifecycle.cancel_requests
+               << " | " << lifecycle.cancel_acceptances
+               << " | " << lifecycle.trades
+               << " | " << lifecycle.freeze_transitions
+               << " | " << lifecycle.recovery_completions << " |\n";
+    }
+
+    report << "\n## CPU 使用情况\n\n"
+           << "利用率按单个逻辑核等效值计算；进程值可超过 100%。上下文切换为采样首尾差值。\n\n"
+           << "| 范围 | 账户 | 线程角色 | TID | 用户态 ms | 内核态 ms | 平均利用率 % | 峰值利用率 % | 主动上下文切换 | 被动上下文切换 |\n"
+           << "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& [key, cpu] : cpu_summaries) {
+        (void)key;
+        const auto wall = cpu.last_mono_ns > cpu.first_mono_ns
+            ? cpu.last_mono_ns - cpu.first_mono_ns : 0;
+        const auto user = cpu.last.user_ns >= cpu.first.user_ns
+            ? cpu.last.user_ns - cpu.first.user_ns : 0;
+        const auto system_ns = cpu.last.system_ns >= cpu.first.system_ns
+            ? cpu.last.system_ns - cpu.first.system_ns : 0;
+        const auto voluntary = cpu.last.voluntary_switches
+                >= cpu.first.voluntary_switches
+            ? cpu.last.voluntary_switches - cpu.first.voluntary_switches : 0;
+        const auto involuntary = cpu.last.nonvoluntary_switches
+                >= cpu.first.nonvoluntary_switches
+            ? cpu.last.nonvoluntary_switches
+                - cpu.first.nonvoluntary_switches : 0;
+        report << "| " << cpu.scope << " | " << cpu.account << " | "
+               << cpu.role << " | " << cpu.tid << " | " << std::fixed
+               << std::setprecision(2) << user / 1'000'000.0 << " | "
+               << system_ns / 1'000'000.0 << " | "
+               << (wall == 0 ? 0.0 : (user + system_ns) * 100.0 / wall)
+               << " | " << cpu.peak_percent << " | " << voluntary << " | "
+               << involuntary << " |\n";
+    }
+
+    report << "\n## 运行队列汇总\n\n"
+           << "| 队列 | 账户 | 最大深度 | 最高水位 | 最大最旧事件年龄 ns | 最大丢弃 | 首次丢弃 mono_ns |\n"
+           << "|---|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& [key, queue] : queue_summaries) {
+        report << "| " << key.first << " | " << key.second << " | "
+               << queue.maximum_depth << " | " << queue.maximum_high_watermark
+               << " | " << queue.maximum_oldest_age_ns << " | "
+               << queue.maximum_dropped << " | ";
+        if (queue.first_drop_mono_ns < 0) report << "无";
+        else report << queue.first_drop_mono_ns;
+        report << " |\n";
+    }
+    report << "\n- 性能样本丢弃合计：" << performance_dropped << "\n";
     report.close();
 
     std::ofstream reproduce{output_directory / "reproduce.sh"};
@@ -987,6 +1192,7 @@ int run_benchmark(
               << " --rate " << settings.rate_per_second
               << " --warmup-seconds " << settings.warmup_seconds
               << " --duration-seconds " << settings.duration_seconds;
+    reproduce << " --submit-stride " << settings.submit_stride;
     if (settings.burst_seconds != 0) {
         reproduce << " --burst-rate " << settings.burst_rate_per_second
                   << " --burst-seconds " << settings.burst_seconds;

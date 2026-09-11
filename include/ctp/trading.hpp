@@ -467,7 +467,8 @@ public:
     CallbackQueueSnapshot callback_queue_snapshot() const noexcept;
     TradingEventSnapshot event_snapshot() const noexcept;
     bool request_reconciliation() noexcept;
-    std::size_t drain_callbacks() noexcept;
+    std::size_t drain_callbacks(
+        std::size_t maximum = std::numeric_limits<std::size_t>::max()) noexcept;
     bool order_snapshot(
         std::uint64_t client_order_id,
         OrderSnapshot& snapshot) const noexcept;
