@@ -156,6 +156,8 @@ struct RiskLimits {
     std::uint32_t max_daily_signals{0};
     std::uint32_t max_daily_orders{0};
     std::uint32_t max_daily_cancels{0};
+    std::uint32_t max_order_rate_per_second{
+        std::numeric_limits<std::uint32_t>::max()};
     std::int32_t max_order_volume{std::numeric_limits<std::int32_t>::max()};
     std::int32_t max_active_open_orders{0};
     std::int32_t max_net_open_position{0};
@@ -190,6 +192,7 @@ struct RiskSnapshot {
     std::int32_t closable_short{0};
     std::uint32_t daily_signals{0};
     std::uint32_t daily_orders{0};
+    std::uint32_t orders_in_rate_window{0};
     std::int32_t active_open_orders{0};
 };
 
@@ -225,6 +228,7 @@ enum class RiskRejectReason : std::uint8_t {
     TooManyActiveOpenOrders,
     NetPositionLimit,
     ResultUnknown,
+    OrderRateLimit,
 };
 
 RiskRejectReason evaluate_risk(

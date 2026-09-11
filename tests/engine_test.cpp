@@ -1005,6 +1005,105 @@ int run_single_account_signal(const ctp::RuntimeConfig& config)
     return exit_code == 0 ? trader->order_insert_calls : -1;
 }
 
+void test_live_runner_traces_order_rate_rejection(
+    test_support::TestRunner& runner)
+{
+    auto base = make_live_config(1);
+    auto live = base.live();
+    live.max_signals_per_run = 2;
+    live.max_orders_per_day = 3;
+    live.max_order_rate_per_second = 1;
+    live.max_active_open_orders = 2;
+    live.max_net_position = 2;
+    ctp::RuntimeConfig config{
+        ctp::Mode::Engine,
+        "simnow",
+        "", "", "", "", "", "", "", "", 0,
+        base.accounts(),
+        {},
+        std::move(live)};
+
+    const std::filesystem::path trace_root{
+        "/tmp/ctp_order_rate_rejection"};
+    std::filesystem::remove_all(trace_root);
+    auto market = std::make_shared<FakeLiveMarketState>();
+    auto trader = std::make_shared<test_support::FakeTraderMetrics>();
+    ctp::LiveEngineDependencies dependencies;
+    dependencies.trace_root = trace_root.string();
+    dependencies.create_market = [market] {
+        return std::make_unique<FakeLiveMarketApi>(market);
+    };
+    dependencies.create_trader = [trader](const std::string&) {
+        return make_recovering_trader(trader, false);
+    };
+
+    std::atomic<bool> stop{false};
+    std::thread feeder([market, &stop] {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds{2};
+        while (!market->subscribed.load(std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        for (int sequence = 0; sequence < 2; ++sequence) {
+            auto below = make_tick(sequence * 2);
+            below.LastPrice = 799.8;
+            below.BidPrice1 = 799.6;
+            below.AskPrice1 = 800.0;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&below);
+            auto crossing = make_tick(sequence * 2 + 1);
+            crossing.LastPrice = 800.0;
+            crossing.BidPrice1 = 799.8;
+            crossing.AskPrice1 = 800.2;
+            market->spi.load(std::memory_order_acquire)
+                ->OnRtnDepthMarketData(&crossing);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::ostringstream output;
+    std::ostringstream error;
+    const auto exit_code = ctp::run_live_engine(
+        config,
+        output,
+        error,
+        [&stop] { return stop.load(std::memory_order_acquire); },
+        std::move(dependencies));
+    feeder.join();
+
+    ctp::TraceJournalReadResult journal{};
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(trace_root)) {
+        if (entry.path().extension() == ".csv") {
+            journal = ctp::read_trace_journal(entry.path());
+            break;
+        }
+    }
+    std::uint64_t rejected_signal_id = 0;
+    for (const auto& event : journal.events) {
+        if (event.stage == ctp::TraceStage::RiskRejected
+            && event.code == static_cast<std::int32_t>(
+                ctp::RiskRejectReason::OrderRateLimit)) {
+            rejected_signal_id = event.trace_id.signal_id;
+        }
+    }
+    const bool linked_signal = rejected_signal_id != 0
+        && std::any_of(
+            journal.events.begin(), journal.events.end(),
+            [rejected_signal_id](const ctp::TraceEvent& event) {
+                return event.stage == ctp::TraceStage::Signal
+                    && event.trace_id.signal_id == rejected_signal_id;
+            });
+    runner.expect(
+        exit_code == 0 && trader->order_insert_calls == 1
+            && journal.valid && linked_signal,
+        "rate-limited strategy intent must retain a linked rejection reason");
+    std::filesystem::remove_all(trace_root);
+}
+
 void test_live_runner_enforces_margin_and_exchange_time_window(
     test_support::TestRunner& runner)
 {
@@ -1650,6 +1749,7 @@ int main()
     test_live_runner_stops_when_all_trader_creations_fail(runner);
     test_live_runner_isolates_trace_journal_start_failure(runner);
     test_live_runner_enforces_margin_and_exchange_time_window(runner);
+    test_live_runner_traces_order_rate_rejection(runner);
     test_live_runner_fails_over_first_market_login(runner);
     test_live_runner_fails_over_market_subscription(runner);
     test_live_runner_stops_after_all_market_accounts_fail(runner);

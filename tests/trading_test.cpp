@@ -673,6 +673,13 @@ void test_risk_boundaries_have_stable_reasons(
         ctp::evaluate_risk(intent, order_limited, limits)
                 == ctp::RiskRejectReason::DailyOrderLimit,
         "the next order beyond the daily limit must be rejected");
+    auto rate_limited = healthy;
+    rate_limited.orders_in_rate_window =
+        limits.max_order_rate_per_second;
+    runner.expect(
+        ctp::evaluate_risk(intent, rate_limited, limits)
+                == ctp::RiskRejectReason::OrderRateLimit,
+        "the next order at the per-second boundary must be rejected");
     auto invalid_book = healthy;
     invalid_book.bid_price_ticks = invalid_book.ask_price_ticks + 1;
     runner.expect(
@@ -726,6 +733,46 @@ void test_risk_boundaries_have_stable_reasons(
         ctp::evaluate_risk(upper_price, upper_book, limits)
                 == ctp::RiskRejectReason::None,
         "price protection must not overflow near the int64 upper boundary");
+}
+
+void test_rate_limit_rejection_has_order_state_and_trace(
+    test_support::TestRunner& runner)
+{
+    const ctp::AccountConfig account{
+        "account1", "9999", "user1", "password", "app", "auth", "front"};
+    auto metrics = std::make_shared<test_support::FakeTraderMetrics>();
+    auto fake = std::make_unique<test_support::FakeTraderApi>(metrics);
+    CapturingTraceSink trace;
+    auto limits = risk_limits();
+    limits.max_order_rate_per_second = 1;
+    ctp::AccountTradingSession session{
+        account, limits, std::move(fake), 8, 16, 8, 16, 1, 1, {}, &trace};
+    auto risk = healthy_risk_snapshot();
+    risk.orders_in_rate_window = 1;
+
+    const auto rejected = session.submit(opening_intent(78), risk);
+    ctp::OrderSnapshot order{};
+    const bool has_order = session.order_snapshot(
+        rejected.client_order_id, order);
+    const auto rejected_trace = std::find_if(
+        trace.events.begin(), trace.events.begin() + trace.size,
+        [](const ctp::TraceEvent& event) {
+            return event.stage == ctp::TraceStage::RiskRejected;
+        });
+
+    runner.expect(
+        rejected.code == ctp::SubmitCode::RiskRejected
+            && rejected.risk_reason == ctp::RiskRejectReason::OrderRateLimit
+            && has_order && order.state == ctp::OrderState::RiskRejected,
+        "a rate-limited signal must create a terminal rejected order");
+    runner.expect(
+        rejected_trace != trace.events.begin() + trace.size
+            && rejected_trace->trace_id.signal_id == 78
+            && rejected_trace->client_order_id == rejected.client_order_id
+            && rejected_trace->code == static_cast<std::int32_t>(
+                ctp::RiskRejectReason::OrderRateLimit)
+            && metrics->order_insert_calls == 0,
+        "a rate-limited signal must emit its reason without calling CTP");
 }
 
 void test_one_signal_submits_at_most_once(test_support::TestRunner& runner)
@@ -2149,6 +2196,7 @@ int main()
     test_conflicts_and_fixed_capacity(runner);
     test_trading_hot_path_does_not_allocate(runner);
     test_risk_boundaries_have_stable_reasons(runner);
+    test_rate_limit_rejection_has_order_state_and_trace(runner);
     test_one_signal_submits_at_most_once(runner);
     test_order_price_converts_ticks_to_ctp_price(runner);
     test_ctp_callbacks_are_drained_on_account_thread(runner);

@@ -672,6 +672,10 @@ RiskRejectReason evaluate_risk(
     if (snapshot.daily_orders >= limits.max_daily_orders) {
         return RiskRejectReason::DailyOrderLimit;
     }
+    if (snapshot.orders_in_rate_window
+        >= limits.max_order_rate_per_second) {
+        return RiskRejectReason::OrderRateLimit;
+    }
     if (!snapshot.market_valid
         || snapshot.bid_price_ticks <= 0
         || snapshot.ask_price_ticks <= 0

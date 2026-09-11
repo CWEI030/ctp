@@ -664,6 +664,8 @@ private:
         limits.max_daily_signals = live.max_signals_per_run;
         limits.max_daily_orders = live.max_orders_per_day;
         limits.max_daily_cancels = live.max_cancels_per_day;
+        limits.max_order_rate_per_second =
+            live.max_order_rate_per_second;
         limits.max_order_volume = live.max_order_volume;
         limits.max_active_open_orders = live.max_active_open_orders;
         limits.max_net_open_position = live.max_net_position;
@@ -768,14 +770,11 @@ private:
                 const auto decision = strategy_.on_market(market, risk.now_ns);
                 if (!decision.has_intent) continue;
                 session_->trace_signal(market, decision.intent, risk.now_ns);
-                if (orders_in_window_ >= live_.max_order_rate_per_second
-                    && risk.now_ns - rate_window_start_ns_ < 1'000'000'000) {
-                    continue;
-                }
                 if (risk.now_ns - rate_window_start_ns_ >= 1'000'000'000) {
                     rate_window_start_ns_ = risk.now_ns;
                     orders_in_window_ = 0;
                 }
+                risk.orders_in_rate_window = orders_in_window_;
                 const auto result = session_->submit(decision.intent, risk);
                 if (result.code == SubmitCode::Submitted) {
                     ++orders_in_window_;
